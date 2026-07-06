@@ -11,8 +11,15 @@ requires-python = ">=3.10"
 authors = [{ name = "PanocularAI team", email = "hello@panocular.ai" }]
 license = {file = "LICENSE"}
 
+# torchtitan/torchft are the training engine. As PEP 508 direct references they
+# are pulled (and built) transitively whenever symphony-learn is installed —
+# including by the `symphony` control plane and on cloud nodes — so a single
+# `pip install symphony-learn` brings the whole engine. torchft builds via maturin
+# and therefore needs Rust + protoc in the install environment (see Makefile
+# `setup-env`). Both forks track `main`; pin to `@<sha>` if a commit breaks.
 dependencies = [
-
+    "torchtitan @ git+https://github.com/PanocularAI/torchtitan.git@main",
+    "torchft @ git+https://github.com/PanocularAI/torchft.git@main",
 ]
 
 # Discover the repo-root config registries (models.llama3, models.qwen3, ...) so

@@ -8,7 +8,8 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.validate import Validator
-from torchtitan.config import ActivationCheckpointConfig, ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
 from torchtitan.experiments.torchft.config.job_config import FaultTolerance
 from torchtitan.experiments.torchft.optimizer import default_ft_adamw
@@ -63,9 +64,7 @@ def qwen3_0_6b() -> FaultTolerantTrainer.Config:
             last_save_model_only=False,
             export_dtype="float16",
         ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-        ),
+        activation_checkpoint=SelectiveAC.Config(),
         fault_tolerance=FaultTolerance(
             enable=True,
             sync_steps=10,
@@ -124,9 +123,7 @@ def qwen3_1_7b() -> FaultTolerantTrainer.Config:
             last_save_model_only=False,
             export_dtype="float16",
         ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-        ),
+        activation_checkpoint=SelectiveAC.Config(),
         fault_tolerance=FaultTolerance(
             enable=True,
             sync_steps=10,
@@ -186,9 +183,7 @@ def qwen3_32b() -> FaultTolerantTrainer.Config:
             last_save_model_only=False,
             export_dtype="float16",
         ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="full",
-        ),
+        activation_checkpoint=FullAC.Config(),
         fault_tolerance=FaultTolerance(
             enable=True,
             sync_steps=10,
@@ -248,9 +243,7 @@ def qwen3_moe_debug() -> FaultTolerantTrainer.Config:
             last_save_model_only=False,
             export_dtype="float16",
         ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-        ),
+        activation_checkpoint=SelectiveAC.Config(),
         fault_tolerance=FaultTolerance(
             enable=True,
             sync_steps=10,

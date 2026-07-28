@@ -8,7 +8,8 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.validate import Validator
-from torchtitan.config import ActivationCheckpointConfig, CommConfig, ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.config import CommConfig, ParallelismConfig, TrainingConfig
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
 from torchtitan.experiments.torchft.config.job_config import FaultTolerance
 from torchtitan.experiments.torchft.optimizer import default_ft_adamw
@@ -64,9 +65,7 @@ def llama3_8b() -> FaultTolerantTrainer.Config:
             last_save_model_only=True,
             export_dtype="float32",
         ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-        ),
+        activation_checkpoint=SelectiveAC.Config(),
         fault_tolerance=FaultTolerance(
             enable=True,
             sync_steps=10,
@@ -130,9 +129,7 @@ def llama3_debugmodel() -> FaultTolerantTrainer.Config:
             last_save_model_only=False,
             export_dtype="float32",
         ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-        ),
+        activation_checkpoint=SelectiveAC.Config(),
         comm=CommConfig(train_timeout_seconds=15),
         fault_tolerance=FaultTolerance(
             enable=True,

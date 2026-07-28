@@ -7,7 +7,8 @@ from torch.distributed._composable.replicate import replicate
 
 from torch.distributed.device_mesh import DeviceMesh
 from torchtitan.config import TORCH_DTYPE_MAP
-from torchtitan.config.configs import ActivationCheckpointConfig, CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config.configs import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 from torch.distributed.tensor import Replicate, Shard
 from torchtitan.distributed import ParallelDims
@@ -21,7 +22,7 @@ def parallelize_resnet(
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: CompileConfig,
-    ac_config: ActivationCheckpointConfig,
+    ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
     **kwargs,
 ):

@@ -7,7 +7,8 @@
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.validate import Validator
-from torchtitan.config import ActivationCheckpointConfig, ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
 from torchtitan.experiments.torchft.config.job_config import FaultTolerance
 from torchtitan.experiments.torchft.optimizer import default_ft_adamw
@@ -69,9 +70,7 @@ def resnet18_cifar10() -> FaultTolerantTrainer.Config:
             last_save_model_only=False,
             export_dtype="float32",
         ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-        ),
+        activation_checkpoint=SelectiveAC.Config(),
         fault_tolerance=FaultTolerance(
             enable=True,
             sync_steps=10,
@@ -137,9 +136,7 @@ def resnet34_cifar10() -> FaultTolerantTrainer.Config:
             last_save_model_only=False,
             export_dtype="float32",
         ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-        ),
+        activation_checkpoint=SelectiveAC.Config(),
         fault_tolerance=FaultTolerance(
             enable=True,
             sync_steps=10,
@@ -205,9 +202,7 @@ def resnet50_cifar10() -> FaultTolerantTrainer.Config:
             last_save_model_only=False,
             export_dtype="float32",
         ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-        ),
+        activation_checkpoint=SelectiveAC.Config(),
         fault_tolerance=FaultTolerance(
             enable=True,
             sync_steps=10,
@@ -273,9 +268,7 @@ def resnet152_cifar10() -> FaultTolerantTrainer.Config:
             last_save_model_only=False,
             export_dtype="float32",
         ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="none",
-        ),
+        activation_checkpoint=None,
         fault_tolerance=FaultTolerance(
             enable=True,
             sync_steps=10,

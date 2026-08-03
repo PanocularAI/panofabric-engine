@@ -131,3 +131,4 @@ def test_ft_topology_invariants(model: str, fn_name: str, fn) -> None:
             f"{where}: sync_steps={sync_steps!r} not divisible by "
             f"num_fragments={num_fragments!r} (DiLoCo invariant)"
         )
+

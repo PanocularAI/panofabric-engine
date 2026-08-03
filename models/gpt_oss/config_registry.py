@@ -8,7 +8,7 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.validate import Validator
-from torchtitan.config import ActivationCheckpointConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
 from torchtitan.experiments.torchft.config.job_config import FaultTolerance
 from torchtitan.experiments.torchft.optimizer import default_ft_adamw
@@ -68,9 +68,7 @@ def gptoss_debugmodel() -> FaultTolerantTrainer.Config:
             last_save_model_only=False,
             export_dtype="float32",
         ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="none",
-        ),
+        activation_checkpoint=None,
         fault_tolerance=FaultTolerance(
             enable=True,
             sync_steps=10,

@@ -1,8 +1,10 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Config-as-code presets for FT training of HF-architecture models, mirroring
+# symphony-learn/models/llama3/config_registry.py. Selected by torchtitan's
+# ConfigManager: --module models.hf_transformers --config <fn>.
+# The HF repo id is NOT baked into presets — it arrives via the --hf_model
+# CLI overlay (RunSpec.model.hf_model), so two presets cover all models.
+
+from dataclasses import dataclass
 
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
@@ -20,76 +22,22 @@ from torchtitan.tools.profiler import Profiler
 from . import model_registry
 
 
-def llama3_8b() -> FaultTolerantTrainer.Config:
-    return FaultTolerantTrainer.Config(
-        loss=CrossEntropyLoss.Config(),
-        hf_assets_path="./assets/hf/Llama-3.1-8B",
-        dump_folder="./outputs",
-        profiler=Profiler.Config(
-            enable_profiling=True,
-            save_traces_folder="profile_trace",
-            profile_freq=100,
-        ),
-        metrics=MetricsProcessor.Config(
-            log_freq=10,
-            enable_tensorboard=False,
-            save_tb_folder="tb",
-            enable_wandb=False,
-        ),
-        model_spec=model_registry("8B"),
-        optimizer=default_ft_adamw(lr=3e-4),
-        lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=200,
-        ),
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=8192,
-            max_norm=1.0,
-            steps=1000,
-        ),
-        dataloader=HuggingFaceTextDataLoader.Config(
-            dataset="c4",
-        ),
-        parallelism=ParallelismConfig(
-            data_parallel_replicate_degree=1,
-            data_parallel_shard_degree=-1,
-            tensor_parallel_degree=1,
-            pipeline_parallel_degree=1,
-            context_parallel_degree=1,
-        ),
-        checkpoint=TorchFTCheckpointManager.Config(
-            enable=False,
-            enable_ft_dataloader_checkpoints=False,
-            folder="checkpoint",
-            interval=500,
-            last_save_model_only=True,
-            export_dtype="float32",
-        ),
-        activation_checkpoint=SelectiveAC.Config(),
-        fault_tolerance=FaultTolerance(
-            enable=True,
-            sync_steps=10,
-            num_fragments=2,
-            semi_sync_method="diloco",
-            process_group="gloo",
-            process_group_timeout_ms=10000,
-        ),
-        validator=Validator.Config(
-            enable=False,
-        ),
-    )
+@dataclass(kw_only=True, slots=True)
+class HFFTConfig(FaultTolerantTrainer.Config):
+    hf_model: str = ""
+    """HuggingFace repo id (e.g. 'Qwen/Qwen2.5-7B'); architecture only, random init."""
 
-def llama3_debugmodel() -> FaultTolerantTrainer.Config:
-    return FaultTolerantTrainer.Config(
+
+def hf_debugmodel() -> HFFTConfig:
+    return HFFTConfig(
+        # Architecture donor for smoke tests; the debugmodel flavor re-applies
+        # tiny dims (dim=256, 2 layers) after the HF config load.
+        hf_model="Qwen/Qwen3-0.6B",
         loss=CrossEntropyLoss.Config(),
-        hf_assets_path="./torchtitan/tests/assets/tokenizer",
+        hf_assets_path="tests/assets/tokenizer",
         dump_folder="./outputs",
         profiler=Profiler.Config(
-            enable_profiling=True,
-            save_traces_folder="profile_trace",
-            profile_freq=10,
-            profiler_active=10,
-            profiler_warmup=0,
+            enable_profiling=False,
         ),
         metrics=MetricsProcessor.Config(
             log_freq=1,
@@ -98,7 +46,7 @@ def llama3_debugmodel() -> FaultTolerantTrainer.Config:
             enable_wandb=False,
         ),
         model_spec=model_registry("debugmodel"),
-        optimizer=default_ft_adamw(lr=8e-4),
+        optimizer=default_ft_adamw(lr=8e-4, eps=1e-8),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,
@@ -134,7 +82,7 @@ def llama3_debugmodel() -> FaultTolerantTrainer.Config:
         fault_tolerance=FaultTolerance(
             enable=True,
             sync_steps=10,
-            num_fragments=2,
+            num_fragments=1,  # no fragment_fn: whole-model DiLoCo
             semi_sync_method="diloco",
             process_group="gloo",
             process_group_timeout_ms=10000,
@@ -145,3 +93,83 @@ def llama3_debugmodel() -> FaultTolerantTrainer.Config:
             steps=10,
         ),
     )
+
+
+def hf_full() -> HFFTConfig:
+    return HFFTConfig(
+        hf_model="",  # required: set via --hf_model (RunSpec.model.hf_model)
+        loss=CrossEntropyLoss.Config(),
+        hf_assets_path="",  # required: set via --hf_assets_path (auto-derived by the launcher)
+        dump_folder="./outputs",
+        profiler=Profiler.Config(
+            enable_profiling=True,
+            save_traces_folder="profile_trace",
+            profile_freq=100,
+        ),
+        metrics=MetricsProcessor.Config(
+            log_freq=10,
+            enable_tensorboard=False,
+            save_tb_folder="tb",
+            enable_wandb=False,
+        ),
+        model_spec=model_registry("full"),
+        optimizer=default_ft_adamw(lr=3e-4, eps=1e-8),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=200,
+        ),
+        training=TrainingConfig(
+            local_batch_size=1,
+            seq_len=8192,
+            max_norm=1.0,
+            steps=1000,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="c4",
+        ),
+        parallelism=ParallelismConfig(
+            data_parallel_replicate_degree=1,
+            data_parallel_shard_degree=-1,
+            tensor_parallel_degree=1,
+            pipeline_parallel_degree=1,
+            context_parallel_degree=1,
+        ),
+        checkpoint=TorchFTCheckpointManager.Config(
+            enable=False,
+            enable_ft_dataloader_checkpoints=False,
+            folder="checkpoint",
+            interval=500,
+            last_save_model_only=True,
+            export_dtype="float32",
+        ),
+        activation_checkpoint=SelectiveAC.Config(),
+        fault_tolerance=FaultTolerance(
+            enable=True,
+            sync_steps=10,
+            num_fragments=1,  # no fragment_fn: whole-model DiLoCo
+            semi_sync_method="diloco",
+            process_group="gloo",
+            process_group_timeout_ms=10000,
+        ),
+        validator=Validator.Config(
+            enable=False,
+        ),
+    )
+
+
+def hf_finetune() -> HFFTConfig:
+    """Full-parameter FINE-TUNING of any dense CausalLM repo: hf_full's
+    architecture (the repo's real dims from config.json) plus the repo's
+    pretrained safetensors loaded at startup via the backend's state-dict
+    adapter. The scheduler fetches the weights into hf_assets_path before
+    launch (see panofabric.spec.runspec.hf_fetch_plan); the launcher scopes
+    the checkpoint folder per run/replica like the LoRA presets."""
+    # hf_full already uses the "full" flavor = the repo's real dims from
+    # config.json, so fine-tuning just adds pretrained-weight loading on top.
+    config = hf_full()
+    # Full fine-tuning moves every weight: ~10x cooler than the pretrain
+    # schedule (3e-4) or gradients shear the pretrained features off.
+    config.optimizer = default_ft_adamw(lr=2e-5, eps=1e-8)
+    config.lr_scheduler.warmup_steps = 20
+    config.checkpoint.enable = True               # the initial HF-weight load is gated on it
+    config.checkpoint.initial_load_in_hf = True   # pretrained safetensors from hf_assets_path
+    return config

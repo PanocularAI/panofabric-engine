@@ -55,8 +55,14 @@ from . import stage_transport as tp
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 
-# Upper bound on how long a hook may block on the transport. Covers a
-# hot-swap: peers wait in their recvs while every stage fetches its shard.
+# Upper bound on how long a stage waits on the transport — both at BOOT
+# (listening for the upstream dial-in / retry-dialing the downstream
+# neighbor, where cloud stages start minutes apart: per-node image-pull
+# variance alone was measured at 13 minutes between two same-region nodes)
+# and inside hooks (a hot-swap: peers wait in their recvs while every stage
+# fetches its shard). The boot waits MUST tolerate the full skew: a
+# too-short accept window kills the tail stage before its upstream ever
+# provisions, and the whole run with it.
 _LINK_TIMEOUT_S = float(os.environ.get("PANOFABRIC_LINK_TIMEOUT_S", "3600"))
 
 # "step: N" progress lines: every step for the first N (the supervisor's
@@ -92,7 +98,8 @@ class SyncLink:
         return the listener's ack role ("last" | "mid") — how stage 0 learns
         whether its downstream neighbor IS the last stage."""
         async def _dh():
-            link = await tp.dial(host, port, profile=profile, retry_s=600)
+            link = await tp.dial(host, port, profile=profile,
+                                 retry_s=_LINK_TIMEOUT_S)
             await link.send(f"hello:{role}")
             tag, _ = await link.recv()
             return link, tag.split(":", 1)[1]
@@ -110,7 +117,7 @@ class SyncLink:
         and stage 0 blocks on the ring hello-ack, so the ring is classified
         here before any step can run."""
         async def _accept_one(server):
-            link = await server.accept(timeout=600)
+            link = await server.accept(timeout=_LINK_TIMEOUT_S)
             tag, _ = await link.recv()
             role = tag.split(":", 1)[1]
             await link.send(f"hello-ack:{ack}")
@@ -165,8 +172,10 @@ class SyncLink:
     def recv_any(self) -> tuple[str, list]:
         """Receive one frame, returning its tag. Wave mode's ring reader
         consumes token frames from ALL waves off one link, so the tag is
-        data ("tok:2"), not an assertion."""
-        return self._run(self._link.recv())
+        data ("tok:2"), not an assertion. No timeout: the ring reader idles
+        indefinitely between requests, and a timed-out result() leaves the
+        recv coroutine pending to swallow the next frame."""
+        return self._run(self._link.recv(), timeout=None)
 
     def close(self) -> None:
         if self._link is not None:

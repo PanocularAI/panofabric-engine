@@ -7,7 +7,11 @@
 # round-robin skews badly). Streaming responses pass through chunk-by-chunk.
 #
 # Optional bearer-key auth (`--api-keys k1,k2`): when set, every /v1 request
-# must carry `Authorization: Bearer <key>`. Health: each target's /health is
+# must carry `Authorization: Bearer <key>`. With `--upstream-key` the backends
+# are dialed with THAT bearer instead of the client's (the control plane starts
+# them with VLLM_API_KEY set to it), so a replica whose port is publicly
+# reachable — as it is on any cloud launch — cannot be used to skip the check
+# above. Health: each target's /health is
 # polled in the background; unhealthy targets are skipped (and everything is
 # eligible again if every target looks down, so a cold-starting deployment
 # still converges instead of 503ing forever).
@@ -44,11 +48,13 @@ class Gateway:
     single aiohttp event loop (no awaits between read and write), so no locks."""
 
     def __init__(self, targets: list[str], *, api_keys: list[str] | None = None,
-                 admin_token: str = "", health_interval_s: float = 5.0):
+                 admin_token: str = "", upstream_key: str = "",
+                 health_interval_s: float = 5.0):
         if not targets:
             raise ValueError("gateway needs at least one target")
         self.api_keys = set(api_keys or [])
         self.admin_token = admin_token
+        self.upstream_key = upstream_key
         self.health_interval_s = health_interval_s
         self.num_requests = 0
         self.num_rejected = 0
@@ -100,8 +106,17 @@ class Gateway:
                                      status=401)
         target = self.pick()
         url = f"{target}{request.path_qs}"
+        # The client's own bearer stops HERE (it was just checked against
+        # api_keys); with an upstream key the backend gets the internal one it
+        # was launched with instead — that key is what makes a replica
+        # reachable only THROUGH this gateway, since on a cloud launch its own
+        # port is public. Drop every casing of the inbound header, or aiohttp
+        # would forward the client's alongside ours.
+        drop = _HOP_HEADERS | ({"authorization"} if self.upstream_key else set())
         headers = {k: v for k, v in request.headers.items()
-                   if k.lower() not in _HOP_HEADERS}
+                   if k.lower() not in drop}
+        if self.upstream_key:
+            headers["Authorization"] = f"Bearer {self.upstream_key}"
         body = await request.read()
         self.inflight[target] = self.inflight.get(target, 0) + 1
         self.num_requests += 1
@@ -238,6 +253,11 @@ def main() -> None:
     p.add_argument("--admin-token", default="",
                    help="bearer for POST /gateway/targets (control-plane "
                         "retargeting); empty disables the route")
+    p.add_argument("--upstream-key", default="",
+                   help="bearer sent to the BACKENDS in place of the client's "
+                        "(they are launched with VLLM_API_KEY set to it), so a "
+                        "publicly-reachable replica port cannot bypass this "
+                        "gateway's api-key check")
     args = p.parse_args()
     # Secrets come from the environment (argv is visible in `ps` and lands in
     # cloud job scripts/logs); the flags stay for standalone use.
@@ -248,6 +268,8 @@ def main() -> None:
         [t for t in args.targets.split(",") if t.strip()],
         api_keys=[k for k in api_keys.split(",") if k.strip()],
         admin_token=admin_token,
+        upstream_key=os.environ.get("PANOFABRIC_GATEWAY_UPSTREAM_KEY",
+                                    args.upstream_key),
     )
     started = time.monotonic()
     try:

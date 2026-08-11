@@ -430,6 +430,37 @@ def test_hello_protocol_classifies_up_and_ring_links():
         lk.close()
 
 
+def test_recv_any_waits_without_link_timeout():
+    """Regression: the ring reader idles indefinitely between requests, so
+    recv_any must wait with timeout=None — a bounded wait killed the reader
+    thread after _LINK_TIMEOUT_S idle and the orphaned recv coroutine then
+    swallowed the first frame of the next request."""
+    from panoserve.engine_stage import SyncLink
+
+    class FakeLink:
+        async def recv(self):
+            return "tok:0", []
+
+        async def close(self):
+            pass
+
+    s = SyncLink()
+    s._link = FakeLink()
+    timeouts = []
+    real_run = s._run
+
+    def spy(coro, timeout="<default>"):
+        timeouts.append(timeout)
+        return real_run(coro) if timeout == "<default>" else real_run(
+            coro, timeout)
+
+    s._run = spy
+    tag, tensors = s.recv_any()
+    assert (tag, tensors) == ("tok:0", [])
+    assert timeouts == [None]
+    s.close()
+
+
 # ---------------------------------------------------------------- gateway -- #
 
 
@@ -441,7 +472,9 @@ def _backend(name: str, *, healthy: bool = True):
 
     async def chat(request):
         body = await request.json()
-        return web.json_response({"backend": name, "echo": body})
+        return web.json_response({"backend": name, "echo": body,
+                                  "auth": request.headers.getall(
+                                      "Authorization", [])})
 
     app = web.Application()
     app.add_routes([web.get("/health", health),
@@ -482,10 +515,45 @@ def test_routing_health_and_auth():
                     payload = await r.json()
                     assert payload["targets"][u1]["healthy"] is True
                     assert payload["requests"] == 3 and payload["rejected"] == 1
+                # with no upstream key the client's own bearer is forwarded
+                async with s.post(gw_url, json={"m": 1}, headers=hdrs) as r:
+                    assert (await r.json())["auth"] == ["Bearer k-test"]
         finally:
             await gw_server.close()
             await b1.close()
             await b2.close()
+
+    asyncio.run(scenario())
+
+
+def test_upstream_key_replaces_the_client_bearer():
+    """The backends are launched with VLLM_API_KEY=<upstream key>, so a public
+    replica port cannot bypass this gateway's api-key check. The client's own
+    bearer must NOT reach them (nor ride along in a second header)."""
+    async def scenario():
+        b1 = TestServer(_backend("b1"))
+        await b1.start_server()
+        u1 = f"http://127.0.0.1:{b1.port}"
+        gw = Gateway([u1], api_keys=["k-client"], upstream_key="k-internal")
+        gw.healthy[u1] = True
+        gw_server = TestServer(gw.app())
+        await gw_server.start_server()
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as s:
+                url = f"http://127.0.0.1:{gw_server.port}/v1/chat/completions"
+                # lowercase inbound header: the swap must not leave both
+                async with s.post(url, json={"m": 1},
+                                  headers={"authorization": "Bearer k-client"}) as r:
+                    assert r.status == 200
+                    assert (await r.json())["auth"] == ["Bearer k-internal"]
+                # the client's key is still what the GATEWAY checks
+                async with s.post(url, json={"m": 1},
+                                  headers={"Authorization": "Bearer k-internal"}) as r:
+                    assert r.status == 401
+        finally:
+            await gw_server.close()
+            await b1.close()
 
     asyncio.run(scenario())
 
@@ -555,3 +623,33 @@ def test_fetch_model_dir_verified(tmp_path):
             assert got == digest
     finally:
         srv.shutdown()
+
+
+def test_boot_waits_are_governed_by_link_timeout(monkeypatch):
+    """The chain's BOOT waits — the listener's accept window and the dial
+    retry window — must follow _LINK_TIMEOUT_S, not a hardcoded 600s.
+    Regression: the tail stage's accept was pinned at 600s while cloud
+    stages start minutes apart (image-pull variance alone was measured at
+    13 min between same-region nodes), so the tail died before its upstream
+    ever provisioned and took the whole run with it."""
+    from panoserve import engine_stage as es
+
+    monkeypatch.setattr(es, "_LINK_TIMEOUT_S", 0.5)
+
+    # Listener with no dialer: the accept window must expire in ~0.5s
+    # (pre-fix: 600s — this test would hang ten minutes).
+    ln = es.SyncLink()
+    t0 = time.monotonic()
+    with pytest.raises(Exception):     # TimeoutError via run_coroutine_threadsafe
+        ln.listen_classify(0, "mid", False, lambda *_: None)
+    assert time.monotonic() - t0 < 5
+
+    # Dial against a dead port: the retry window must give up in ~0.5s.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        dead_port = probe.getsockname()[1]
+    dl = es.SyncLink()
+    t0 = time.monotonic()
+    with pytest.raises(Exception):     # ConnectionError once retry_s expires
+        dl.dial_hello("127.0.0.1", dead_port, "up")
+    assert time.monotonic() - t0 < 5

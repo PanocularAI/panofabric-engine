@@ -1,0 +1,27 @@
+# Keep the docker build context lean (the repo is multi-GB). docker/engine.Dockerfile
+# builds the engine from the LOCAL submodules (torchtitan/ + torchft/), so those source
+# trees must stay IN the context — but their build artifacts, the venv, git metadata,
+# outputs, and runtime assets must not.
+.venv
+.git
+**/__pycache__
+**/*.egg-info
+*.pyc
+*.pyo
+**/build
+**/dist
+outputs
+out
+data
+wandb
+assets
+.pytest_cache
+.claude
+.vscode
+.idea
+*.log
+*.zip
+
+# Rust build dir — maturin recompiles torchft from source inside the build, so the
+# host's (potentially multi-GB) target/ is dead weight in the context.
+torchft/target

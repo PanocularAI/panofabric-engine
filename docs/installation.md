@@ -49,12 +49,19 @@ Make sure that you pull all submodules using `--recursive` flag.
 ```
 
 3. Installing PyTorch:
-You need to install the correct version of PyTroch nightly according to your hardware. On a typical Nvidia GPU such as (A100, H100), the following command should work:
+You need to install the correct version of PyTorch nightly according to your hardware. On Nvidia GPUs the engine requires the **CUDA 13** wheels:
 ```bash
-    uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128 --force-reinstall
+    uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130 --force-reinstall
 ```
 
-However, you might need to install cu130 for newer Nvidia GPUs, such as B200, or even the rocm backend for AMD GPUs:
+The older `cu128`/`cu129` indexes will NOT work: torchtitan calls
+`create_block_mask(separate_full_blocks=...)`, added in torch 2.13, and PyTorch stopped
+publishing CUDA 12 wheels before that (cu128 caps at 2.11 stable / 2.12.0.dev20260408).
+CUDA 13 wheels need an r580+ driver. On an older driver (datacenter GPUs only), install
+NVIDIA's forward-compat package (`conda install -c nvidia cuda-compat`) and put its lib
+dir on `LD_LIBRARY_PATH` before starting training — on PanoFabric, set it once per cluster
+under compute page → Slurm settings → Worker environment. For AMD GPUs use the rocm
+backend instead:
 ```bash
     uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/rocm7.0 --force-reinstall
 ```

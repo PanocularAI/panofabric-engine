@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "panoserve"
+version = "0.1.0"
+description = "PanoFabric serving plane: spliced-pipeline vLLM engine stages, replica-fleet gateway, checkpoint sharder, verified weight fetch, and the stage transport"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Panocular AI", email = "hello@panocular.ai" }]
+license = { file = "LICENSE" }
+
+# torch and vllm are deliberately NOT declared: every runtime that launches
+# panoserve modules (the panofabric daemon's venv, engine cloud nodes) carries
+# backend-matched torch+vllm nightlies installed LAST so they win — a plain
+# dependency resolve here would drag the stable torch back in and clobber them
+# (same policy as panofabric's Makefile `install-torch` note). Only the
+# lightweight, resolve-safe deps are listed.
+dependencies = [
+    "aiohttp>=3.9",       # stage control channel, gateway, engine_stage admin/OpenAI endpoints
+    "huggingface_hub",    # snapshot_download for --ensure-from
+    "numpy",              # stage_transport tensor wire encoding
+    "safetensors",        # sharder + engine_stage weight I/O
+    "transformers",       # AutoTokenizer in engine_stage (unpinned: matched to the env's vLLM)
+]
+
+[project.optional-dependencies]
+# Standalone/dev installs where a STABLE torch is acceptable: pulls vllm (which
+# pins its matched torch). Never select this on nightly-matched nodes.
+vllm = ["vllm"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/PanocularAI/panoserve"
+
+[tool.setuptools.packages.find]
+include = ["panoserve", "panoserve.*"]
+# Wheels ship the runtime modules only; tests stay source-tree-only (same
+# convention as panofabric-controld).
+exclude = ["panoserve.tests", "panoserve.tests.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["panoserve/tests"]
+addopts = "-ra"

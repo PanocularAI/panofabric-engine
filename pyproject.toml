@@ -7,7 +7,10 @@ name = "panofabric-engine"
 version = "0.1.0"
 description = "Pytorch-native engine for heterogeneous & decentralized training and serving of large-scale AI models"
 readme = "README.md"
-requires-python = ">=3.10"
+# torchtitan requires >=3.11, and torchft's Rust extension builds via pyo3 0.24,
+# which caps at CPython 3.13 — a 3.14 interpreter fails the maturin build. Declaring
+# the real window makes that a resolver error instead of a build-time surprise.
+requires-python = ">=3.11,<3.14"
 authors = [{ name = "PanocularAI team", email = "hello@panocular.ai" }]
 license = { file = "LICENSE" }
 

@@ -12,7 +12,7 @@
 # STRIPPED — a stage dir loads on a box that could never hold the full model.
 #
 # Offline CLI (pure torch, CPU-only — safetensors shuffling, no CUDA):
-#   python -m panoserve.sharder --checkpoint /path/to/hf-model \
+#   python -m panoengine.serve.sharder --checkpoint /path/to/hf-model \
 #       --stage-memory 80,40,80 --out /path/to/staged
 #
 # The manifest (pipeline.json) records stage order, layer ranges, per-file

@@ -141,7 +141,7 @@ def main() -> None:
     serving runs whose weights come from a relay/private artifact store
     instead of the HF hub:
 
-        python -m panoserve.weights \\
+        python -m panoengine.serve.weights \\
             --manifest-url http://relay/models/qwen3-0.6b --dest /data/w \\
             -- --port 8800 --max-model-len 8192 ...     (vllm serve args)
     """

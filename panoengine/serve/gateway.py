@@ -18,7 +18,7 @@
 #
 # Launched by the control plane as a CoordinatorPlan (same pattern as the RL
 # relay); runs standalone too:
-#   python -m panoserve.gateway --port 8800 \
+#   python -m panoengine.serve.gateway --port 8800 \
 #       --targets http://127.0.0.1:8801,http://127.0.0.1:8802
 
 from __future__ import annotations

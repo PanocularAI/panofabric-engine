@@ -49,12 +49,16 @@ train = [
 # that launches these modules carries backend-matched nightlies installed last,
 # and a plain resolve here would clobber them. This is hard-won; do not "fix" it.
 serve = [
-  "aiohttp>=3.9",
-  "huggingface_hub",
-  "numpy",
-  "safetensors",
-  "transformers",
+  "aiohttp>=3.9",      # stage control channel, gateway, engine_stage endpoints
+  "huggingface_hub",   # snapshot_download for --ensure-from
+  "numpy",             # stage_transport tensor wire encoding
+  "safetensors",       # sharder + engine_stage weight I/O
+  "transformers",      # AutoTokenizer in engine_stage (unpinned: matched to the env vLLM)
 ]
+
+# Standalone/dev installs where a STABLE torch is acceptable: pulls vllm (which
+# pins its matched torch). Never select this on nightly-matched nodes.
+serve-vllm = ["vllm"]
 
 [project.urls]
 Homepage = "https://github.com/PanocularAI/panofabric-engine"
@@ -68,8 +72,12 @@ Homepage = "https://github.com/PanocularAI/panofabric-engine"
 [tool.setuptools.packages.find]
 # panoengine* = the engine. models* = the compatibility shims that keep stored
 # run specs resolving (see models/__init__.py).
-include = ["panoengine*", "models*"]
+include = ["panoengine*", "models*", "panoserve*"]
 exclude = ["panoengine.serve.tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "panoengine/serve/tests"]
+addopts = "-ra"
 
 # No [tool.uv.sources] for the forks on purpose: a declarative `path =
 # "../torchtitan"` override makes `uv sync` fail for anyone who clones this repo

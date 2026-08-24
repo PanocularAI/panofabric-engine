@@ -27,10 +27,10 @@ from aiohttp.test_utils import TestServer
 torch = pytest.importorskip("torch")
 from safetensors.torch import load_file, save_file  # noqa: E402
 
-from panoserve import stage_transport as st  # noqa: E402
-from panoserve.gateway import Gateway  # noqa: E402
-from panoserve.sharder import plan_ranges, shard_checkpoint  # noqa: E402
-from panoserve.weights import (  # noqa: E402
+from panoengine.serve import stage_transport as st  # noqa: E402
+from panoengine.serve.gateway import Gateway  # noqa: E402
+from panoengine.serve.sharder import plan_ranges, shard_checkpoint  # noqa: E402
+from panoengine.serve.weights import (  # noqa: E402
     IntegrityError, fetch_file, fetch_manifest, fetch_model_dir,
 )
 
@@ -346,7 +346,7 @@ def test_link_profile_paces_and_jitters_deterministically():
     import asyncio
     import time as _time
 
-    from panoserve.stage_transport import LinkProfile, dial, listen
+    from panoengine.serve.stage_transport import LinkProfile, dial, listen
 
     # deterministic jitter: same seed -> same delays
     a = [d for d, _ in zip(LinkProfile(10, 5, seed=7).delays(), range(4))]
@@ -384,7 +384,7 @@ def test_hello_protocol_classifies_up_and_ring_links():
     from the ack that its next hop IS the last stage) and stage 0's ring
     dial is classified off the same listener. Tokens then return to stage 0
     in ONE hop, and tag-checked recv catches lockstep violations loudly."""
-    from panoserve.engine_stage import SyncLink
+    from panoengine.serve.engine_stage import SyncLink
 
     last_up = SyncLink()                      # the last stage's listener side
     ring_box: dict = {}
@@ -435,7 +435,7 @@ def test_recv_any_waits_without_link_timeout():
     recv_any must wait with timeout=None — a bounded wait killed the reader
     thread after _LINK_TIMEOUT_S idle and the orphaned recv coroutine then
     swallowed the first frame of the next request."""
-    from panoserve.engine_stage import SyncLink
+    from panoengine.serve.engine_stage import SyncLink
 
     class FakeLink:
         async def recv(self):
@@ -632,7 +632,7 @@ def test_boot_waits_are_governed_by_link_timeout(monkeypatch):
     stages start minutes apart (image-pull variance alone was measured at
     13 min between same-region nodes), so the tail died before its upstream
     ever provisioned and took the whole run with it."""
-    from panoserve import engine_stage as es
+    from panoengine.serve import engine_stage as es
 
     monkeypatch.setattr(es, "_LINK_TIMEOUT_S", 0.5)
 

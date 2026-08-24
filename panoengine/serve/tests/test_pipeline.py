@@ -10,7 +10,7 @@ def test_ctl_frame_roundtrip():
     # so the encoding itself needs torch — absent from control-plane CI, same
     # skip convention as test_serve.py / the engine-glue tests in test_runspec.
     pytest.importorskip("torch")
-    from panoserve.engine_stage import _ctl_decode, _ctl_encode
+    from panoengine.serve.engine_stage import _ctl_decode, _ctl_encode
 
     frame = {"admits": [{"rid": "r0-v3", "token_ids": [1, 2, 3],
                          "max_tokens": 1}],
@@ -23,7 +23,7 @@ def test_ctl_wire_tp_fanout():
     tensor broadcast): a peer rank reconstructs exactly the frame rank 0
     sent — including the idle heartbeat shape (step False, no admits)."""
     pytest.importorskip("torch")   # frames are length-prefixed uint8 tensors
-    from panoserve.engine_stage import _ctl_wire
+    from panoengine.serve.engine_stage import _ctl_wire
 
     for frame in (
         {"admits": [{"rid": "r7", "prompt": "hi", "max_tokens": 8}],
@@ -48,7 +48,7 @@ def test_reload_stage_weights_uses_vllm_load_weights(tmp_path):
     pytest.importorskip("safetensors")
     from safetensors.torch import save_file
 
-    from panoserve.engine_stage import reload_stage_weights
+    from panoengine.serve.engine_stage import reload_stage_weights
 
     tensors = {"model.layers.0.self_attn.q_proj.weight": torch.ones(4, 4),
                "model.embed_tokens.weight": torch.ones(8, 4)}
@@ -75,7 +75,7 @@ def test_gateway_retarget_during_inflight_request():
     recovery — exactly when requests to the dead island are in flight — and
     the naive `finally: inflight[target] -= 1` raised KeyError there (or, if
     the target came back, drove the count negative and biased routing)."""
-    from panoserve.gateway import Gateway
+    from panoengine.serve.gateway import Gateway
 
     gw = Gateway(["http://a:1", "http://b:2"], health_interval_s=3600)
     target = "http://a:1"
@@ -104,7 +104,7 @@ def test_claim_reload_is_atomic():
     the API had already answered 'scheduled'."""
     import threading
 
-    from panoserve.engine_stage import SpliceServer
+    from panoengine.serve.engine_stage import SpliceServer
 
     srv = SpliceServer.__new__(SpliceServer)
     srv._pending_reload = "http://relay/m"

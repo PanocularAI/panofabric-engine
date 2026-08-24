@@ -38,7 +38,7 @@
 # tree: InprocClient -> EngineCore -> UniProcExecutor -> GPUModelRunner),
 # with enforce_eager so the hooks fire every step.
 #
-#   python -m panoserve.engine_stage --stage-dir staged/stage1 \
+#   python -m panoengine.serve.engine_stage --stage-dir staged/stage1 \
 #       --listen-port 9201 [--next host:9202] --prompts p.txt --out o.txt
 
 from __future__ import annotations

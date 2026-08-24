@@ -3,28 +3,72 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "symphony-learn"
+name = "panofabric-engine"
 version = "0.1.0"
-description = "Pytorch-native platform for hetetrogenous & decentralized training of large-scale AI models"
+description = "Pytorch-native engine for heterogeneous & decentralized training and serving of large-scale AI models"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "PanocularAI team", email = "hello@panocular.ai" }]
-license = {file = "LICENSE"}
+license = { file = "LICENSE" }
 
-# torchtitan/torchft are the training engine. As PEP 508 direct references they
-# are pulled (and built) transitively whenever symphony-learn is installed —
-# including by the `symphony` control plane and on cloud nodes — so a single
-# `pip install symphony-learn` brings the whole engine. torchft builds via maturin
-# and therefore needs Rust + protoc in the install environment (see Makefile
-# `setup-env`). Both forks track `main`; pin to `@<sha>` if a commit breaks.
-dependencies = [
-    "torchtitan @ git+https://github.com/PanocularAI/torchtitan.git@main",
-    "torchft @ git+https://github.com/PanocularAI/torchft.git@main",
+# Base install is light: it gets you the package, `--help`, and the serving
+# plane's pure-python glue. The training engine is the [train] extra because
+# torchft has to COMPILE (see below).
+dependencies = []
+
+[project.optional-dependencies]
+# The training engine. Pinned by SHA, never by branch: a moving ref in a
+# published dist is not reproducible and breaks outright when the branch is
+# deleted (which is exactly what happened to @async_rl / @async-diloco).
+#
+# INSTALL-ORDER TRAP — do not "clean this up":
+#   torchft declares torch>=2.7, so resolving this extra unconstrained can pull
+#   a STABLE torch over a backend-matched NIGHTLY and clobber the whole stack.
+#   torch must be installed LAST, which is what the Makefile's `install-torch`
+#   target does. Same policy as the deliberately-undeclared torch/vllm below.
+#
+#   torchft also builds via maturin, so a git install needs Rust + protoc 32.0
+#   and CPython <= 3.13 (pyo3 0.24's ceiling) on the consumer's machine. That is
+#   the single biggest install-friction item in this repo; prefer the published
+#   image, or `make dev-forks` for local development.
+train = [
+  "torchtitan @ git+https://github.com/PanocularAI/torchtitan.git@8dab07165c50e46e076293a26011443d8443df8f",
+  "torchft   @ git+https://github.com/PanocularAI/torchft.git@429a9dba61b8a04b7d202c9a4ca0be4c42324184",
+  # panoengine.train.pretrain.hf_transformers needs it, and torchtitan's
+  # transformers_modeling_backend imports it without declaring it in either its
+  # pyproject or requirements.txt — so without this line that recipe fails to
+  # import on an otherwise-complete node. Unpinned deliberately: the backend's
+  # own 4.57 pin predates the 5.x we run, matched to vLLM.
+  "transformers",
 ]
 
-# Discover the repo-root config registries (models.llama3, models.qwen3, ...) so
-# they import as installed packages instead of relying on the repo root being on
-# sys.path. Keeping the repo root off sys.path is what lets the editable
-# torchtitan/torchft packages win over the same-named submodule source dirs.
+# The serving plane. torch and vllm are DELIBERATELY NOT DECLARED: every runtime
+# that launches these modules carries backend-matched nightlies installed last,
+# and a plain resolve here would clobber them. This is hard-won; do not "fix" it.
+serve = [
+  "aiohttp>=3.9",
+  "huggingface_hub",
+  "numpy",
+  "safetensors",
+  "transformers",
+]
+
+[project.urls]
+Homepage = "https://github.com/PanocularAI/panofabric-engine"
+
+# No [project.scripts] yet. `panofabric` is taken by the private control-plane
+# CLI, and the repo-root launch.py this would have wrapped was an unfinished stub
+# (its num_nodes/rank/master_addr were literal `...`), so there is nothing to
+# wrap. `run_train.sh` and `python -m torchtitan.train` are the entry points
+# until a real one is written. See the plan's Q2.
+
 [tool.setuptools.packages.find]
-include = ["models*"]
+# panoengine* = the engine. models* = the compatibility shims that keep stored
+# run specs resolving (see models/__init__.py).
+include = ["panoengine*", "models*"]
+exclude = ["panoengine.serve.tests*"]
+
+# No [tool.uv.sources] for the forks on purpose: a declarative `path =
+# "../torchtitan"` override makes `uv sync` fail for anyone who clones this repo
+# without the siblings — i.e. every outside user. Engine hackers get editable
+# forks from `make dev-forks`, which installs them imperatively instead.

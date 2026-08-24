@@ -1,12 +1,18 @@
 # Copyright (c) Panocular AI.
 #
-# Registry smoke test — cheap insurance that the next torchtitan/torchft submodule
+# Registry smoke test — cheap insurance that the next torchtitan/torchft fork
 # rebase (via the `update-submodules` skill) cannot silently re-break every
-# `models/<name>/config_registry.py`, the exact failure mode that produced the
+# recipe's `config_registry.py`, the exact failure mode that produced the
 # original `experiments.ft.*` / `build_loss_fn=` drift.
 #
+# Recipes live in `panoengine.train.*`; `models.<name>` is a compatibility shim
+# kept alive because stored run specs name it. Discovery runs against the
+# CANONICAL modules (a shim's re-exported functions carry the canonical
+# `__module__`, so filtering by it would find nothing), and
+# test_compat_shims_resolve_presets covers the shim layer separately.
+#
 # For every config factory in every supported model it asserts:
-#   1. the `models.<name>.config_registry` module imports        (catches dead imports)
+#   1. the canonical `config_registry` module imports            (catches dead imports)
 #   2. every zero-arg config factory constructs without raising  (catches API drift)
 #   3. the result is a buildable `*.Config`                      (right return type)
 #   4. it carries the fields the drift used to drop (`loss`, `model_spec`)
@@ -35,6 +41,12 @@ SUPPORTED_MODELS = sorted(models._supported_models)
 
 
 def _config_module_name(model: str) -> str:
+    """The canonical (post-move) config_registry module for a recipe."""
+    return f"{models._canonical_modules[model]}.config_registry"
+
+
+def _shim_module_name(model: str) -> str:
+    """The legacy `models.*` path that stored run specs still name."""
     return f"models.{model}.config_registry"
 
 
@@ -88,6 +100,33 @@ def test_config_registry_imports(model: str) -> None:
 def test_every_model_has_a_config(model: str) -> None:
     """Guard against a registry that lost all its factory functions."""
     assert list(discover_config_factories(model)), f"{model}: no config factories found"
+
+
+@pytest.mark.parametrize("model", SUPPORTED_MODELS)
+def test_compat_shims_resolve_presets(model: str) -> None:
+    """`models.<pkg>.config_registry` still resolves every preset, and to the SAME
+    object as the canonical module.
+
+    This is the whole contract the shims exist for: stored run specs and the
+    `RunSpec.model.module` default name `models.<pkg>`, and torchtitan's
+    ConfigManager reaches a preset with getattr(module, config_name). A shim that
+    silently stopped re-exporting would strand every stored spec.
+    """
+    shim = importlib.import_module(_shim_module_name(model))
+    canonical = importlib.import_module(_config_module_name(model))
+
+    factories = dict(discover_config_factories(model))
+    assert factories, f"{model}: no config factories to check the shim against"
+
+    for fn_name, fn in factories.items():
+        via_shim = getattr(shim, fn_name, None)
+        assert via_shim is not None, (
+            f"{_shim_module_name(model)}.{fn_name} does not resolve — the shim "
+            f"stopped re-exporting it and every stored run spec naming it breaks"
+        )
+        assert via_shim is fn is getattr(canonical, fn_name), (
+            f"{model}.{fn_name}: shim and canonical module disagree on the object"
+        )
 
 
 @pytest.mark.parametrize("model,fn_name,fn", CASES)

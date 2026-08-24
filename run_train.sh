@@ -9,15 +9,13 @@ set -ex
 NGPU=${NGPU:-"8"}
 export LOG_RANK=${LOG_RANK:-0}
 
-# Keep the repo root off sys.path so `import torchtitan` / `import torchft`
-# resolve to the editable-installed packages instead of the same-named submodule
-# source directories sitting here (which, lacking a top-level __init__.py, would
-# otherwise shadow them as empty namespace packages). The repo-root config
-# registries (models.*) are reached via the editable `symphony-learn` install,
-# not via cwd, so dropping cwd from the path is safe.
+# Keep the repo root off sys.path so the installed packages always win. The forks
+# are sibling clones now (not in-tree submodules), so the old shadowing hazard is
+# gone, but `panoengine` / `models` must still resolve from the install rather
+# than from cwd.
 export PYTHONSAFEPATH=${PYTHONSAFEPATH:-1}
-MODULE=${MODULE:-"ft.llama3"} # Python module containing config_registry.py (e.g. models.qwen3)
-CONFIG_NAME=${CONFIG_NAME:-"llama3_ft_debugmodel"} # function name in config_registry.py to call for the run config
+MODULE=${MODULE:-"panoengine.train.pretrain.llama3"} # module containing config_registry.py
+CONFIG_NAME=${CONFIG_NAME:-"llama3_debugmodel"} # function in config_registry.py returning the run config
 TRAIN_FILE=${TRAIN_FILE:-"torchtitan.train"} # entry point module passed to torchrun -m; points directly to torchtitan's trainer
 
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}

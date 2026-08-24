@@ -10,7 +10,7 @@ from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.validate import Validator
 from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
-from torchtitan.experiments.torchft.config.job_config import FaultTolerance
+from panoengine.train.strategies import diloco
 from torchtitan.experiments.torchft.optimizer import default_ft_adamw
 from torchtitan.experiments.torchft.trainer import FaultTolerantTrainer
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
@@ -69,14 +69,7 @@ def gptoss_debugmodel() -> FaultTolerantTrainer.Config:
             export_dtype="float32",
         ),
         activation_checkpoint=None,
-        fault_tolerance=FaultTolerance(
-            enable=True,
-            sync_steps=10,
-            num_fragments=2,
-            semi_sync_method="diloco",
-            process_group="gloo",
-            process_group_timeout_ms=10000,
-        ),
+        fault_tolerance=diloco(),
         validator=Validator.Config(
             enable=False,
             freq=5,

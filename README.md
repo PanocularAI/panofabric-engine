@@ -29,9 +29,10 @@ Every recipe in this repo is a `FaultTolerantTrainer.Config`, so a workload does
 | **SFT (instruction tuning)**             |  —   |   —    |   —    |  —    |
 | **RL (GRPO)** <sup>†</sup>               |  ✅  |   ✅   |   ✅   |  ✅   |
 
-<sup>†</sup> RL works, but its recipes currently live in the torchtitan fork
-(`torchtitan/experiments/decentralized_rl/`) because its actors subclass upstream's
-own experimental `PolicyTrainer`. See [FORK-DELTA.md](FORK-DELTA.md).
+<sup>†</sup> The RL presets live here (`panoengine/train/rl/`), as do the parameter server,
+relay and rollout queue. The Monarch trainer actors and replica classes stay in the torchtitan
+fork, because they subclass upstream's own experimental `PolicyTrainer` and `Controller`. See
+[FORK-DELTA.md](FORK-DELTA.md) for exactly where that line falls.
 
 **On the SFT row:** the em-dashes are honest. What exists is LoRA fine-tuning
 (`panoengine/train/finetune/lora`) and a full-parameter HF backend
@@ -46,10 +47,11 @@ ten minutes and would cost you the rest of the table.)
 
 ```
 panoengine/
-├── decentralized/    async DiLoCo + HeLoCo — the algorithms themselves
+├── decentralized/    async DiLoCo + HeLoCo, the parameter server, relay, rollout queue
 ├── train/
 │   ├── pretrain/     llama3, qwen3, gpt_oss, hf_transformers (any HF architecture)
 │   ├── finetune/     lora
+│   ├── rl/           GRPO presets (the trainers they name live in the fork)
 │   ├── recipes/      resnet — the non-LLM reference recipe
 │   └── strategies.py the fault-tolerance defaults every recipe shares
 models/               compatibility shims; stored run specs still name models.<pkg>

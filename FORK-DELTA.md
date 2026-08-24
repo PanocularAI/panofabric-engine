@@ -4,7 +4,8 @@ This engine composes two forks:
 
 * [PanocularAI/torchtitan](https://github.com/PanocularAI/torchtitan) — see its own
   [FORK-DELTA.md](https://github.com/PanocularAI/torchtitan/blob/main/FORK-DELTA.md).
-  34 files, +8032 / −119 vs upstream.
+  34 files, +5561 / −119 vs upstream (it was +8032 before the parameter server, relay,
+  rollout queue and RL presets moved into this repo).
 * [PanocularAI/torchft](https://github.com/PanocularAI/torchft) — see its own
   [FORK-DELTA.md](https://github.com/PanocularAI/torchft/blob/main/FORK-DELTA.md).
   10 files, +2368 / −14 vs upstream (it was 15 files / +7440 before the async DiLoCo and
@@ -20,7 +21,7 @@ is what happened to the old `@async_rl` and `@async-diloco` refs.
 |---|---|
 | Code that must **subclass or patch upstream internals**: the RL trainers in `experiments/decentralized_rl/` (extend `experiments.rl`'s `PolicyTrainer`), `torchft.semi_async_*` (extends the private `_StreamingDiLoCoFragment`), and the additive `Manager` / `local_sgd` patches — you cannot add methods to a class from outside it | Code that stands on its own or only **composes public classes**: **async DiLoCo and HeLoCo** (`panoengine.decentralized`), every recipe, every preset, the strategy defaults, dataloaders, the serving plane |
 | Breaks when upstream moves an *internal* | Breaks only when upstream changes a *public signature* |
-| ~9.5k lines across the two forks | ~4k lines, and the place all new work lands |
+| ~7.9k lines across the two forks | ~7.2k lines, and the place all new work lands |
 
 This is a real line, not a fudge. `panoengine/train/finetune/lora/config_registry.py` already
 imports `torchtitan.experiments.torchft.{checkpoint,optimizer,trainer,diloco}` and composes
@@ -35,7 +36,7 @@ adapter imports this package, and a torchtitan-free extra keeps that from being 
 ## Why the forks are permanent, and why that is cheap
 
 A rebase conflicts only on files **both sides touched**. Added files never conflict. So the
-carrying cost is the **119 + 14 deleted lines across 21 modified files** — not the ~15,000
+carrying cost is the **119 + 14 deleted lines across 21 modified files** — not the ~7,900
 added ones. The new modules are free to keep in-tree forever.
 
 Which means the maintenance lever is not "get out of the fork business". It is "shrink the

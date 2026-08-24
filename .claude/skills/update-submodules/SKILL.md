@@ -1,15 +1,26 @@
 ---
 name: update-submodules
-description: Update a vendored git submodule (torchtitan, torchft, or any future fork-based submodule) to a newer upstream version while preserving Panocular's custom changes that live on top of upstream. Use this whenever the user wants to "update torchtitan/torchft", "update the submodules", "pull in upstream changes", "rebase our fork", "bump a submodule", "sync the fork with upstream", or resolve conflicts between our changes and new upstream code. Trigger even if the user only names one submodule or just says "update the submodule".
+description: Update a vendored fork (torchtitan, torchft, or any future fork) to a newer upstream version while preserving Panocular's custom changes that live on top of upstream. Use this whenever the user wants to "update torchtitan/torchft", "update the forks", "update the submodules", "pull in upstream changes", "rebase our fork", "bump a fork", "sync the fork with upstream", or resolve conflicts between our changes and new upstream code. Trigger even if the user only names one fork.
 ---
 
-# Update a fork-based submodule from upstream
+# Update a fork from upstream
 
 ## Mental model — read this first
 
-This repo (`symphony-learn`) vendors libraries as git **submodules** that point at
-**Panocular forks** (e.g. `PanocularAI/torchtitan`, `PanocularAI/torchft`), not at the
-upstream projects directly.
+This repo (`panofabric-engine`) depends on **Panocular forks** (`PanocularAI/torchtitan`,
+`PanocularAI/torchft`) rather than the upstream projects directly.
+
+**These are NOT submodules any more.** They are ordinary **sibling clones** next to this
+repo (`../torchtitan`, `../torchft`), created by `make forks` / `make dev-forks`, and the
+engine pins them **by SHA** in two places that must stay in sync:
+
+* `pyproject.toml` — the `[train]` extra's `torchtitan @ git+...@<sha>` / `torchft @ ...@<sha>`
+* `Makefile` — `TORCHTITAN_REF` / `TORCHFT_REF`
+
+A third pin lives in the private control-plane repo: `panofabric/Makefile`'s
+`TORCHTITAN_REQ` / `TORCHFT_REQ` (needed because `uv pip` accepts git URLs only from the
+command line, never from a package's metadata). Update it too, or `make install-engine`
+drifts from the engine.
 
 Each fork's `main` is structured the same way:
 
@@ -23,12 +34,12 @@ Each fork's `main` is structured the same way:
 
 So our changes are a **small stack of commits replayed on top of an upstream snapshot**.
 **Updating = rebase that stack onto a newer upstream commit, resolve conflicts, push the fork,
-then move the submodule pointer in `symphony-learn` and commit it.** That's the whole job for
-*every* submodule — only the remote URLs, the files our stack touches, and the verification
-commands differ. Everything below is the careful, generic version of those five moves.
+then update the SHA pins.** That's the whole job for *every* fork — only the remote URLs, the
+files our stack touches, and the verification commands differ. Everything below is the
+careful, generic version of those five moves.
 
 **Never hardcode the stack's SHAs or commit count** — always rediscover it dynamically per
-submodule (Step 2), because the stack grows over time and differs between submodules.
+fork (Step 2), because the stack grows over time and differs between forks.
 
 ## Submodule registry
 
@@ -39,8 +50,8 @@ Run `cat .gitmodules` from the repo root to see the current set. Known mappings:
 | `torchtitan` | `git@github.com:PanocularAI/torchtitan.git` | `https://github.com/pytorch/torchtitan.git` |
 | `torchft` | `git@github.com:PanocularAI/torchft.git` | `https://github.com/pytorch/torchft.git` |
 
-If the user says "update the submodules" without naming one, ask which (or do all of them) and
-run the steps below **once per submodule**.
+If the user says "update the submodules" (still the common phrasing) without naming one, ask
+which — or do both — and run the steps below **once per fork**.
 
 ## Guardrails
 
@@ -55,16 +66,19 @@ run the steps below **once per submodule**.
 
 ---
 
-The steps below use `$SM` for the submodule path (e.g. `torchtitan`). Set it once per submodule
-and repeat the whole sequence.
+The steps below use `$SM` for the fork's directory name (e.g. `torchtitan`) and reach it as
+`../$SM` from this repo. Set it once per fork and repeat the whole sequence.
 
 ## Step 0 — Orient and check preconditions
 
 ```bash
-cd "$SM"                          # the submodule, from repo root
+cd "../$SM"                       # the sibling clone
 git status                        # MUST be clean; if dirty, stop and ask the user
 git remote -v                     # expect: origin -> PanocularAI/<name>
 ```
+
+Each fork also carries a `FORK-DELTA.md` listing exactly which files our stack modifies —
+read it first, because that list *is* the conflict surface you are about to hit.
 
 Ensure the upstream remote exists (URL from the registry above), then fetch everything:
 
@@ -75,11 +89,12 @@ git fetch origin
 git fetch upstream
 ```
 
-Note the submodule pointer the parent currently records — it may lag `origin/main`:
+Note the SHA the engine currently pins — it may lag `origin/main`:
 
 ```bash
-git rev-parse HEAD            # what symphony-learn points at
-git rev-parse origin/main    # tip of the fork
+git rev-parse HEAD                                   # this clone's checkout
+git rev-parse origin/main                            # tip of the fork
+grep -E 'TORCHTITAN_REF|TORCHFT_REF' ../panofabric-engine/Makefile   # what we pin
 ```
 
 ## Step 1 — Decide the target upstream ref
@@ -154,24 +169,28 @@ If it gets messy, `git rebase --abort` returns you to a clean `origin/main` to r
 ## Step 5 — Verify without a full run
 
 Confirm the tree is coherent — this catches the most common rebase breakage (stale imports,
-moved symbols). Verification is submodule-specific:
+moved symbols). Verification is fork-specific:
 
-- **Pure-Python submodule (e.g. torchtitan):** from the repo root, using the project venv:
+- **Pure-Python fork (e.g. torchtitan):** from this repo's root, using the project venv:
   ```bash
   python -c "import torchtitan; print(torchtitan.__file__)"
-  python -c "import torchtitan.experiments.ft.manager, torchtitan.experiments.ft.checkpoint"
-  ls tests && python -m pytest tests -q     # if present and quick
+  python -c "import torchtitan.experiments.torchft.manager, torchtitan.experiments.torchft.checkpoint"
+  python -m pytest tests -q                 # the recipe smoke test — see below
   ```
+  **Run `tests/test_config_registry.py`.** It constructs every preset in every recipe and is
+  the cheapest possible detector of exactly the drift a rebase causes (a moved symbol, a
+  renamed kwarg). It is why this suite exists.
   Also eyeball that `run_train.sh`'s entry points still exist (`MODULE`, `TRAIN_FILE`,
   `CONFIG_NAME`), since upstream refactors config registries periodically. Do NOT launch
   `run_train.sh`.
 
-- **Submodule with a native/Rust extension (e.g. torchft):** importing requires a build. Rebuild
-  the extension before the import check (it ships a Rust core via maturin):
+- **Fork with a native/Rust extension (e.g. torchft):** importing requires a build. Rebuild
+  the extension before the import check (it ships a Rust core via maturin, needing Rust,
+  `protoc` 32.0 and CPython <= 3.13):
   ```bash
-  pip install -e ./torchft        # or: (cd torchft && maturin develop)
+  pip install -e ../torchft       # or: (cd ../torchft && maturin develop)
   python -c "import torchft; print(torchft.__file__)"
-  (cd torchft && cargo build 2>/dev/null; ls tests && python -m pytest tests -q)
+  (cd ../torchft && cargo build 2>/dev/null && python -m pytest tests -q)
   ```
   If a full rebuild isn't feasible in this environment, say so explicitly rather than claiming the
   import passed.
@@ -197,26 +216,33 @@ update it with a lease guard:
 git push --force-with-lease origin "${SM}-update-$(date +%Y%m%d):main"
 ```
 
-## Step 7 — Bump the submodule pointer in symphony-learn
+## Step 7 — Update the SHA pins
 
-Point the parent at the new commit and commit that change. Use the merged `origin/main` if you
-opened+merged a PR, otherwise the branch tip you pushed.
+There is no submodule pointer to move. Update the pins instead — **all three**, or the engine,
+its Makefile and the control plane drift apart:
 
 ```bash
-cd "$SM"
-git fetch origin
-git checkout <new-sha-or-origin/main>
-cd ..
-git add "$SM"
-git submodule status "$SM"        # confirm the new SHA
-git commit -m "Bump $SM submodule to upstream <ref> (rebased stack)"
+NEW=$(git -C "../$SM" rev-parse origin/main)   # or the branch tip you pushed
+
+# 1 + 2. The engine: pyproject.toml [train] extra, and the Makefile ref.
+#        Both live in this repo; grep the old sha and replace it in both.
+grep -rn "<old-sha>" pyproject.toml Makefile
+
+# 3. The private control plane (TORCHTITAN_REQ / TORCHFT_REQ).
+grep -n "$SM" ../panofabric/Makefile
 ```
 
-If you updated multiple submodules, you can stage them all and use one commit, or one per
-submodule — match the user's preference. Don't push `symphony-learn` or open its PR unless asked.
+Then confirm nothing still names a dead ref — a deleted branch or a stale sha is exactly how
+`make install-engine` broke before:
 
-End with a summary per submodule: old vs new upstream base, the stack after rebase, conflicts
-resolved, anything dropped as obsolete, and what was verified.
+```bash
+git ls-remote https://github.com/PanocularAI/$SM.git | grep "$NEW"   # MUST match
+```
+
+Commit the pin bumps. Don't push this repo or open its PR unless asked.
+
+End with a summary per fork: old vs new upstream base, the stack after rebase, conflicts
+resolved, anything dropped as obsolete, which pins you moved, and what was verified.
 
 ## Quick reference
 
@@ -227,4 +253,5 @@ resolved, anything dropped as obsolete, and what was verified.
 | Replay stack | `git rebase --onto <target> $(git merge-base origin/main upstream/main)` |
 | Abort | `git rebase --abort` |
 | Publish | branch + `gh pr create` (preferred) or `git push --force-with-lease origin <branch>:main` |
-| Bump pointer | `git add <submodule> && git commit` in `symphony-learn` |
+| Bump pins | `pyproject.toml` `[train]` + `Makefile` refs here, **and** `panofabric/Makefile`'s `*_REQ` |
+| Check a pin is real | `git ls-remote https://github.com/PanocularAI/$SM.git \| grep <sha>` |

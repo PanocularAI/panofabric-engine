@@ -1,135 +1,187 @@
 <div align="center">
 
+# panofabric-engine
 
+#### A PyTorch-native engine for heterogeneous & decentralized training of large-scale AI models
 
-# SymphonyLearn
-
-#### A Pytorch-native platform for hetetrogenous & decentralized training of large-scale AI models
-
-![SymphonyLearn](docs/assets/symphonylearn.png)
+![panofabric-engine](docs/assets/symphonylearn.png)
 </div>
 
 ## 🧭 Overview
+
 As AI models, especially Large Language Models (LLMs) and Vision-Language Models (VLMs), continue to grow in scale and complexity, the need for heterogeneous and decentralized training strategies is becoming increasingly critical. Training such massive models demands enormous computational resources, which are often inaccessible to most researchers and organizations.
 
 HPC centers around the world host a wide variety of GPUs, ranging across different vendors, architectures, and hardware configurations. However, these variations introduce compatibility and utilization challenges, often preventing AI researchers from seamlessly leveraging multiple HPC systems at once.
 
-This platform demonstrates a practical approach to overcoming these challenges by connecting heterogeneous HPC resources in a decentralized manner using the Diloco algorithm. It enables collaborative, cross-platform AI model training without requiring homogeneous hardware or centralized orchestration. In particular, this platform enables two levels of heterogeneity:
+This engine is a practical approach to overcoming those challenges: it connects heterogeneous compute in a decentralized manner using DiLoCo and its relatives, enabling collaborative, cross-platform training without homogeneous hardware or centralized orchestration. Two levels of heterogeneity are supported:
 
-* **Cross-Hardware heterogeneity:**
-Train models across multiple hardware platforms—leveraging both PyTorch and DaCe integration. This provides flexibility to exploit various computation resources, regardless of vendor or GPU generation. Supporting efficient training on exotic backends can be supported via extending DaCe.
+* **Cross-hardware heterogeneity:** train across multiple hardware platforms, regardless of vendor or GPU generation.
+* **Non-uniform GPU distribution:** clusters vary widely in node configuration (commonly 4 or 8 GPUs per node). Islands of different sizes train together.
 
-* **Non-uniform GPU distribution:**
-HPC clusters vary widely in their node configurations (commonly with 4 or 8 GPUs per node). Our platform offers native support for varying GPU counts and node structures, allowing seamless scaling across diverse systems.
+## 📊 What it covers
 
-## 💡 Why Use This Platform?
-* Overcome hardware heterogeneity in HPC environments
-* Enable decentralized collaboration for large-model training
-* Achieve efficient cross-center resource sharing
-* Lower the computational and financial barriers to AI research
+Every recipe in this repo is a `FaultTolerantTrainer.Config`, so a workload does not opt in to decentralized training — it gets it by construction. The strategy is chosen at launch (`--fault_tolerance.semi_sync_method=...`), not baked into the recipe.
+
+|                                          | solo | DiLoCo | HeLoCo | async |
+|------------------------------------------|:----:|:------:|:------:|:-----:|
+| **pretraining**                          |  ✅  |   ✅   |   ✅   |  ✅   |
+| **LoRA fine-tuning**                     |  ✅  |   ✅   |   ✅   |  ✅   |
+| **SFT (instruction tuning)**             |  —   |   —    |   —    |  —    |
+| **RL (GRPO)** <sup>†</sup>               |  ✅  |   ✅   |   ✅   |  ✅   |
+
+<sup>†</sup> RL works, but its recipes currently live in the torchtitan fork
+(`torchtitan/experiments/decentralized_rl/`) because its actors subclass upstream's
+own experimental `PolicyTrainer`. See [FORK-DELTA.md](FORK-DELTA.md).
+
+**On the SFT row:** the em-dashes are honest. What exists is LoRA fine-tuning
+(`panoengine/train/finetune/lora`) and a full-parameter HF backend
+(`panoengine/train/pretrain/hf_transformers`) — but both train on raw text, so they are
+parameter-efficient and full-parameter *continued pretraining*. Instruction tuning needs a
+data path that does not exist yet: chat-template rendering, prompt-token loss masking,
+sample packing with correct attention boundaries, and an eval split. Until that lands,
+this repo does not claim SFT. (An `sft/` directory aliasing LoRA would be discovered in
+ten minutes and would cost you the rest of the table.)
+
+## 🗂️ Layout
+
+```
+panoengine/
+├── train/
+│   ├── pretrain/     llama3, qwen3, gpt_oss, hf_transformers (any HF architecture)
+│   ├── finetune/     lora
+│   ├── recipes/      resnet — the non-LLM reference recipe
+│   └── strategies.py the fault-tolerance defaults every recipe shares
+models/               compatibility shims; stored run specs still name models.<pkg>
+```
+
+Each recipe's `config_registry.py` assembles a whole training stack — trainer, optimizer,
+loss, LR schedule, dataloader, activation-checkpoint policy, fault-tolerance manager and
+checkpoint manager. torchtitan's `ConfigManager` selects one by module and function name,
+which *is* the plugin system: any installed module exposing a `config_registry` works.
 
 ## 🧪 Tested platforms
-We tested and validated heterogenous training on the following platforms:
+
 - [x] Nvidia GPUs (L40S, A100, H100, H200)
 - [x] AMD GPUs (MI300X)
 
 Training on a CPU backend is not supported as of now.
 
-## 📑 Documentations
-Besides the [Getting started](#-getting-started) section, you can find additional documentations in the [doc](docs/) folder.
+## 📦 Installation
 
-- [Detailed installation tutorial](docs/installation.md)
-- [Detailed description on decentralized and heterogeneous training](docs/distributed.md)
-- [Tutorial on adding a new model](docs/model.md)
-- [Deployment on Cloud using SkyPilot](docs/skypilot.md)
+The engine composes two forks, [torchtitan](https://github.com/PanocularAI/torchtitan) and
+[torchft](https://github.com/PanocularAI/torchft), which stay forks on purpose — see
+[FORK-DELTA.md](FORK-DELTA.md).
 
-## 🚀 Getting Started
-### Installing the framework
-First clone the repository with:
-```
-git clone --recursive https://github.com/PanocularAI/symphony-learn.git
-```
-Make sure that you pull all submodules using `--recursive` flag.
+**One thing to know first:** torchft builds its Rust extension via maturin, so installing
+it from source needs a Rust toolchain, `protoc` 32.0, and CPython ≤ 3.13 (pyo3 0.24's
+ceiling). That is the single biggest install-friction item here, and it is why the paths
+below are ordered the way they are.
 
-To facilitate the installation of the framework, you may run the make file to automatically setup the dependencies and environment.
-```
-make all
+```bash
+# 1. Development on the engine itself: sibling fork clones, installed editable.
+git clone https://github.com/PanocularAI/panofabric-engine.git
+cd panofabric-engine
+make all          # toolchain, project, backend-matched torch, the forks
+make dev-forks    # optional: editable forks for hacking on them
+
+# 2. Ordinary install (needs the Rust toolchain above).
+pip install 'panofabric-engine[train]'
 ```
 
-However, it might be the case that any of the commands in the makefile fail due to incompatibility with your setup. Therefore, please refer to the detailed [Installation Guideline](docs/installation.md) for installing dependencies and troubleshooting. 
+There are no submodules: `git clone --recursive` plus a Rust build is where a newcomer
+bounces. `make all` clones the forks as siblings at their pinned SHAs.
+
+> **Install-order trap.** torchft declares `torch>=2.7`, so resolving `[train]`
+> unconstrained can pull a *stable* torch over a backend-matched *nightly* and clobber the
+> stack. torch must be installed **last** — which is what `make install-torch` does.
+
+If a Makefile step fails on your setup, see the [Installation Guideline](docs/installation.md).
 
 ### Setting up Tailscale VPN
-To establish communication between different compute islands, each compute node must have a routable public IP address.
-If public IPs are not available, it is recommended to use Tailscale. Please follow the [instructions](docs/installation.md#tailscale-setup) to setup the tailscale service on your machine.
 
+To establish communication between compute islands, each node needs a routable address. If
+public IPs are not available, use Tailscale — see the
+[instructions](docs/installation.md#tailscale-setup).
 
-### Launch the decentralized training
-Here we explain a sample training of a llama3 model on two different Nvidia islands in a decentralized way. 
-For a more detailed explanation and required arguments to support fully heterogenous training (different number of gpus and vendors), please refer to [Launching Training](docs/distributed.md).
+## 🚀 Quickstart: train across two machines
 
-You need to execute the following three commands in different shell sessions:
+This is the thing the stack is for. Two islands, separate networks, one model — run these
+in three shells. For fully heterogeneous setups (different GPU counts and vendors) see
+[Launching Training](docs/distributed.md).
 
-1. Start the lighthouse engine.
-```
-RUST_BACKTRACE=1 torchft_lighthouse --bind=<public_ip>:29510 --min_replicas 1 --quorum_tick_ms 100 --join_timeout_ms 10000
-```
-
-2. Run the training on the first island:
-```
-TORCHFT_LIGHTHOUSE=http://<public_ip>:29510 \
-NGPU=1 \
-LOCAL_ADDR=${LOCAL_ADDR} \
-MASTER_ADDR=${MASTER_ADDR} \
-MASTER_PORT=29500 \
-NNODES=<num_nodes> \
-ISHOST=<yes_if_master-no_if_worker> \
-GLOO_SOCKET_IFNAME=<network_card> \
-NCCL_SOCKET_IFNAME=<network_card> \
-MODULE="models.llama3" \
-CONFIG_NAME="llama3_debugmodel" \
-uv run ./run_train.sh --fault_tolerance.enable --fault_tolerance.replica_id=0 --fault_tolerance.group_size=2
+1. Start the lighthouse (the rendezvous service the islands find each other through):
+```bash
+RUST_BACKTRACE=1 torchft_lighthouse --bind=<public_ip>:29510 \
+  --min_replicas 1 --quorum_tick_ms 100 --join_timeout_ms 10000
 ```
 
-3. Run the training on the second island:
-```
+2. Island 0:
+```bash
 TORCHFT_LIGHTHOUSE=http://<public_ip>:29510 \
 NGPU=1 \
 LOCAL_ADDR=<local_ip> \
 MASTER_ADDR=<master_c10d_ip> \
 MASTER_PORT=29500 \
 NNODES=<num_nodes> \
-ISHOST=<yes_if_master-no_if_worker> \
+ISHOST=true \
 GLOO_SOCKET_IFNAME=<network_card> \
 NCCL_SOCKET_IFNAME=<network_card> \
-MODULE="models.llama3" \
+MODULE="panoengine.train.pretrain.llama3" \
 CONFIG_NAME="llama3_debugmodel" \
-uv run ./run_train.sh --fault_tolerance.enable --fault_tolerance.replica_id=1 --fault_tolerance.group_size=2
+uv run ./run_train.sh --fault_tolerance.enable \
+  --fault_tolerance.replica_id=0 --fault_tolerance.group_size=2
 ```
 
-## 🤖 Supported models
-Currently, we validated the decentralized training of the following [models](models/):
+3. Island 1 — identical, with `ISHOST=false` and `--fault_tolerance.replica_id=1`.
 
-- [x] Llama3
-- [x] Qwen3
-- [x] GPT_OSS
-- [x] Resnets
-
-Before running training, make sure to download the relevant tokenizer from HF, using:
+Swap the strategy without touching the recipe:
 
 ```bash
-uv run python torchtitan/scripts/download_hf_assets.py --repo_id <hf_repo_name> --assets tokenizer --hf_token=$HF_TOKEN
+uv run ./run_train.sh ... --fault_tolerance.semi_sync_method=heloco
 ```
 
-Replace `<hf_repo_name>` with the HF model path, such as `meta-llama/Llama-3.1-8B` for Llama3-8B, or `Qwen/Qwen3-0.6B` for Qwen3-0.6B. Specifying `$HF_TOKEN` and requesting access to Llama3 on HF is required for downloading Llama tokenizer.
+## 🤖 Models and recipes
 
-There are many more already added in [TorchTitan models](https://github.com/pytorch/torchtitan/tree/main/torchtitan/models) and [TorchTitan experiment models](https://github.com/pytorch/torchtitan/tree/main/torchtitan/experiments). Moreover, new models can be simply added by following the [Adding a new model tutorial](docs/model.md).
+| Recipe | Module |
+|---|---|
+| Llama3 | `panoengine.train.pretrain.llama3` |
+| Qwen3 (incl. MoE) | `panoengine.train.pretrain.qwen3` |
+| GPT-OSS | `panoengine.train.pretrain.gpt_oss` |
+| Any HF architecture | `panoengine.train.pretrain.hf_transformers` |
+| LoRA (Qwen3, Llama3) | `panoengine.train.finetune.lora` |
+| ResNet / CIFAR-10 | `panoengine.train.recipes.resnet` |
+
+Every module above is also reachable at its legacy `models.<pkg>` path.
+
+Before training, download the tokenizer:
+
+```bash
+uv run python ../torchtitan/scripts/download_hf_assets.py \
+  --repo_id <hf_repo_name> --assets tokenizer --hf_token=$HF_TOKEN
+```
+
+Replace `<hf_repo_name>` with the HF model path, e.g. `meta-llama/Llama-3.1-8B` or
+`Qwen/Qwen3-0.6B`. Llama3 is a gated repo, so it needs `$HF_TOKEN` and an access request.
+
+Many more architectures exist in
+[TorchTitan models](https://github.com/pytorch/torchtitan/tree/main/torchtitan/models) and
+its [experiments](https://github.com/pytorch/torchtitan/tree/main/torchtitan/experiments),
+and new ones follow the [Adding a new model tutorial](docs/model.md).
+
+## 📑 Documentation
+
+- [Detailed installation tutorial](docs/installation.md)
+- [Decentralized and heterogeneous training](docs/distributed.md)
+- [What DiLoCo / HeLoCo / async actually do](docs/decentralized-training.md)
+- [Adding a new model](docs/model.md)
+- [Deployment on cloud using SkyPilot](docs/skypilot.md)
+- [What we changed in the forks, and why](FORK-DELTA.md)
 
 ## 🙏 Acknowledgement
+
 This work builds upon the following open-source frameworks:
 
 * [TorchTitan](https://github.com/meta-pytorch/torchtitan) — a PyTorch-native platform for large-scale generative AI model training (Liang et al., ICLR 2025).
 * [TorchFT](https://github.com/meta-pytorch/torchft) — a library providing fault-tolerance primitives for distributed PyTorch training (HSDP, LocalSGD, DiLoCo, Streaming DiLoCo).
 
 We gratefully acknowledge the PyTorch, TorchTitan, and TorchFT teams for their foundational contributions to distributed and fault-tolerant ML training infrastructures.
-
-This project is gratefully funded by [federal ministry of breakthrough innovation (SPRIN-D)](https://www.sprind.org/en) under [Composite Learning Challenge](https://www.sprind.org/en/actions/challenges/composite-learning). 

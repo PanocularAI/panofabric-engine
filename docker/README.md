@@ -7,9 +7,10 @@ on every run. Cold provisioning drops from **~10 min to ~1**.
 What's baked (mirrors `make all`, once at build time):
 
 - the torch **nightly** for a chosen CUDA build (`cu130` by default),
-- **torchtitan** + **torchft**, built from *this repo's submodules* (so the image matches
+- **torchtitan** + **torchft**, built from the *sibling fork clones* (so the image matches
   the exact SHAs you have checked out; the torchft Rust extension is compiled here, once),
-- **symphony-learn** itself, for the `models.*` config registries,
+- **panofabric-engine** itself, for the `panoengine.train.*` recipe registries
+  (still reachable at their legacy `models.*` paths),
 
 inside a venv at `/opt/symphony/.venv`, on PATH. A container ships its own CUDA userspace,
 so the image only needs the host NVIDIA **driver** to be recent enough — it does not have
@@ -23,13 +24,20 @@ to match the host CUDA toolkit.
 docker login ghcr.io && PUSH=1 ./docker/build-engine-image.sh   # build + push
 ```
 
-The build installs torchtitan/torchft from the **checked-out submodules**, so to refresh
-the engine you bump the submodules and rebuild:
+The build installs torchtitan/torchft from the **sibling clones** (`../torchtitan`,
+`../torchft` by default — `make forks` creates them), passed in as named build contexts. To
+refresh the engine, move those checkouts and rebuild:
 
 ```bash
-git submodule update --remote torchtitan torchft   # or check out specific SHAs
+git -C ../torchtitan pull                       # or check out specific SHAs
 PUSH=1 ./docker/build-engine-image.sh
+
+# Or build a different checkout without touching the siblings:
+TORCHTITAN_DIR=/path/to/torchtitan PUSH=1 ./docker/build-engine-image.sh
 ```
+
+The script warns if a fork has uncommitted changes: they are baked in, but the image's SHA
+label cannot describe them.
 
 ### Tags
 
@@ -54,5 +62,5 @@ Extra args pass straight through to `docker build`, e.g. `--no-cache`.
 ## Requirements
 
 - Docker with BuildKit (the script exports `DOCKER_BUILDKIT=1`).
-- Submodules initialized: `git submodule update --init torchtitan torchft`.
+- The forks checked out as siblings: `make forks` (or set TORCHTITAN_DIR / TORCHFT_DIR).
 - An x86_64 build host.

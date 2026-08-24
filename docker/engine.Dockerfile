@@ -1,14 +1,15 @@
 # syntax=docker/dockerfile:1.7
 #
-# SymphonyLearn engine image — bakes the training engine (torch nightly + torchtitan +
-# torchft + the models.* registry) into a container so a fresh node skips `make all`:
-# no apt, no rustup, no torchft compile, no 2.5 GB torch download. The symphony control
+# panofabric-engine image — bakes the training engine (torch nightly + torchtitan +
+# torchft + the recipe registry) into a container so a fresh node skips `make all`:
+# no apt, no rustup, no torchft compile, no 2.5 GB torch download. The control
 # plane just references it via `--engine-image`; this repo OWNS and publishes it.
 #
 # It mirrors `make all`, but ONCE at build time, and — crucially — builds torchtitan and
-# torchft from THIS checkout's submodules (uv pip install ./torchtitan ./torchft), so the
-# image matches the exact submodule SHAs checked out here. To refresh: bump the submodules
-# (git submodule update --remote …) and rebuild with docker/build-engine-image.sh.
+# torchft from the SIBLING CLONES, so the image matches the exact fork SHAs you have
+# checked out. The forks arrive as NAMED BUILD CONTEXTS (they are no longer submodules,
+# so they are not inside this repo's build context); docker/build-engine-image.sh wires
+# them up. To refresh: check the forks out where you want them and rebuild.
 
 ARG CUDA_VERSION=13.0.3
 ARG UBUNTU_VERSION=24.04
@@ -50,21 +51,25 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 # stage (same ubuntu base => identical /usr/bin/pythonX.Y at the symlink target).
 RUN uv venv --python /usr/bin/python${PYTHON_VERSION} ${VIRTUAL_ENV}
 
-# The repo (with submodules) is the build context; .dockerignore drops .venv/.git/outputs/
-# torchft's target/ etc. so only source travels.
+# This repo is the build context; .dockerignore drops .venv/.git/outputs/ so only source
+# travels. The forks come in as named contexts (see the header).
 WORKDIR /build
 COPY . /build
 
-# install-torchtt-ft (Makefile): torchtitan deps, then torchtitan + torchft from the local
-# submodule source. `uv pip install .` adds symphony-learn for the models.* registry
-# (--no-deps: torchtitan/torchft are already installed from source here, not from the
-# pyproject git refs). This is where torchft compiles from source — paid once.
+# install-torchtt-ft (Makefile): torchtitan deps, then torchtitan + torchft from the
+# sibling clones, bind-mounted from their named build contexts. `rw` because setuptools
+# and maturin write build metadata into the source dir (it lands in a scratch overlay,
+# never in the checkout). `uv pip install --no-deps .` then adds panofabric-engine for the
+# recipe registry (--no-deps: the forks are already installed from source here, not from
+# the pyproject git pins). This is where torchft compiles from source — paid once.
 # `transformers` is torchtitan's undeclared transformers_modeling_backend dep, which
-# models/hf_transformers imports (see the Makefile target for the long version).
+# panoengine.train.pretrain.hf_transformers imports (see the Makefile for the long version).
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install -r torchtitan/requirements.txt \
-    && uv pip install ./torchtitan \
-    && uv pip install ./torchft \
+    --mount=type=bind,from=torchtitan,target=/src/torchtitan,rw \
+    --mount=type=bind,from=torchft,target=/src/torchft,rw \
+    uv pip install -r /src/torchtitan/requirements.txt \
+    && uv pip install /src/torchtitan \
+    && uv pip install /src/torchft \
     && uv pip install --no-deps . \
     && uv pip install transformers
 
@@ -112,7 +117,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 libssl3 ca-certificates iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
-# The whole engine: venv (torch + torchtitan + torchft + models.*) + run_train.sh.
+# The whole engine: venv (torch + torchtitan + torchft + panoengine) + run_train.sh.
 COPY --from=builder /opt/symphony /opt/symphony
 WORKDIR /opt/symphony
 
@@ -121,13 +126,13 @@ WORKDIR /opt/symphony
 RUN python -c "import torch, torchtitan, torchft; print('baked torch', torch.__version__)"
 
 # OCI labels: source -> THIS repo (so GHCR shows symphony-learn's README, not symphony's);
-# the build script passes the resolved submodule SHAs.
+# the build script passes the resolved fork SHAs.
 ARG TORCHTITAN_SHA=unknown
 ARG TORCHFT_SHA=unknown
 ARG CUDA_TAG=cu130
 LABEL org.opencontainers.image.title="symphony-engine" \
       org.opencontainers.image.source="https://github.com/PanocularAI/symphony-learn" \
-      org.opencontainers.image.description="Baked training engine (torch nightly + torchtitan + torchft + models.*) for SymphonyLearn." \
+      org.opencontainers.image.description="Baked training engine (torch nightly + torchtitan + torchft + panoengine recipes) for panofabric-engine." \
       ai.panocular.cuda="${CUDA_TAG}" \
       ai.panocular.ref.torchtitan="${TORCHTITAN_SHA}" \
       ai.panocular.ref.torchft="${TORCHFT_SHA}"

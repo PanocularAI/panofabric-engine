@@ -4,11 +4,11 @@
 # that replaces `make all` on training nodes (docker/engine.Dockerfile). The symphony
 # control plane consumes it via `--engine-image`.
 #
-# Unlike a git-URL install, this builds torchtitan + torchft from THIS checkout's
-# submodules, so the image == the exact submodule SHAs you have checked out. To refresh
-# the engine:
-#     git submodule update --remote torchtitan torchft   # or check out specific SHAs
+# Unlike a git-URL install, this builds torchtitan + torchft from the SIBLING CLONES, so
+# the image == the exact fork SHAs you have checked out. To refresh the engine:
+#     git -C ../torchtitan pull   # or check out specific SHAs
 #     ./docker/build-engine-image.sh
+# Override the locations with TORCHTITAN_DIR / TORCHFT_DIR.
 #
 # Usage:
 #   ./docker/build-engine-image.sh                 # build locally; tag <cuda>-<date>-<sha>
@@ -40,22 +40,36 @@ TORCH_VERSION="${TORCH_VERSION:-}"            # exact nightly pin (e.g. 2.14.0.d
 PUSH="${PUSH:-0}"
 EXTRA_BUILD_ARGS=("$@")   # e.g. --no-cache, --progress=plain
 
-# ---- read submodule SHAs (provenance + tag) -------------------------------
-submodule_sha() {  # <path> -> checked-out commit sha (errors if the submodule is empty)
+# ---- locate the forks (sibling clones; override to build a different checkout) ----
+# They are NOT submodules any more, so they are outside this repo's build context and
+# have to arrive as named build contexts (see docker/engine.Dockerfile).
+TORCHTITAN_DIR="${TORCHTITAN_DIR:-../torchtitan}"
+TORCHFT_DIR="${TORCHFT_DIR:-../torchft}"
+
+fork_sha() {  # <dir> -> checked-out commit sha
   local path="$1" sha
   sha="$(git -C "$path" rev-parse HEAD 2>/dev/null || true)"
   if [[ -z "$sha" ]]; then
-    echo "ERROR: submodule '$path' is not initialized. Run: git submodule update --init $path" >&2
+    echo "ERROR: no git checkout at '$path'. Run \`make forks\` (clones both as siblings)," >&2
+    echo "       or point TORCHTITAN_DIR / TORCHFT_DIR at your checkouts." >&2
     exit 1
   fi
   echo "$sha"
 }
 
-echo ">>> reading engine submodule SHAs..."
-TT_SHA="$(submodule_sha torchtitan)"
-FT_SHA="$(submodule_sha torchft)"
-printf '    torchtitan  %s\n' "$TT_SHA"
-printf '    torchft     %s\n' "$FT_SHA"
+echo ">>> reading engine fork SHAs..."
+TT_SHA="$(fork_sha "$TORCHTITAN_DIR")"
+FT_SHA="$(fork_sha "$TORCHFT_DIR")"
+printf '    torchtitan  %s  (%s)\n' "$TT_SHA" "$TORCHTITAN_DIR"
+printf '    torchft     %s  (%s)\n' "$FT_SHA" "$TORCHFT_DIR"
+
+# A dirty fork silently produces an image whose SHA label is a lie.
+for d in "$TORCHTITAN_DIR" "$TORCHFT_DIR"; do
+  if ! git -C "$d" diff --quiet HEAD 2>/dev/null; then
+    echo "WARNING: $d has uncommitted changes; they WILL be baked in, but the image's" >&2
+    echo "         SHA label will not describe them." >&2
+  fi
+done
 
 # ---- tags -----------------------------------------------------------------
 DATE_TAG="$(date -u +%Y%m%d)"
@@ -73,6 +87,8 @@ docker build \
   --build-arg TORCH_VERSION="$TORCH_VERSION" \
   --build-arg TORCHTITAN_SHA="$TT_SHA" \
   --build-arg TORCHFT_SHA="$FT_SHA" \
+  --build-context torchtitan="$TORCHTITAN_DIR" \
+  --build-context torchft="$TORCHFT_DIR" \
   -t "${IMAGE}:${VERSION_TAG}" \
   -t "${IMAGE}:${CUDA_TAG}" \
   "${EXTRA_BUILD_ARGS[@]}" \

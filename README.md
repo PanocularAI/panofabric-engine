@@ -46,13 +46,20 @@ ten minutes and would cost you the rest of the table.)
 
 ```
 panoengine/
+├── decentralized/    async DiLoCo + HeLoCo — the algorithms themselves
 ├── train/
 │   ├── pretrain/     llama3, qwen3, gpt_oss, hf_transformers (any HF architecture)
 │   ├── finetune/     lora
 │   ├── recipes/      resnet — the non-LLM reference recipe
 │   └── strategies.py the fault-tolerance defaults every recipe shares
 models/               compatibility shims; stored run specs still name models.<pkg>
+examples/
+└── decentralized/    runnable drivers for async DiLoCo and HeLoCo
 ```
+
+`panoengine.decentralized` needs only torch and torchft — not torchtitan — so it installs
+on its own with the `[decentralized]` extra, and the forks' RL adapter can import it without
+a dependency cycle.
 
 Each recipe's `config_registry.py` assembles a whole training stack — trainer, optimizer,
 loss, LR schedule, dataloader, activation-checkpoint policy, fault-tolerance manager and
@@ -68,9 +75,10 @@ Training on a CPU backend is not supported as of now.
 
 ## 📦 Installation
 
-The engine composes two forks, [torchtitan](https://github.com/PanocularAI/torchtitan) and
-[torchft](https://github.com/PanocularAI/torchft), which stay forks on purpose — see
-[FORK-DELTA.md](FORK-DELTA.md).
+The engine owns its decentralized algorithms (`panoengine.decentralized`) and composes two
+forks, [torchtitan](https://github.com/PanocularAI/torchtitan) and
+[torchft](https://github.com/PanocularAI/torchft), for the pieces that must subclass upstream
+internals — see [FORK-DELTA.md](FORK-DELTA.md) for exactly where that line falls.
 
 **One thing to know first:** torchft builds its Rust extension via maturin, so installing
 it from source needs a Rust toolchain, `protoc` 32.0, and CPython ≤ 3.13 (pyo3 0.24's
@@ -86,6 +94,9 @@ make dev-forks    # optional: editable forks for hacking on them
 
 # 2. Ordinary install (needs the Rust toolchain above).
 pip install 'panofabric-engine[train]'
+
+# 3. Just the decentralized algorithms (async DiLoCo / HeLoCo), no torchtitan.
+pip install 'panofabric-engine[decentralized]'
 ```
 
 There are no submodules: `git clone --recursive` plus a Rust build is where a newcomer

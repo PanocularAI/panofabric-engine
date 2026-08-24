@@ -34,9 +34,17 @@ dependencies = []
 #   and CPython <= 3.13 (pyo3 0.24's ceiling) on the consumer's machine. That is
 #   the single biggest install-friction item in this repo; prefer the published
 #   image, or `make dev-forks` for local development.
+# The decentralized-training algorithms (panoengine.decentralized: async DiLoCo,
+# HeLoCo). torchft ONLY — deliberately NOT torchtitan. That is what keeps the layering
+# one-way: the torchtitan fork's RL adapter imports panoengine.decentralized, and since
+# this extra pulls no torchtitan, there is no dependency cycle. Do not add torchtitan here.
+decentralized = [
+  "torchft @ git+https://github.com/PanocularAI/torchft.git@429a9dba61b8a04b7d202c9a4ca0be4c42324184",
+]
+
 train = [
+  "panofabric-engine[decentralized]",
   "torchtitan @ git+https://github.com/PanocularAI/torchtitan.git@8dab07165c50e46e076293a26011443d8443df8f",
-  "torchft   @ git+https://github.com/PanocularAI/torchft.git@429a9dba61b8a04b7d202c9a4ca0be4c42324184",
   # panoengine.train.pretrain.hf_transformers needs it, and torchtitan's
   # transformers_modeling_backend imports it without declaring it in either its
   # pyproject or requirements.txt — so without this line that recipe fails to
@@ -69,7 +77,11 @@ Homepage = "https://github.com/PanocularAI/panofabric-engine"
 # panoengine* = the engine. models* = the compatibility shims that keep stored
 # run specs resolving (see models/__init__.py).
 include = ["panoengine*", "models*"]
-exclude = ["panoengine.serve.tests*"]
+exclude = ["panoengine.serve.tests*", "panoengine.decentralized.tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "panoengine/decentralized/tests"]
+addopts = "-ra"
 
 # No [tool.uv.sources] for the forks on purpose: a declarative `path =
 # "../torchtitan"` override makes `uv sync` fail for anyone who clones this repo

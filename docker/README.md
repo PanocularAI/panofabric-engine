@@ -12,7 +12,7 @@ What's baked (mirrors `make all`, once at build time):
 - **panofabric-engine** itself, for the `panoengine.train.*` recipe registries
   (still reachable at their legacy `models.*` paths),
 
-inside a venv at `/opt/symphony/.venv`, on PATH. A container ships its own CUDA userspace,
+inside a venv at `/opt/panoengine/.venv`, on PATH. A container ships its own CUDA userspace,
 so the image only needs the host NVIDIA **driver** to be recent enough — it does not have
 to match the host CUDA toolkit.
 
@@ -43,15 +43,21 @@ label cannot describe them.
 
 Each build produces two tags:
 
-- `…:cu130-20260630-ab12cd3` — immutable; CUDA build + date + torchft short SHA.
+- `…:cu130-20260630-abc1234-tt89ef012-ft3456789` — immutable; CUDA build, date, and the
+  short SHA of all three sources (this repo, torchtitan, torchft). A build from any dirty
+  tree gets a `-dirty-<epoch>` suffix so it can never claim an immutable tag.
 - `…:cu130` — moving "latest for this CUDA" pointer.
+- `…-train` on either of the above — the training-only variant (`--target train`): no
+  vllm, no RL runtime, no serving plane, ~6 GB smaller. Pretrain islands only.
+  `--engine-image` is daemon-wide, so a deployment points at the unsuffixed tag.
 
 ## Common overrides (all via env)
 
 | Var | Default | Notes |
 |---|---|---|
 | `REGISTRY` | `ghcr.io/panocularai` | where to push |
-| `IMAGE_NAME` | `symphony-engine` | |
+| `IMAGE_NAME` | `panofabric-engine` | one repository; the train variant is a `-train` tag, not a second name |
+| `TARGETS` | `train full` | which stages to build/tag |
 | `CUDA_TAG` | `cu130` | torch nightly index: `cu130`/`cpu`/`rocm7.0`. CUDA 12 (`cu128`/`cu129`) is unsupported — torch>=2.13 is CUDA-13-only and the engine needs it |
 | `CUDA_VERSION` | `13.0.3` | `nvidia/cuda` base tag — keep aligned with `CUDA_TAG` |
 | `PYTHON_VERSION` | `3.12` | matches the ubuntu 24.04 base |

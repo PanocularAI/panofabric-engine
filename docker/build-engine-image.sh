@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
 #
-# Build (and optionally push) the panofabric-engine base image — the baked-deps container
-# that replaces `make all` on training nodes (docker/engine.Dockerfile). The panofabric
-# control plane consumes it via `--engine-image`.
+# Build (and optionally push) the node images — the baked-deps containers that replace
+# `make all` on a node (docker/engine.Dockerfile). Two images, two stages, ONE build:
 #
-# NOTE: the image is still NAMED symphony-engine (IMAGE_NAME below). Renaming it is a
-# coordinated change, not a local one — panofabric's infra/engine-image/build.sh builds
-# its overlay FROM this name, and config.env/docs name it too. See docker/README.md.
+#   <image>:<tag>        (--target full)   torch + torchtitan + torchft + panoengine,
+#                                          plus vllm, the RL runtime and the serving
+#                                          plane. What --engine-image points at.
+#   <image>:<tag>-train  (--target train)  the same minus vllm/RL/serving (~6 GB less
+#                                          to pull). Pretrain islands only — a serving
+#                                          or RL island cannot run on it.
+#
+# ONE repository, two tags — not two names. --engine-image is a DAEMON-WIDE argument, so
+# every node in a deployment gets the same image and the slim one is only reachable by
+# standing up a separate pretrain-only daemon. That does not justify a second GHCR
+# package (its own visibility setting, its own retention policy) whose name reads like a
+# different product.
 #
 # Unlike a git-URL install, this builds torchtitan + torchft from the SIBLING CLONES, so
 # the image == the exact fork SHAs you have checked out. To refresh the engine:
@@ -15,13 +23,14 @@
 # Override the locations with TORCHTITAN_DIR / TORCHFT_DIR.
 #
 # Usage:
-#   ./docker/build-engine-image.sh                 # build locally; tag <cuda>-<date>-<sha>
+#   ./docker/build-engine-image.sh                 # both tags; <cuda>-<date>-<shas>[-train]
+#   TARGETS=train ./docker/build-engine-image.sh   # just the training-only tag
 #   PUSH=1 ./docker/build-engine-image.sh          # also push (run `docker login` first)
 #   CUDA_TAG=rocm7.0 CUDA_VERSION=13.0.3 ./docker/build-engine-image.sh
 #   ./docker/build-engine-image.sh --no-cache      # extra args pass through to `docker build`
 #
-# Override via env: REGISTRY, IMAGE_NAME, CUDA_TAG, CUDA_VERSION, PYTHON_VERSION,
-# PROTOC_VERSION, PYTORCH_BASE_URL, PUSH.
+# Override via env: REGISTRY, IMAGE_NAME, TARGETS, CUDA_TAG, CUDA_VERSION,
+# PYTHON_VERSION, PROTOC_VERSION, PYTORCH_BASE_URL, TORCH_VERSION, PUSH.
 
 set -euo pipefail
 export DOCKER_BUILDKIT=1   # required for the `--mount=type=cache` steps in the Dockerfile
@@ -33,7 +42,8 @@ command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not found on PATH" >&
 
 # ---- config (override via env) --------------------------------------------
 REGISTRY="${REGISTRY:-ghcr.io/panocularai}"
-IMAGE_NAME="${IMAGE_NAME:-symphony-engine}"
+IMAGE_NAME="${IMAGE_NAME:-panofabric-engine}"
+TARGETS="${TARGETS:-train full}"     # subset to build; `full` carries the unsuffixed tag
 CUDA_TAG="${CUDA_TAG:-cu130}"                 # torch nightly index (cu130/cpu/rocm7.0; CUDA 12 unsupported)
 CUDA_VERSION="${CUDA_VERSION:-13.0.3}"        # nvidia/cuda base image tag; keep aligned with CUDA_TAG
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
@@ -104,40 +114,89 @@ if (( ${#DIRTY_TREES[@]} )); then
   echo "NOTE: uncommitted changes in ${DIRTY_TREES[*]} -> tagging :$VERSION_TAG"
 fi
 
-IMAGE="${REGISTRY}/${IMAGE_NAME}"
+# ---- RL / serving pins: read from the Makefile, which is the single source of truth --
+# `make install-rl` (the imageless path) and this image MUST agree, and they used to be
+# two hand-synced copies in two repos. Parsed rather than duplicated so a bump lands in
+# one place.
+mk_var() {  # <NAME> -> the Makefile's `NAME ?= value`
+  local v
+  v="$(sed -nE "s/^$1[[:space:]]*\\?=[[:space:]]*(.*)\$/\\1/p" Makefile | head -1)"
+  [[ -n "$v" ]] || { echo "ERROR: $1 not found in Makefile" >&2; exit 1; }
+  echo "$v"
+}
+RL_ARGS=(
+  --build-arg TORCHVISION_VERSION="$(mk_var RL_TORCHVISION_VERSION)"
+  --build-arg VLLM_VERSION="$(mk_var RL_VLLM_VERSION)"
+  --build-arg TORCHMONARCH_VERSION="$(mk_var RL_TORCHMONARCH_VERSION)"
+  --build-arg TORCHSTORE_SHA="$(mk_var RL_TORCHSTORE_SHA)"
+  --build-arg RENDERERS_VERSION="$(mk_var RL_RENDERERS_VERSION)"
+  --build-arg FLASH_ATTN_3_VERSION="$(mk_var RL_FLASH_ATTN_3_VERSION)"
+  --build-arg MATH_VERIFY_VERSION="$(mk_var RL_MATH_VERIFY_VERSION)"
+)
 
-echo ">>> building ${IMAGE}:${VERSION_TAG}"
-docker build \
-  -f docker/engine.Dockerfile \
-  --build-arg CUDA_VERSION="$CUDA_VERSION" \
-  --build-arg PYTHON_VERSION="$PYTHON_VERSION" \
-  --build-arg PROTOC_VERSION="$PROTOC_VERSION" \
-  --build-arg CUDA_TAG="$CUDA_TAG" \
-  --build-arg PYTORCH_BASE_URL="$PYTORCH_BASE_URL" \
-  --build-arg TORCH_VERSION="$TORCH_VERSION" \
-  --build-arg ENGINE_SHA="$ENGINE_SHA" \
-  --build-arg TORCHTITAN_SHA="$TT_SHA" \
-  --build-arg TORCHFT_SHA="$FT_SHA" \
-  --build-context torchtitan="$TORCHTITAN_DIR" \
-  --build-context torchft="$TORCHFT_DIR" \
-  -t "${IMAGE}:${VERSION_TAG}" \
-  -t "${IMAGE}:${CUDA_TAG}" \
-  "${EXTRA_BUILD_ARGS[@]}" \
-  .
+# ---- build -----------------------------------------------------------------
+# `full` derives FROM `train`, so building both is one pass plus a cache-hit re-tag.
+# `full` gets the bare tags; `train` gets the same with a -train suffix. Every tag is
+# collected for the push, because pushing "${IMAGE}:${CUDA_TAG}" once per target would
+# have the train build clobber full's moving tag.
+IMAGE="${REGISTRY}/${IMAGE_NAME}"
+PUSH_REFS=()
+
+for target in $TARGETS; do
+  case "$target" in
+    full)  sfx="" ;;
+    train) sfx="-train" ;;
+    *) echo "ERROR: unknown target '$target' (want: train, full)" >&2; exit 1 ;;
+  esac
+  version_ref="${IMAGE}:${VERSION_TAG}${sfx}"
+  moving_ref="${IMAGE}:${CUDA_TAG}${sfx}"
+
+  echo ">>> building ${version_ref}  (--target $target)"
+  docker build \
+    -f docker/engine.Dockerfile \
+    --target "$target" \
+    --build-arg CUDA_VERSION="$CUDA_VERSION" \
+    --build-arg PYTHON_VERSION="$PYTHON_VERSION" \
+    --build-arg PROTOC_VERSION="$PROTOC_VERSION" \
+    --build-arg CUDA_TAG="$CUDA_TAG" \
+    --build-arg PYTORCH_BASE_URL="$PYTORCH_BASE_URL" \
+    --build-arg TORCH_VERSION="$TORCH_VERSION" \
+    --build-arg ENGINE_SHA="$ENGINE_SHA" \
+    --build-arg TORCHTITAN_SHA="$TT_SHA" \
+    --build-arg TORCHFT_SHA="$FT_SHA" \
+    "${RL_ARGS[@]}" \
+    --build-context torchtitan="$TORCHTITAN_DIR" \
+    --build-context torchft="$TORCHFT_DIR" \
+    -t "$version_ref" \
+    -t "$moving_ref" \
+    "${EXTRA_BUILD_ARGS[@]}" \
+    .
+  PUSH_REFS+=("$version_ref" "$moving_ref")
+done
 
 echo ">>> built:"
-echo "      ${IMAGE}:${VERSION_TAG}   (immutable)"
-echo "      ${IMAGE}:${CUDA_TAG}      (moving 'latest for this CUDA' tag)"
+for ref in "${PUSH_REFS[@]}"; do echo "      $ref"; done
 
 if [[ "$PUSH" == "1" ]]; then
   echo ">>> pushing..."
-  docker push "${IMAGE}:${VERSION_TAG}"
-  docker push "${IMAGE}:${CUDA_TAG}"
+  for ref in "${PUSH_REFS[@]}"; do docker push "$ref"; done
   echo ">>> pushed."
 else
   echo ">>> PUSH=0 — not pushing. To push: docker login ${REGISTRY%%/*} && PUSH=1 $0"
 fi
 
+# Machine-readable handoff: panofabric's 04-deploy-controld.sh reads the tag it just
+# built from here instead of scraping the human output above. `full` is the node image,
+# so it wins when both were built.
+if [[ -n "${TAG_OUT:-}" ]]; then
+  if [[ " $TARGETS " == *" full "* ]]; then
+    printf '%s\n' "${IMAGE}:${VERSION_TAG}" > "$TAG_OUT"
+  else
+    printf '%s\n' "${IMAGE}:${VERSION_TAG}-train" > "$TAG_OUT"
+  fi
+fi
+
 cat <<EOF
->>> Now you can use the engine-image with ${IMAGE}:${VERSION_TAG}
+>>> point --engine-image / ENGINE_IMAGE at the FULL tag:
+      ${IMAGE}:${VERSION_TAG}
 EOF

@@ -127,6 +127,7 @@ RUN python -c "import torch, torchtitan, torchft; print('baked torch', torch.__v
 
 # OCI labels: source -> THIS repo (so GHCR shows symphony-learn's README, not symphony's);
 # the build script passes the resolved fork SHAs.
+ARG ENGINE_SHA=unknown
 ARG TORCHTITAN_SHA=unknown
 ARG TORCHFT_SHA=unknown
 ARG CUDA_TAG=cu130
@@ -134,5 +135,6 @@ LABEL org.opencontainers.image.title="symphony-engine" \
       org.opencontainers.image.source="https://github.com/PanocularAI/symphony-learn" \
       org.opencontainers.image.description="Baked training engine (torch nightly + torchtitan + torchft + panoengine recipes) for panofabric-engine." \
       ai.panocular.cuda="${CUDA_TAG}" \
+      ai.panocular.ref.engine="${ENGINE_SHA}" \
       ai.panocular.ref.torchtitan="${TORCHTITAN_SHA}" \
       ai.panocular.ref.torchft="${TORCHFT_SHA}"

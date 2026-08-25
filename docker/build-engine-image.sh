@@ -46,34 +46,60 @@ EXTRA_BUILD_ARGS=("$@")   # e.g. --no-cache, --progress=plain
 TORCHTITAN_DIR="${TORCHTITAN_DIR:-../torchtitan}"
 TORCHFT_DIR="${TORCHFT_DIR:-../torchft}"
 
-fork_sha() {  # <dir> -> checked-out commit sha
+tree_sha() {  # <dir> -> checked-out commit sha
   local path="$1" sha
   sha="$(git -C "$path" rev-parse HEAD 2>/dev/null || true)"
   if [[ -z "$sha" ]]; then
-    echo "ERROR: no git checkout at '$path'. Run \`make forks\` (clones both as siblings)," >&2
-    echo "       or point TORCHTITAN_DIR / TORCHFT_DIR at your checkouts." >&2
+    if [[ "$path" == "." ]]; then
+      echo "ERROR: '$REPO_ROOT' is not a git checkout; cannot label the image." >&2
+    else
+      echo "ERROR: no git checkout at '$path'. Run \`make forks\` (clones both as siblings)," >&2
+      echo "       or point TORCHTITAN_DIR / TORCHFT_DIR at your checkouts." >&2
+    fi
     exit 1
   fi
   echo "$sha"
 }
 
-echo ">>> reading engine fork SHAs..."
-TT_SHA="$(fork_sha "$TORCHTITAN_DIR")"
-FT_SHA="$(fork_sha "$TORCHFT_DIR")"
+echo ">>> reading source SHAs..."
+ENGINE_SHA="$(tree_sha ".")"
+TT_SHA="$(tree_sha "$TORCHTITAN_DIR")"
+FT_SHA="$(tree_sha "$TORCHFT_DIR")"
+printf '    engine      %s  (%s)\n' "$ENGINE_SHA" "$REPO_ROOT"
 printf '    torchtitan  %s  (%s)\n' "$TT_SHA" "$TORCHTITAN_DIR"
 printf '    torchft     %s  (%s)\n' "$FT_SHA" "$TORCHFT_DIR"
 
-# A dirty fork silently produces an image whose SHA label is a lie.
-for d in "$TORCHTITAN_DIR" "$TORCHFT_DIR"; do
-  if ! git -C "$d" diff --quiet HEAD 2>/dev/null; then
-    echo "WARNING: $d has uncommitted changes; they WILL be baked in, but the image's" >&2
-    echo "         SHA label will not describe them." >&2
+# THREE trees go into this image and all three are copied from the WORKING DIRECTORY,
+# not from git — so uncommitted work is baked in whether or not a SHA describes it.
+# `git status --porcelain` (not `diff HEAD`) is the right test: untracked files are
+# copied by the build too, and .gitignore'd ones do not show up here.
+DIRTY_TREES=()
+for d in "." "$TORCHTITAN_DIR" "$TORCHFT_DIR"; do
+  if [[ -n "$(git -C "$d" status --porcelain 2>/dev/null)" ]]; then
+    DIRTY_TREES+=("$d")
+    echo "WARNING: $d has uncommitted changes; they WILL be baked in, but no SHA" >&2
+    echo "         below describes them." >&2
   fi
 done
 
 # ---- tags -----------------------------------------------------------------
 DATE_TAG="$(date -u +%Y%m%d)"
-VERSION_TAG="${CUDA_TAG}-${DATE_TAG}-${FT_SHA:0:7}"   # immutable, records what's inside
+
+# Records what is ACTUALLY inside: this repo's SHA plus both forks'. It used to be
+# torchft's SHA alone, which meant an engine-only or torchtitan-only change produced a
+# byte-identical tag to the previous build — and torchft is the tree that moves least,
+# so that was the common case, not the corner case. Two images claiming one tag, with
+# the second push silently overwriting the first.
+VERSION_TAG="${CUDA_TAG}-${DATE_TAG}-${ENGINE_SHA:0:7}-tt${TT_SHA:0:7}-ft${FT_SHA:0:7}"
+
+# "Immutable" only holds when all three trees are COMMITTED; otherwise the SHAs above
+# describe something other than what was copied in. Mark those builds so they can never
+# clobber a real immutable tag — same rule as infra/engine-image/build.sh in panofabric.
+if (( ${#DIRTY_TREES[@]} )); then
+  VERSION_TAG="${VERSION_TAG}-dirty-$(date +%s)"
+  echo "NOTE: uncommitted changes in ${DIRTY_TREES[*]} -> tagging :$VERSION_TAG"
+fi
+
 IMAGE="${REGISTRY}/${IMAGE_NAME}"
 
 echo ">>> building ${IMAGE}:${VERSION_TAG}"
@@ -85,6 +111,7 @@ docker build \
   --build-arg CUDA_TAG="$CUDA_TAG" \
   --build-arg PYTORCH_BASE_URL="$PYTORCH_BASE_URL" \
   --build-arg TORCH_VERSION="$TORCH_VERSION" \
+  --build-arg ENGINE_SHA="$ENGINE_SHA" \
   --build-arg TORCHTITAN_SHA="$TT_SHA" \
   --build-arg TORCHFT_SHA="$FT_SHA" \
   --build-context torchtitan="$TORCHTITAN_DIR" \

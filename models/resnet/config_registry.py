@@ -4,19 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.validate import Validator
 from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
-from torchtitan.experiments.torchft.config.job_config import FaultTolerance
+from panoengine.train.strategies import semi_sync
 from torchtitan.experiments.torchft.optimizer import default_ft_adamw
 from torchtitan.experiments.torchft.trainer import FaultTolerantTrainer
 from torchtitan.tools.profiler import Profiler
 
-from models.resnet.datasets.cifar10 import CifarDataLoader
-from models.resnet.model.loss import ResNetCrossEntropyLoss
+from .datasets.cifar10 import CifarDataLoader
+from .model.loss import ResNetCrossEntropyLoss
 
 from . import model_registry
 
@@ -71,14 +71,7 @@ def resnet18_cifar10() -> FaultTolerantTrainer.Config:
             export_dtype="float32",
         ),
         activation_checkpoint=SelectiveAC.Config(),
-        fault_tolerance=FaultTolerance(
-            enable=True,
-            sync_steps=10,
-            num_fragments=1,
-            semi_sync_method="diloco",
-            process_group="gloo",
-            process_group_timeout_ms=10000,
-        ),
+        fault_tolerance=semi_sync(num_fragments=1),
         validator=Validator.Config(
             enable=False,
             freq=5,
@@ -137,14 +130,7 @@ def resnet34_cifar10() -> FaultTolerantTrainer.Config:
             export_dtype="float32",
         ),
         activation_checkpoint=SelectiveAC.Config(),
-        fault_tolerance=FaultTolerance(
-            enable=True,
-            sync_steps=10,
-            num_fragments=1,
-            semi_sync_method="diloco",
-            process_group="gloo",
-            process_group_timeout_ms=10000,
-        ),
+        fault_tolerance=semi_sync(num_fragments=1),
         validator=Validator.Config(
             enable=False,
             freq=5,
@@ -203,14 +189,7 @@ def resnet50_cifar10() -> FaultTolerantTrainer.Config:
             export_dtype="float32",
         ),
         activation_checkpoint=SelectiveAC.Config(),
-        fault_tolerance=FaultTolerance(
-            enable=True,
-            sync_steps=10,
-            num_fragments=1,
-            semi_sync_method="diloco",
-            process_group="gloo",
-            process_group_timeout_ms=10000,
-        ),
+        fault_tolerance=semi_sync(num_fragments=1),
         validator=Validator.Config(
             enable=False,
             freq=5,
@@ -269,14 +248,7 @@ def resnet152_cifar10() -> FaultTolerantTrainer.Config:
             export_dtype="float32",
         ),
         activation_checkpoint=None,
-        fault_tolerance=FaultTolerance(
-            enable=True,
-            sync_steps=10,
-            num_fragments=1,
-            semi_sync_method="diloco",
-            process_group="gloo",
-            process_group_timeout_ms=10000,
-        ),
+        fault_tolerance=semi_sync(num_fragments=1),
         validator=Validator.Config(
             enable=False,
             freq=5,

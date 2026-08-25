@@ -1,6 +1,6 @@
 # SkyPilot configuration to launch a 2-node cluster
 
-name: symphonylearn-multinode-cluster
+name: panofabric-multinode-cluster
 
 resources:
   # accelerators: {H100:8, H200:8}

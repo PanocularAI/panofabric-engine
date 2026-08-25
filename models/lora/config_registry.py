@@ -1,6 +1,6 @@
 # Config-as-code presets for LoRA fine-tuning, mirroring the
-# symphony-learn/models/* FT glue. Selected by torchtitan's ConfigManager:
-# --module models.lora --config <fn>.
+# panoengine.train.* FT glue. Selected by torchtitan's ConfigManager:
+# --module models.lora --config <fn> (models.lora shims this package).
 #
 # What makes these FINE-TUNING presets rather than pretraining:
 #   * checkpoint.initial_load_in_hf=True loads the repo's pretrained
@@ -25,13 +25,14 @@ from dataclasses import dataclass
 
 from torchtitan.components.lora import LoRAConverter
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.validate import Validator
 from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
-from torchtitan.experiments.torchft.config.job_config import FaultTolerance, FaultTolerantModelSpec
+from torchtitan.experiments.torchft.config.job_config import FaultTolerantModelSpec
+from panoengine.train.strategies import semi_sync
 from torchtitan.experiments.torchft.diloco import fragment_llm
 from torchtitan.experiments.torchft.optimizer import default_ft_adamw
 from torchtitan.experiments.torchft.trainer import FaultTolerantTrainer
@@ -189,14 +190,7 @@ def _lora_preset(
             export_dtype="float32",
         ),
         activation_checkpoint=SelectiveAC.Config(),
-        fault_tolerance=FaultTolerance(
-            enable=True,
-            sync_steps=10,
-            num_fragments=2,
-            semi_sync_method="diloco",
-            process_group="gloo",
-            process_group_timeout_ms=10000,
-        ),
+        fault_tolerance=semi_sync(),
         validator=Validator.Config(
             enable=False,
         ),

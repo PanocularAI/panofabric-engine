@@ -1,5 +1,5 @@
 # Config-as-code presets for FT training of HF-architecture models, mirroring
-# symphony-learn/models/llama3/config_registry.py. Selected by torchtitan's
+# models/llama3/config_registry.py. Selected by torchtitan's
 # ConfigManager: --module models.hf_transformers --config <fn>.
 # The HF repo id is NOT baked into presets — it arrives via the --hf_model
 # CLI overlay (RunSpec.model.hf_model), so two presets cover all models.
@@ -7,13 +7,13 @@
 from dataclasses import dataclass
 
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.validate import Validator
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.config import CommConfig, ParallelismConfig, TrainingConfig
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
-from torchtitan.experiments.torchft.config.job_config import FaultTolerance
+from panoengine.train.strategies import semi_sync
 from torchtitan.experiments.torchft.optimizer import default_ft_adamw
 from torchtitan.experiments.torchft.trainer import FaultTolerantTrainer
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
@@ -79,14 +79,7 @@ def hf_debugmodel() -> HFFTConfig:
         ),
         activation_checkpoint=SelectiveAC.Config(),
         comm=CommConfig(train_timeout_seconds=15),
-        fault_tolerance=FaultTolerance(
-            enable=True,
-            sync_steps=10,
-            num_fragments=1,  # no fragment_fn: whole-model DiLoCo
-            semi_sync_method="diloco",
-            process_group="gloo",
-            process_group_timeout_ms=10000,
-        ),
+        fault_tolerance=semi_sync(num_fragments=1),  # no fragment_fn: whole-model DiLoCo
         validator=Validator.Config(
             enable=False,
             freq=5,
@@ -142,14 +135,7 @@ def hf_full() -> HFFTConfig:
             export_dtype="float32",
         ),
         activation_checkpoint=SelectiveAC.Config(),
-        fault_tolerance=FaultTolerance(
-            enable=True,
-            sync_steps=10,
-            num_fragments=1,  # no fragment_fn: whole-model DiLoCo
-            semi_sync_method="diloco",
-            process_group="gloo",
-            process_group_timeout_ms=10000,
-        ),
+        fault_tolerance=semi_sync(num_fragments=1),  # no fragment_fn: whole-model DiLoCo
         validator=Validator.Config(
             enable=False,
         ),

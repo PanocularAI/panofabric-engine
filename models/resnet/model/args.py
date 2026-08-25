@@ -21,7 +21,7 @@ class ResNetModelArgs:
         pass
 
     def build(self):
-        from models.resnet.model.model import ResNetModel
+        from .model import ResNetModel
         return ResNetModel(self)
 
     def to_dict(self) -> dict:

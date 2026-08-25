@@ -1,7 +1,21 @@
-# Makefile for installing SymphonyLearn project.
+# Makefile for installing the panofabric-engine project.
 # Usage:
-#   make all
+#   make all         # full bootstrap: toolchain, project, torch, the forks
+#   make dev-forks   # engine hackers: sibling fork clones, installed editable
 
+
+# ------------------------------------------------- the forks (no submodules)
+# torchtitan/torchft live as SIBLINGS of this repo, cloned on demand. Submodules
+# are gone from the public repo: `git clone --recursive` plus a Rust build is
+# where a newcomer bounces. Keep these refs in sync with pyproject.toml's
+# [train] extra — they are the same pins.
+FORKS_DIR      ?= ..
+TORCHTITAN_DIR ?= $(FORKS_DIR)/torchtitan
+TORCHFT_DIR    ?= $(FORKS_DIR)/torchft
+TORCHTITAN_URL ?= https://github.com/PanocularAI/torchtitan.git
+TORCHFT_URL    ?= https://github.com/PanocularAI/torchft.git
+TORCHTITAN_REF ?= 8dab07165c50e46e076293a26011443d8443df8f
+TORCHFT_REF    ?= 429a9dba61b8a04b7d202c9a4ca0be4c42324184
 
 TORCH_SPEC ?= torch
 PYTORCH_BASE_URL ?= https://download.pytorch.org/whl/nightly
@@ -21,7 +35,7 @@ PYTHON_VERSION ?= 3.13
 # unchanged); `build-into` overrides it with an out-of-tree staging venv for the env cache.
 VENV ?= .venv
 
-.PHONY: all setup-env sync-project install-torch install-torchtt-ft build-into ensure gc-env-cache show-backend clean-protoc-zip
+.PHONY: all setup-env sync-project install-torch install-torchtt-ft forks dev-forks build-into ensure gc-env-cache show-backend clean-protoc-zip
 
 all: setup-env sync-project install-torch install-torchtt-ft
 	@[ "$${PF_RL:-0}" = "1" ] && $(MAKE) install-rl || \
@@ -69,9 +83,10 @@ setup-env:
 	# uv (user-local) for installs.
 	@[ -x $(LOCAL_BIN)/uv ] || command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Resolve + install the project (symphony-learn + its git@main engine deps) into the
-# in-tree .venv. Split out of setup-env so `build-into` (env cache) can reuse the toolchain
-# from setup-env WITHOUT this project sync, building into an out-of-tree venv instead.
+# Resolve + install the project (panofabric-engine; its engine deps are the [train]
+# extra's sha-pinned forks) into the in-tree .venv. Split out of setup-env so
+# `build-into` (env cache) can reuse the toolchain from setup-env WITHOUT this
+# project sync, building into an out-of-tree venv instead.
 sync-project:
 	$(UV) sync
 
@@ -97,16 +112,38 @@ install-torch:
 	$(UV_PIP_CMD) --pre $(TORCH_SPEC) --index-url "$$index_url" --force-reinstall; \
 	set +x
 
+# Clone the forks as siblings if they are ABSENT (at the pinned ref). An existing
+# clone is left exactly as it is — never checked out to the pin, because it is the
+# engine hacker's working tree and a detached HEAD would strand their branch.
+forks:
+	@set -e; \
+	for spec in "$(TORCHTITAN_DIR)|$(TORCHTITAN_URL)|$(TORCHTITAN_REF)" \
+	            "$(TORCHFT_DIR)|$(TORCHFT_URL)|$(TORCHFT_REF)"; do \
+	  dir=$${spec%%|*}; rest=$${spec#*|}; url=$${rest%%|*}; ref=$${rest##*|}; \
+	  if [ -d "$$dir/.git" ]; then \
+	    echo "[forks] $$dir exists at $$(git -C "$$dir" rev-parse --short HEAD) (left untouched)"; \
+	  else \
+	    echo "[forks] cloning $$url -> $$dir @ $$ref"; \
+	    git clone --quiet "$$url" "$$dir"; \
+	    git -C "$$dir" checkout --quiet "$$ref"; \
+	  fi; \
+	done
+
+# Engine hackers: the forks installed EDITABLE, so a change in ../torchtitan is
+# live without a reinstall. This is what replaced `git submodule update --init`.
+dev-forks: forks
+	$(UV_PIP_CMD) -e $(TORCHTITAN_DIR) -e $(TORCHFT_DIR)
+
 install-torchtt-ft: export VIRTUAL_ENV := $(abspath $(VENV))
-install-torchtt-ft:
-	$(UV_PIP_CMD) -r torchtitan/requirements.txt
-	$(UV_PIP_CMD) ./torchtitan
-	$(UV_PIP_CMD) ./torchft
-	# transformers: required by models/hf_transformers (the HF-architecture backend
-	# glue) — torchtitan's transformers_modeling_backend imports it but declares it
-	# in neither its pyproject nor requirements.txt, so `import models.hf_transformers`
-	# fails on a node without this line. Unpinned deliberately (the backend's own
-	# 4.57 pin predates the 5.x we run locally, matched to vLLM).
+install-torchtt-ft: forks
+	$(UV_PIP_CMD) -r $(TORCHTITAN_DIR)/requirements.txt
+	$(UV_PIP_CMD) $(TORCHTITAN_DIR)
+	$(UV_PIP_CMD) $(TORCHFT_DIR)
+	# transformers: required by panoengine.train.pretrain.hf_transformers (the
+	# HF-architecture backend glue) — torchtitan's transformers_modeling_backend
+	# imports it but declares it in neither its pyproject nor requirements.txt, so
+	# that recipe fails to import on a node without this line. Unpinned deliberately
+	# (the backend's own 4.57 pin predates the 5.x we run locally, matched to vLLM).
 	$(UV_PIP_CMD) transformers
 
 # ------------------------------------------------- RL runtime (PF_RL=1)
@@ -165,8 +202,8 @@ install-rl:
 # build-into: `all` built into a relocatable, SELF-CONTAINED, out-of-tree $(VENV) so the
 # cached venv survives the builder's teardown. Non-editable (an -e install records an
 # absolute finder into the builder's workdir, rm -rf'd at teardown -> dangling in every
-# consumer). `--no-deps .` skips the redundant git@main engine pull (symphony-learn's only
-# deps are torchtitan/torchft, installed locally from the submodules next).
+# consumer). `--no-deps .` skips the redundant git engine pull (panofabric-engine's only
+# deps are torchtitan/torchft, installed locally from the sibling clones next).
 build-into: export VIRTUAL_ENV := $(abspath $(VENV))
 build-into: setup-env
 	$(UV) venv $(VENV) --relocatable --python $(PYTHON_VERSION)

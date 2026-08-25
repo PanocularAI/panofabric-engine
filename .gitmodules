@@ -1,6 +1,0 @@
-[submodule "torchtitan"]
-	path = torchtitan
-	url = https://github.com/PanocularAI/torchtitan.git
-[submodule "torchft"]
-	path = torchft
-	url = https://github.com/PanocularAI/torchft.git

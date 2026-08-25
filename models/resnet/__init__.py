@@ -15,6 +15,9 @@ __all__ = [
     "ResNetModelArgs",
     "ResNetModel",
     "resnet_configs",
+    # Listed so the `models.resnet` compatibility shim's star-import re-exports
+    # it — config_registry.py does `from . import model_registry`.
+    "model_registry",
 ]
 
 

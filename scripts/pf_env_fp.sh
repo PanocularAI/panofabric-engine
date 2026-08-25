@@ -3,7 +3,7 @@
 # backend-INDEPENDENT half of the env-cache key. The `ensure` Make target combines it with
 # the node's torch backend (scripts/pf_backend.sh) into the per-fingerprint cache dir:
 # `fp = sha256("<source_fp>:<backend>")[:16]`. See the panofabric env-cache design
-# (docs/slurm-setup-cache-plan.md) — this is the symphony-learn side of it.
+# (docs/slurm-setup-cache-plan.md) — this is the panofabric-engine side of it.
 #
 # POSIX sh; invoked as `sh scripts/pf_env_fp.sh --source`.
 set -eu

@@ -6,9 +6,9 @@ hf_debugmodel/hf_full presets train it from scratch (random init); hf_finetune
 loads the repo's pretrained safetensors through the backend's near-identity
 HFTransformerStateDictAdapter (native keys == "model." + HF keys) — genuine
 full-parameter fine-tuning of any dense CausalLM repo. This package marries
-the backend to the torchft FaultTolerantTrainer, mirroring the symphony-learn
-models/llama3 glue, and is selected from a RunSpec via
-model.module: models.hf_transformers.
+the backend to the torchft FaultTolerantTrainer, mirroring the
+models.llama3 glue, and is selected from a RunSpec via
+model.module: models.hf_transformers (a shim for this package).
 """
 
 from torchtitan.experiments.transformers_modeling_backend import (

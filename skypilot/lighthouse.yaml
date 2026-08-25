@@ -1,6 +1,6 @@
 # SkyPilot configuration to launch a single-node lighthouse server
 
-name: symphonylearn-multinode
+name: panofabric-multinode
 
 resources:
   cpus: 4

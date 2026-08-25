@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 #
-# Build (and optionally push) the SymphonyLearn engine image — the baked-deps container
-# that replaces `make all` on training nodes (docker/engine.Dockerfile). The symphony
+# Build (and optionally push) the panofabric-engine base image — the baked-deps container
+# that replaces `make all` on training nodes (docker/engine.Dockerfile). The panofabric
 # control plane consumes it via `--engine-image`.
+#
+# NOTE: the image is still NAMED symphony-engine (IMAGE_NAME below). Renaming it is a
+# coordinated change, not a local one — panofabric's infra/engine-image/build.sh builds
+# its overlay FROM this name, and config.env/docs name it too. See docker/README.md.
 #
 # Unlike a git-URL install, this builds torchtitan + torchft from the SIBLING CLONES, so
 # the image == the exact fork SHAs you have checked out. To refresh the engine:

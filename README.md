@@ -4,7 +4,7 @@
 
 #### A PyTorch-native engine for heterogeneous & decentralized training of large-scale AI models
 
-![panofabric-engine](docs/assets/symphonylearn.png)
+![panofabric-engine](docs/assets/panofabric-engine.png)
 </div>
 
 ## 🧭 Overview
@@ -58,7 +58,6 @@ panoengine/            the machinery the recipes compose
 models/               the training recipes, one package per model — llama3, qwen3,
                       gpt_oss, hf_transformers, lora, resnet. The path a run spec
                       names and ConfigManager resolves for --module
-panoserve/            transitional shims for the serving plane's old module names
 examples/
 └── decentralized/    runnable drivers for async DiLoCo and HeLoCo
 ```
@@ -206,11 +205,6 @@ python -m panoengine.serve.gateway --port 8800
 Install it with the `serve` extra. As with training, torch and vLLM are deliberately
 **not** declared: every runtime that launches these modules carries backend-matched
 nightlies installed last, and a plain resolve would clobber them.
-
-These modules are also reachable at their old `panoserve.*` names. Those shims exist only for
-the transition: the control plane launches these modules *by name on the node*, and the image
-and the control plane are separate artifacts with separate release cadences, so both names
-have to work at once for one cycle. Each shim's docstring says when it can go.
 
 ## 📑 Documentation
 

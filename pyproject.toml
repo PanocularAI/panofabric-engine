@@ -80,10 +80,8 @@ Homepage = "https://github.com/PanocularAI/panofabric-engine"
 [tool.setuptools.packages.find]
 # panoengine* = the engine machinery (strategies, RL coordinators, decentralized
 # algorithms, the serving plane). models* = the training recipes, one package per
-# model — the path run specs name (see models/__init__.py). panoserve* = the
-# transitional shims for the serving plane's old module paths, which controld
-# still spawns as `python -m panoserve.<mod>` on the node.
-include = ["panoengine*", "models*", "panoserve*"]
+# model — the path run specs name (see models/__init__.py).
+include = ["panoengine*", "models*"]
 exclude = [
   "panoengine.serve.tests*",
   "panoengine.decentralized.tests*",

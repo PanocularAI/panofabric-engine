@@ -125,8 +125,10 @@ WORKDIR /opt/symphony
 # ABI mismatch before the image ships). `import torch` does not need a GPU.
 RUN python -c "import torch, torchtitan, torchft; print('baked torch', torch.__version__)"
 
-# OCI labels: source -> THIS repo (so GHCR shows symphony-learn's README, not symphony's);
-# the build script passes the resolved fork SHAs.
+# OCI labels: source -> THIS repo (so GHCR shows the engine's README, not the control
+# plane's); the build script passes the resolved source SHAs. The source URL stays
+# github.com/PanocularAI/symphony-learn because that is still the repo's real name —
+# panofabric-engine does not resolve yet.
 ARG ENGINE_SHA=unknown
 ARG TORCHTITAN_SHA=unknown
 ARG TORCHFT_SHA=unknown

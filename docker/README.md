@@ -1,4 +1,4 @@
-# `docker/` — the SymphonyLearn engine image
+# `docker/` — the panofabric-engine base image
 
 This bakes the **training engine** into a container so a fresh training node no longer
 runs `make all` (apt + rustup + **compile torchft** + download the ~2.5 GB torch nightly)

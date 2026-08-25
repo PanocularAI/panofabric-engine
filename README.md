@@ -28,6 +28,7 @@ Every recipe in this repo is a `FaultTolerantTrainer.Config`, so a workload does
 | **LoRA fine-tuning**                     |  ✅  |   ✅   |   ✅   |  ✅   |
 | **SFT (instruction tuning)**             |  —   |   —    |   —    |  —    |
 | **RL (GRPO)** <sup>†</sup>               |  ✅  |   ✅   |   ✅   |  ✅   |
+| **serving (spliced pipeline)**           |  ✅  |  n/a   |  n/a   |  n/a  |
 
 <sup>†</sup> `panoengine/train/rl/` holds the presets and the decentralized coordinators —
 the Monarch trainer actors, the four replica strategies and their launch entry points — and
@@ -47,15 +48,17 @@ ten minutes and would cost you the rest of the table.)
 ## 🗂️ Layout
 
 ```
-panoengine/
+panoengine/            the machinery the recipes compose
 ├── decentralized/    async DiLoCo + HeLoCo, the parameter server, relay, rollout queue
 ├── train/
-│   ├── pretrain/     llama3, qwen3, gpt_oss, hf_transformers (any HF architecture)
-│   ├── finetune/     lora
-│   ├── rl/           GRPO presets (the trainers they name live in the fork)
-│   ├── recipes/      resnet — the non-LLM reference recipe
+│   ├── rl/           decentralized RL: presets, the four replica strategies,
+│   │                 the Monarch trainer actors and their launch entry points
 │   └── strategies.py the fault-tolerance defaults every recipe shares
-models/               compatibility shims; stored run specs still name models.<pkg>
+└── serve/            the spliced-pipeline inference plane
+models/               the training recipes, one package per model — llama3, qwen3,
+                      gpt_oss, hf_transformers, lora, resnet. The path a run spec
+                      names and ConfigManager resolves for --module
+panoserve/            transitional shims for the serving plane's old module names
 examples/
 └── decentralized/    runnable drivers for async DiLoCo and HeLoCo
 ```
@@ -182,6 +185,32 @@ Many more architectures exist in
 [TorchTitan models](https://github.com/pytorch/torchtitan/tree/main/torchtitan/models) and
 its [experiments](https://github.com/pytorch/torchtitan/tree/main/torchtitan/experiments),
 and new ones follow the [Adding a new model tutorial](docs/model.md).
+
+## 🔌 Serving: one model spliced across GPU islands
+
+Decentralized *inference* is the other half. `panoengine.serve` splits one model into
+pipeline stages, runs each stage as its own vLLM engine — possibly in a different
+datacenter — and stitches them back together over the stage transport:
+
+```bash
+# Shard a checkpoint into per-stage weight sets.
+python -m panoengine.serve.sharder --checkpoint <hf-model> --out staged/ --stage-memory <GiB>
+
+# Run a stage (once per island).
+python -m panoengine.serve.engine_stage --stage-dir staged/stage1
+
+# Front the fleet with the gateway (OpenAI-compatible).
+python -m panoengine.serve.gateway --port 8800
+```
+
+Install it with the `serve` extra. As with training, torch and vLLM are deliberately
+**not** declared: every runtime that launches these modules carries backend-matched
+nightlies installed last, and a plain resolve would clobber them.
+
+These modules are also reachable at their old `panoserve.*` names. Those shims exist only for
+the transition: the control plane launches these modules *by name on the node*, and the image
+and the control plane are separate artifacts with separate release cadences, so both names
+have to work at once for one cycle. Each shim's docstring says when it can go.
 
 ## 📑 Documentation
 

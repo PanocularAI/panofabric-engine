@@ -1,22 +1,21 @@
-"""The training surface.
+"""The training machinery the recipes compose — not the recipes themselves.
 
-Each recipe package holds a ``config_registry`` whose zero-arg functions return
-a fully-assembled training config — trainer, optimizer, loss, LR schedule,
-dataloader, activation-checkpoint policy, fault-tolerance manager and
-checkpoint manager. torchtitan's ``ConfigManager`` selects one with
-``--module panoengine.train.<group>.<pkg> --config <fn>``.
+The recipes live in the top-level ``models`` package, one per model
+(``models.llama3``, ``models.lora``, ``models.resnet``, ...). That is the path a
+run spec stores and the one torchtitan's ConfigManager resolves for ``--module``.
 
-Groups:
+What is here is what a recipe builds ON:
 
-* ``pretrain``  — llama3, qwen3, gpt_oss (torchtitan-native), and
-  hf_transformers (any HF architecture through the transformers backend).
-* ``finetune``  — lora. Parameter-efficient recipes. NOTE: these train on raw
-  text (c4), so they are LoRA continued-pretraining, not instruction tuning.
-  Instruction tuning needs the chat-template / prompt-loss-masking data path
-  that does not exist yet (specs/engine-repo-unification-plan.md §1.5).
-* ``recipes``   — resnet, the non-LLM reference recipe.
+* ``strategies`` — ``semi_sync()``, the shared fault-tolerance block every recipe
+  drops into its ``FaultTolerantTrainer.Config``. One default, because the
+  strategy is chosen at launch, not at preset-construction time; read that
+  module's docstring before adding a per-strategy factory.
+* ``rl`` — decentralized RL post-training: the presets, the four replica
+  coordination strategies, the Monarch trainer actors and their launch entry
+  points. It builds on ``torchtitan.experiments.rl``, imported from the fork.
 
-The decentralized strategy (solo / diloco / heloco / async) is NOT fixed by the
-recipe: presets carry a default and the launcher overrides it with
-``--fault_tolerance.semi_sync_method=...``. See ``panoengine.train.strategies``.
+The dependency direction is one-way: a recipe imports from here, nothing here
+imports a recipe. The decentralized algorithms themselves (async DiLoCo, HeLoCo,
+the parameter server, relay and rollout queue) are a level up again, in
+``panoengine.decentralized``, which needs neither torchtitan nor vLLM.
 """

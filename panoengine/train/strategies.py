@@ -1,51 +1,124 @@
-"""Decentralized-training strategy defaults, shared by every recipe.
+"""Decentralized-training strategy defaults, shared by the pretrain and finetune recipes.
 
-This is why "pretraining, fine-tuning and RL all get decentralized training for
-free" is a fact about the code rather than a claim in the README: every recipe
-returns a ``FaultTolerantTrainer.Config``, and the fault-tolerance block below is
-the same for all of them.
+Every recipe under ``models/`` returns a ``FaultTolerantTrainer.Config`` whose
+fault-tolerance block is the one built below — so a recipe gets decentralized
+training by writing ``fault_tolerance=semi_sync()`` and nothing else.
 
-WHERE THE STRATEGY IS ACTUALLY CHOSEN — read this before adding a
-``heloco()`` / ``async_diloco()`` sibling to ``diloco()``:
+NOT used by RL. ``panoengine.train.rl`` reaches decentralized training through a
+different mechanism entirely: its four replica classes in
+``panoengine.train.rl.replicas`` (DiLoCo / HeLoCo / async-inference / both),
+selected by preset rather than by a ``semi_sync_method`` flag. Nothing under
+``panoengine/train/rl/`` imports this module.
 
-    The strategy is NOT fixed when a preset is constructed. Presets carry a
-    default, and the launcher overrides it at runtime with a tyro flag:
+WHERE THE STRATEGY IS ACTUALLY CHOSEN — two answers, depending on who launches:
 
-        --fault_tolerance.semi_sync_method=heloco
+    Standalone (``./run_train.sh``, ``python -m torchtitan.train``): whatever
+    the preset built here. ``semi_sync(method="heloco")`` really does run
+    HeLoCo — but see the function docstring, that path also needs a parameter
+    server process and its URLs in the environment.
 
-    (panofabric ``spec/launch.py`` emits that from ``workload.strategy``.) So
-    solo / diloco / heloco / async are argv values, not constructors, and a set
-    of preset-time factories here would imply a selection mechanism that does
-    not exist. One shared default is the honest shape.
+    Under controld: the preset's value is only a default. ``spec/launch.py``
+    always emits an explicit
 
-The algorithms themselves live in the forks, because they subclass upstream
-internals: ``torchft.heloco``, ``torchft.async_diloco``, and the ``manager.py`` /
-``local_sgd.py`` hooks they depend on.
+        --fault_tolerance.semi_sync_method=<diloco | local_sgd | heloco>
+
+    derived from ``workload.strategy``, and tyro applies it on top. controld
+    also stands up whatever plane that strategy needs — for heloco that is
+    ``HeLoCoPretrainHub``: a parameter server AND a lighthouse (the trainer
+    derives its dataloader shard from the FT manager, so with fault tolerance
+    off every island would train identical data).
+
+    That is why every preset in this repo calls a bare ``semi_sync()``. There is
+    ONE default here, not one factory per strategy, because a factory per
+    strategy would suggest the preset decides — and in the deployment that
+    matters, it does not.
+
+WHERE EACH VALUE ACTUALLY RESOLVES — the torchtitan fork's
+``experiments/torchft/manager.py`` branches on the final ``semi_sync_method``:
+
+    "diloco"     -> ``torchft.local_sgd.DiLoCo``    (upstream torchft)
+    "local_sgd"  -> ``torchft.local_sgd.LocalSGD``  (upstream torchft)
+    "heloco"     -> ``panoengine.decentralized.async_diloco.AsyncDiLoCo``
+
+That last one is not a typo. On the TRAINER side both parameter-server strategies
+are the same class: ``AsyncDiLoCo`` POSTs its pseudo-gradient to the PS and pulls
+back look-ahead global params. What makes a run HeLoCo rather than plain async
+DiLoCo is SERVER-side — ``panoengine.decentralized.heloco``'s ``HeLoCoOptimizer``
+(look-ahead init, tensor-block directional correction), which
+``panoengine.decentralized.parameter_server`` runs.
+
+So the algorithms live HERE, in ``panoengine.decentralized``, not in the forks.
+What stays in the torchft fork is only what patches upstream internals in place:
+``torchft.semi_async_diloco`` / ``torchft.semi_async_heloco`` (they extend the
+private ``_StreamingDiLoCoFragment``) and the additive ``manager.py`` /
+``local_sgd.py`` hooks. See FORK-DELTA.md.
 """
 
 from torchtitan.experiments.torchft.config.job_config import FaultTolerance
 
-__all__ = ["diloco"]
+__all__ = ["semi_sync"]
+
+#: The values torchtitan's `maybe_semi_sync_training` dispatches on. "solo" is
+#: NOT one of them — controld's strategy axis has it, and it means "leave
+#: fault_tolerance off entirely", not "pass semi_sync_method=solo".
+SEMI_SYNC_METHODS = ("diloco", "local_sgd", "heloco")
 
 
-def diloco(*, num_fragments: int = 2, **overrides) -> FaultTolerance:
-    """The FT block every recipe in this repo shares.
+def semi_sync(
+    *,
+    method: str = "diloco",
+    num_fragments: int = 2,
+    **overrides,
+) -> FaultTolerance:
+    """The FT block every recipe under ``models/`` shares.
+
+    ``method`` picks the algorithm. It is a real parameter — a preset CAN pin a
+    strategy, and a standalone launch (``./run_train.sh``, ``python -m
+    torchtitan.train``) will run whatever it says. Under controld it is only a
+    default: the launcher always emits an explicit
+    ``--fault_tolerance.semi_sync_method=...`` derived from ``workload.strategy``,
+    and tyro applies that on top. Which is why every preset in this repo just
+    calls ``semi_sync()`` and lets the launcher decide.
+
+    Picking ``"heloco"`` here is not sufficient on its own: that path POSTs
+    pseudo-gradients to a parameter server, so it also needs
+    ``panoengine.decentralized.parameter_server`` running and its URLs exported
+    as ``$DILOCO_SERVER_ADDR`` / ``$DILOCO_HB_ADDR``. controld's
+    ``HeLoCoPretrainHub`` does that for you; standalone, you do it yourself. The
+    trainer fails loudly with the missing env var if you forget.
 
     ``num_fragments`` is the one field recipes genuinely differ on: it must be 1
-    for a model whose spec has no ``fragment_fn`` (nothing can split it, so
-    DiLoCo syncs the whole model), and the DiLoCo invariant is that
-    ``sync_steps`` stays divisible by it — tests/test_config_registry.py
-    enforces that.
+    for a model whose spec has no ``fragment_fn`` (nothing can split it, so the
+    whole model syncs), and the DiLoCo invariant is that ``sync_steps`` stays
+    divisible by it — tests/test_config_registry.py enforces that. It must also
+    match the parameter server's ``--num_fragments`` on the heloco path.
 
     ``process_group="gloo"`` because the pseudo-gradient exchange runs over the
     WAN between islands on CPU, not over NCCL inside one.
+
+    Anything else in ``FaultTolerance`` can be set through ``**overrides``.
     """
-    return FaultTolerance(
+    if method not in SEMI_SYNC_METHODS:
+        raise ValueError(
+            f"semi_sync_method must be one of {SEMI_SYNC_METHODS}, got {method!r}"
+        )
+    # The algorithm has exactly one spelling here: the `method` parameter. Its
+    # FaultTolerance field name would otherwise slip through **overrides and win
+    # the dict update below, and a cluster quietly running the other algorithm is
+    # an expensive way to discover that. (`num_fragments` needs no such guard —
+    # it is a named parameter, so Python binds it before **overrides sees it.)
+    if "semi_sync_method" in overrides:
+        raise TypeError(
+            "pass the strategy as the named parameter `method=`, not as "
+            "semi_sync_method= in **overrides"
+        )
+    fields = dict(
         enable=True,
         sync_steps=10,
         num_fragments=num_fragments,
-        semi_sync_method="diloco",
+        semi_sync_method=method,
         process_group="gloo",
         process_group_timeout_ms=10000,
-        **overrides,
     )
+    fields.update(overrides)   # every default above is overridable
+    return FaultTolerance(**fields)

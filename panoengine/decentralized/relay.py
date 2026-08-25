@@ -1,8 +1,7 @@
 # Copyright (c) Panocular AI.
 #
-# Checkpoint distribution for the async-inference swarm: prime-rl-style
-# SHARDCAST (arXiv:2505.07291, INTELLECT-2), in three pieces that share one
-# module because they share one wire format:
+# Checkpoint distribution for the async-inference swarm: in three pieces 
+# that share one module because they share one wire format:
 #
 #   - Sharding: split a *serialized checkpoint* into size-balanced byte
 #     pieces with a SHA-256-per-shard manifest, so a relay tier can

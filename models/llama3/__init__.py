@@ -1,4 +1,38 @@
-# Compatibility shim. The recipe moved to `panoengine.train.pretrain.llama3`;
-# `models.llama3` stays importable because it is a runspec default and lives in
-# stored run specs (panofabric spec/runspec.py). See specs/engine-repo-unification-plan.md §1.2.
-from panoengine.train.pretrain.llama3 import *  # noqa: F401,F403
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+from torchtitan.distributed.pipeline_parallel import pipeline_llm
+from torchtitan.experiments.torchft.config.job_config import FaultTolerantModelSpec
+from torchtitan.experiments.torchft.diloco import fragment_llm
+from torchtitan.models.llama3 import (
+    llama3_configs,
+    Llama3StateDictAdapter,
+    parallelize_llama,
+)
+from torchtitan.models.utils import validate_converter_order
+from torchtitan.protocols.model import ModelConfigConverter
+
+
+def model_registry(
+    flavor: str,
+    attn_backend: str = "flex",
+    converters: list[ModelConfigConverter.Config] | None = None,
+) -> FaultTolerantModelSpec:
+    config = llama3_configs[flavor](attn_backend=attn_backend)
+    if converters is not None:
+        validate_converter_order(converters)
+        for c in converters:
+            c.build().convert(config)
+    return FaultTolerantModelSpec(
+        name="torchft/llama3",
+        flavor=flavor,
+        model=config,
+        parallelize_fn=parallelize_llama,
+        pipelining_fn=pipeline_llm,
+        post_optimizer_build_fn=None,
+        state_dict_adapter=Llama3StateDictAdapter,
+        fragment_fn=fragment_llm,
+    )

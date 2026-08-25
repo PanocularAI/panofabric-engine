@@ -3,7 +3,7 @@
 # Config entry points for the decentralized_rl coordination strategies, discoverable
 # by torchtitan's ConfigManager via ``--module decentralized_rl --config
 # <function_name>`` (or the fully-qualified ``--module
-# torchtitan.experiments.decentralized_rl``).
+# panoengine.train.rl``).
 #
 # ``base_rl_config`` + ``wrap_replica`` are the shared building blocks: a plain
 # RLTrainer.Config with the common loss/data choices, and a helper that
@@ -40,21 +40,21 @@ from torchtitan.config import (
     TrainingConfig,
 )
 from torchtitan.experiments import rl as _rl_pkg
-from torchtitan.experiments.decentralized_rl.controller import GRPOLoss, RLTrainer
-from torchtitan.experiments.decentralized_rl.replicas import (
+from panoengine.train.rl.controller import RLTrainer
+from panoengine.train.rl.replicas import (
     AsyncInferenceReplica,
     DiLoCoRLReplica,
     HeLoCoAsyncInferenceReplica,
     HeLoCoRLReplica,
 )
-from torchtitan.experiments.decentralized_rl.worker import AsyncInferenceWorker
+from panoengine.train.rl.worker import AsyncInferenceWorker
 from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.components.batcher import BatchConfig, Batcher
 from torchtitan.experiments.rl.controller import AsyncLoopConfig, ValidationConfig
 from torchtitan.experiments.rl.environment import TokenEnv
 from torchtitan.experiments.rl.examples.alphabet_sort import AlphabetSortRollouter
-from torchtitan.experiments.rl.losses import DAPOLoss
+from torchtitan.experiments.rl.losses import DAPOLoss, GRPOLoss
 from torchtitan.experiments.rl.models.vllm_registry import InferenceParallelismConfig
 from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
 from torchtitan.experiments.rl.renderer import RendererConfig
@@ -69,7 +69,7 @@ from torchtitan.models.qwen3 import model_registry as _qwen3_model_registry
 
 def _hf_model_registry(flavor, *, attn_backend, hf_assets_path):
     # Lazy: pulls transformers, only needed when the "hf" model is selected.
-    from torchtitan.experiments.transformers_modeling_backend.rl import model_registry
+    from panoengine.train.rl.hf_model_registry import model_registry
 
     return model_registry(
         flavor, attn_backend=attn_backend, hf_assets_path=hf_assets_path
@@ -147,7 +147,7 @@ def base_rl_config(
     (spec `overrides`), which is how a shared box should ask for less.
     trainer/generator tensor_parallel_degree default to 1; raise either for a
     model too large to fit one GPU per role -- the GPU mesh spawned by
-    torchtitan.experiments.decentralized_rl.train (and therefore the GPU count a
+    panoengine.train.rl.train (and therefore the GPU count a
     launch script needs to provision) scales with these automatically.
     ``rollouter`` is the task bundle (dataset + reward rubric + environment, a
     ``Rollouter.Config`` subclass instance); it defaults to the alphabet-sort
@@ -488,7 +488,7 @@ def rl_heloco_async_inference_qwen3_0_6b(
     trainer_tensor_parallel_degree: int = 1,
     generator_tensor_parallel_degree: int = 1,
 ) -> HeLoCoAsyncInferenceReplica.Config:
-    """Prime-rl-style decoupled generation (arXiv:2505.07291) scaled to
+    """Decoupled generation (arXiv:2505.07291) scaled to
     MULTIPLE trainers: N PURE-LEARNER HeLoCo trainer replicas (1 GPU each at
     the default TP=1 -- no local generation, no vLLM on the trainer) plus a
     separate pool of rl_heloco_async_inference_worker_* generator processes on
@@ -715,16 +715,16 @@ def rl_async_inference_qwen3_0_6b(
     trainer_tensor_parallel_degree: int = 1,
     generator_tensor_parallel_degree: int = 1,
 ) -> AsyncInferenceReplica.Config:
-    """Trainer role of prime-rl (arXiv:2505.07291): ONE pure-learner trainer
-    (1 GPU, no local vLLM) fed entirely by a pool of remote generator workers
+    """Trainer role: ONE pure-learner trainer (1 GPU, no local vLLM) fed 
+    entirely by a pool of remote generator workers
     (rl_async_inference_worker_*) on their own machines. The trainer pops
     rollouts from the standalone queue process at rollout_queue_address under
     a max_staleness bound, trains, and shards + publishes its weights to
     relay_addresses every publish_every windows (SHARDCAST-style) -- plus an
     initial publish at startup so the workers can bootstrap. Both addresses
     are required -- start the servers first:
-    ``python -m torchtitan.experiments.decentralized_rl.relay`` and
-    ``python -m torchtitan.experiments.decentralized_rl.rollout_queue``.
+    ``python -m panoengine.train.rl.relay`` and
+    ``python -m panoengine.train.rl.rollout_queue``.
     Workers push rollouts to the same queue
     ($ASYNC_INFERENCE_ROLLOUT_QUEUE_ADDR) and pull weights from the relay
     ($ASYNC_INFERENCE_RELAY_ADDRS).

@@ -29,14 +29,15 @@ Every recipe in this repo is a `FaultTolerantTrainer.Config`, so a workload does
 | **SFT (instruction tuning)**             |  —   |   —    |   —    |  —    |
 | **RL (GRPO)** <sup>†</sup>               |  ✅  |   ✅   |   ✅   |  ✅   |
 
-<sup>†</sup> The RL presets live here (`panoengine/train/rl/`), as do the parameter server,
-relay and rollout queue. The Monarch trainer actors and replica classes stay in the torchtitan
-fork, because they subclass upstream's own experimental `PolicyTrainer` and `Controller`. See
-[FORK-DELTA.md](FORK-DELTA.md) for exactly where that line falls.
+<sup>†</sup> `panoengine/train/rl/` holds the presets and the decentralized coordinators —
+the Monarch trainer actors, the four replica strategies and their launch entry points — and
+`panoengine/decentralized/` holds the parameter server, relay and rollout queue. The RL
+implementation they all build on stays in the torchtitan fork and is imported from there, not
+copied. See [FORK-DELTA.md](FORK-DELTA.md) for exactly where that line falls.
 
 **On the SFT row:** the em-dashes are honest. What exists is LoRA fine-tuning
-(`panoengine/train/finetune/lora`) and a full-parameter HF backend
-(`panoengine/train/pretrain/hf_transformers`) — but both train on raw text, so they are
+(`models/lora`) and a full-parameter HF backend
+(`models/hf_transformers`) — but both train on raw text, so they are
 parameter-efficient and full-parameter *continued pretraining*. Instruction tuning needs a
 data path that does not exist yet: chat-template rendering, prompt-token loss masking,
 sample packing with correct attention boundaries, and an eval split. Until that lands,
@@ -139,7 +140,7 @@ NNODES=<num_nodes> \
 ISHOST=true \
 GLOO_SOCKET_IFNAME=<network_card> \
 NCCL_SOCKET_IFNAME=<network_card> \
-MODULE="panoengine.train.pretrain.llama3" \
+MODULE="models.llama3" \
 CONFIG_NAME="llama3_debugmodel" \
 uv run ./run_train.sh --fault_tolerance.enable \
   --fault_tolerance.replica_id=0 --fault_tolerance.group_size=2
@@ -157,14 +158,15 @@ uv run ./run_train.sh ... --fault_tolerance.semi_sync_method=heloco
 
 | Recipe | Module |
 |---|---|
-| Llama3 | `panoengine.train.pretrain.llama3` |
-| Qwen3 (incl. MoE) | `panoengine.train.pretrain.qwen3` |
-| GPT-OSS | `panoengine.train.pretrain.gpt_oss` |
-| Any HF architecture | `panoengine.train.pretrain.hf_transformers` |
-| LoRA (Qwen3, Llama3) | `panoengine.train.finetune.lora` |
-| ResNet / CIFAR-10 | `panoengine.train.recipes.resnet` |
+| Llama3 | `models.llama3` |
+| Qwen3 (incl. MoE) | `models.qwen3` |
+| GPT-OSS | `models.gpt_oss` |
+| Any HF architecture | `models.hf_transformers` |
+| LoRA (Qwen3, Llama3) | `models.lora` |
+| ResNet / CIFAR-10 | `models.resnet` |
 
-Every module above is also reachable at its legacy `models.<pkg>` path.
+`models.<pkg>` is the canonical path: it is what the control plane stores in a run
+spec and what torchtitan's ConfigManager resolves for `--module`.
 
 Before training, download the tokenizer:
 

@@ -45,7 +45,7 @@ decentralized = [
 train = [
   "panofabric-engine[decentralized]",
   "torchtitan @ git+https://github.com/PanocularAI/torchtitan.git@8dab07165c50e46e076293a26011443d8443df8f",
-  # panoengine.train.pretrain.hf_transformers needs it, and torchtitan's
+  # models.hf_transformers needs it, and torchtitan's
   # transformers_modeling_backend imports it without declaring it in either its
   # pyproject or requirements.txt — so without this line that recipe fails to
   # import on an otherwise-complete node. Unpinned deliberately: the backend's
@@ -74,10 +74,15 @@ Homepage = "https://github.com/PanocularAI/panofabric-engine"
 # until a real one is written. See the plan's Q2.
 
 [tool.setuptools.packages.find]
-# panoengine* = the engine. models* = the compatibility shims that keep stored
-# run specs resolving (see models/__init__.py).
+# panoengine* = the engine machinery (strategies, RL coordinators, decentralized
+# algorithms, serving). models* = the training recipes, one package per model —
+# the path run specs name (see models/__init__.py).
 include = ["panoengine*", "models*"]
-exclude = ["panoengine.serve.tests*", "panoengine.decentralized.tests*"]
+exclude = [
+  "panoengine.serve.tests*",
+  "panoengine.decentralized.tests*",
+  "panoengine.train.rl.tests*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "panoengine/decentralized/tests"]

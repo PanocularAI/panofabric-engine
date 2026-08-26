@@ -126,15 +126,13 @@ WORKDIR /opt/panoengine
 RUN python -c "import torch, torchtitan, torchft; print('baked torch', torch.__version__)"
 
 # OCI labels: source -> THIS repo (so GHCR shows the engine's README, not the control
-# plane's); the build script passes the resolved source SHAs. The source URL stays
-# github.com/PanocularAI/symphony-learn because that is still the repo's real name —
-# panofabric-engine does not resolve yet.
+# plane's); the build script passes the resolved source SHAs.
 ARG ENGINE_SHA=unknown
 ARG TORCHTITAN_SHA=unknown
 ARG TORCHFT_SHA=unknown
 ARG CUDA_TAG=cu130
 LABEL org.opencontainers.image.title="panofabric-engine (train)" \
-      org.opencontainers.image.source="https://github.com/PanocularAI/symphony-learn" \
+      org.opencontainers.image.source="https://github.com/PanocularAI/panofabric-engine" \
       org.opencontainers.image.description="Training-only stage: torch nightly + torchtitan + torchft + panoengine. No vllm, no RL runtime, no serving plane — published as :<tag>-train." \
       ai.panocular.cuda="${CUDA_TAG}" \
       ai.panocular.ref.engine="${ENGINE_SHA}" \
@@ -239,7 +237,7 @@ ARG ENGINE_SHA=unknown
 ARG TORCHTITAN_SHA=unknown
 ARG TORCHFT_SHA=unknown
 LABEL org.opencontainers.image.title="panofabric-engine" \
-      org.opencontainers.image.source="https://github.com/PanocularAI/symphony-learn" \
+      org.opencontainers.image.source="https://github.com/PanocularAI/panofabric-engine" \
       org.opencontainers.image.description="GPU-node runtime: baked training engine (torch nightly + torchtitan + torchft + panoengine) + vllm + the RL runtime + the serving plane." \
       ai.panocular.cuda="${CUDA_TAG}" \
       ai.panocular.ref.engine="${ENGINE_SHA}" \

@@ -38,13 +38,13 @@ In case you do not have root permission to install tailscale, please follow the 
 ## 2. Installing the framework
 1. First clone the repository with:
 ```
-git clone --recursive https://github.com/PanocularAI/symphony-learn.git
+git clone --recursive https://github.com/PanocularAI/panofabric-engine.git
 ```
 Make sure that you pull all submodules using `--recursive` flag.
 
 2. Change directory into the cloned repository and create uv venv using:
 ```bash
-    cd symphony-learn
+    cd panofabric-engine
     uv sync
 ```
 

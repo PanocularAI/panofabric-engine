@@ -19,8 +19,8 @@ envs:
   FT_GROUP_SIZE: "2"
 
 setup: |
-  git clone --recursive https://github.com/PanocularAI/symphony-learn.git
-  cd symphony-learn
+  git clone --recursive https://github.com/PanocularAI/panofabric-engine.git
+  cd panofabric-engine
   make all
   # uv run python torchtitan/scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.1-8B --assets tokenizer --hf_token=$HF_TOKEN
 
@@ -29,7 +29,7 @@ run: |
   # Get head node IP (first node in the list)
   HEAD_NODE_IP=$(echo "$SKYPILOT_NODE_IPS" | head -n1)
   echo "Head node IP: $HEAD_NODE_IP"
-  cd symphony-learn/
+  cd panofabric-engine/
   rm -rf outputs
 
   echo "Starting training on node with IP: $SKYPILOT_NODE_IPS"

@@ -10,13 +10,13 @@ Before proceeding, make sure you have:
 - Installed and configured [SkyPilot](https://docs.skypilot.co/en/latest/getting-started/quickstart.html)
 - Access to a supported cloud provider (Nebius, AWS, etc.)
 - Proper credentials set up for the cloud provider
-- Access to this repository (contains configuration files under symphony-learn/skypilot/)
+- Access to this repository (contains configuration files under panofabric-engine/skypilot/)
 
 ## ⚙️ Step 1: Launch the Lighthouse Node
 First, launch a Lighthouse node that acts as the central coordinator for TorchFT. A normal CPU VM is sufficient (e.g., 4 vCPUs).
 
 ```bash
-sky launch -c lighthouse ../symphony-learn/skypilot/lighthouse.yaml
+sky launch -c lighthouse ../panofabric-engine/skypilot/lighthouse.yaml
 ```
 
 Once launched, note the public IP address of the lighthouse node — this will be used by all worker nodes to connect.

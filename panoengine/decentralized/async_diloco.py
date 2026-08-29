@@ -27,7 +27,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler
 from types import TracebackType
 from typing import Any, BinaryIO, Dict, List, Optional, Tuple, Type, Union
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlunparse
 
 import torch
 import torch.distributed as dist
@@ -1369,6 +1369,8 @@ class AsyncDiLoCo:
         resync_backoff_max: float = 60.0,
         sync_timeout: float = 600.0,
         busy_retries: int = 10,
+        min_replicas: int = 0,
+        min_replicas_timeout: float = 600.0,
         replica_pg: Optional[dist.ProcessGroup] = None,
         num_fragments: int = 1,
     ) -> None:
@@ -1552,6 +1554,91 @@ class AsyncDiLoCo:
             self._heartbeat_url = None
         self._heartbeat_stop: Optional[threading.Event] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
+        # Cohort gate (see _await_cohort). The status URL is the /sync address
+        # with its path swapped -- the worker is handed /sync and /heartbeat,
+        # never /status.
+        self._min_replicas = int(min_replicas or 0)
+        self._min_replicas_timeout = float(min_replicas_timeout)
+        self._status_url: Optional[str] = (
+            urlunparse(urlparse(server_address)._replace(path="/status", query=""))
+            if server_address
+            else None
+        )
+
+    def _await_cohort(self, startup: bool = True) -> None:
+        """Block until ``min_replicas`` replicas are registered with the server.
+
+        A registered "worker" in this module IS a replica -- only a replica's lead
+        holds the HTTP session and heartbeat identity -- so the name matches
+        torchft's lighthouse knob and the ``ft.min_replica_size`` spec field that
+        feeds it. One vocabulary end to end.
+
+        The parameter-server equivalent of torchft's lighthouse ``min_replicas``:
+        heloco is asynchronous by design and a lone worker will happily train and
+        push by itself, so a run whose whole point is cross-island synchronization
+        can go green having synchronized NOTHING.
+
+        Checked at STARTUP and again at every sync boundary, mirroring the
+        lighthouse: ``min_replicas`` there gates every quorum, not just the first,
+        so a cohort that shrinks mid-run stops training instead of quietly
+        degrading to solo pushes. ``startup`` only changes the log wording.
+
+        Counts replicas, not ranks: a 4-GPU island registers once.
+
+        CAVEAT for multi-GPU replicas: the gate is lead-only, so while the lead
+        polls here its FOLLOWERS are already waiting in the boundary collective.
+        Keep ``min_replicas_timeout`` below the replica process-group timeout, or
+        the followers abort the collective before the lead gives up. Single-GPU
+        replicas have no followers and are unaffected.
+
+        Raises on timeout rather than training alone. A verification run must fail
+        loudly when its premise does not hold; an operator who prefers a solo run
+        sets min_replicas=0 (the default) and gets exactly the old behavior.
+        """
+        if self._min_replicas <= 1 or not self._is_lead:
+            return
+        if self._status_url is None:
+            logger.warning(
+                "min_replicas=%d requested but the server address yields no /status "
+                "URL; starting without waiting for the cohort", self._min_replicas
+            )
+            return
+        deadline = time.monotonic() + self._min_replicas_timeout
+        last_seen = -1
+        while True:
+            count = -1
+            try:
+                with urllib.request.urlopen(self._status_url, timeout=10.0) as resp:
+                    count = int(json.loads(resp.read()).get("worker_count", 0))
+            except Exception as e:  # noqa: BLE001 - the server may still be coming up
+                logger.debug("cohort probe failed: %s", e)
+            if count >= self._min_replicas:
+                if not startup or last_seen >= 0:
+                    logger.info(
+                        "cohort ready: %d/%d workers registered; %s",
+                        count, self._min_replicas,
+                        "starting training" if startup else "resuming training",
+                    )
+                return
+            if count != last_seen and count >= 0:
+                # Mirrors the lighthouse's "New quorum not ready, only have N
+                # participants" line, so the wait is visible in the run's logs.
+                logger.info(
+                    "%s cohort: only have %d worker(s), need min_replicas %d",
+                    "waiting for" if startup else "training paused, waiting for",
+                    count, self._min_replicas,
+                )
+                last_seen = count
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"waited {self._min_replicas_timeout:.0f}s for {self._min_replicas} "
+                    f"workers to register with the parameter server at "
+                    f"{self._status_url}; only {max(count, 0)} present. Training alone "
+                    f"would silently defeat the point of a multi-island run -- raise "
+                    f"min_replicas_timeout if provisioning is just slow, or set "
+                    f"min_replicas=0 to allow a solo run."
+                )
+            time.sleep(min(2.0, self._heartbeat_interval))
 
     def __enter__(self) -> "AsyncDiLoCo":
         # Start heartbeats before the initial pull: on a large model the pull
@@ -1564,6 +1651,9 @@ class AsyncDiLoCo:
             )
             self._heartbeat_thread.start()
         try:
+            # Order matters: our own heartbeat must be running or we would never
+            # count ourselves and every worker would wait for the others forever.
+            self._await_cohort()
             self._initial_pull()
         except Exception:
             self._stop_heartbeat()
@@ -1633,6 +1723,11 @@ class AsyncDiLoCo:
         # every sync_every steps (P=1: the legacy whole-model boundary).
         if self._local_step < self._sync_every // self._num_fragments:
             return
+
+        # Lighthouse parity: min_replicas gates EVERY quorum there, so re-check the
+        # cohort at every sync boundary here. Pushing into a cohort that has shrunk
+        # below the floor is the silent-solo-training failure this exists to stop.
+        self._await_cohort(startup=False)
 
         if self._replica_pg is not None:
             self._boundary_replica()

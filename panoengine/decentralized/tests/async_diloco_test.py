@@ -1862,3 +1862,106 @@ class TestFragmentSync(TestCase):
             self.assertEqual(server.status()["applied_pushes"], 0)
         finally:
             server.shutdown()
+
+
+class TestCohortGate(TestCase):
+    """`min_replicas`: the parameter-server equivalent of torchft's lighthouse
+    `min_replicas`.
+
+    heloco is asynchronous by design, so a lone worker trains and pushes happily.
+    That let a two-island cross-cluster run go green having averaged
+    nothing: the fast island finished before the slow one had provisioned, and the
+    server never saw more than one worker at a time.
+    """
+
+    def _server(self, d: int = 8) -> AsyncDiLoCoServer:
+        global_model = _make_model(d)
+        return AsyncDiLoCoServer(global_model, optim.SGD(global_model.parameters(), lr=0.1),
+                                 port=0)
+
+    def _worker(self, server: AsyncDiLoCoServer, d: int = 8, **kw) -> AsyncDiLoCo:
+        m = _make_model(d)
+        return AsyncDiLoCo(server.address(), m, optim.SGD(m.parameters(), lr=0.01),
+                           sync_every=100, heartbeat_address=server.heartbeat_address(),
+                           **kw)
+
+    def test_default_does_not_wait(self) -> None:
+        """min_replicas unset -> the historical behavior, a solo worker just runs."""
+        server = self._server()
+        started = time.monotonic()
+        with self._worker(server):
+            pass
+        self.assertLess(time.monotonic() - started, 20.0)
+
+    def test_single_worker_times_out_instead_of_training_alone(self) -> None:
+        """THE regression: with a cohort of 2 required and only one present, entering
+        must RAISE. Training alone is what silently defeated the run."""
+        server = self._server()
+        worker = self._worker(server, min_replicas=2, min_replicas_timeout=3.0)
+        with self.assertRaises(TimeoutError) as ctx:
+            with worker:
+                pass
+        msg = str(ctx.exception)
+        self.assertIn("min_replicas", msg)          # names the knob to change
+        self.assertIn("parameter server", msg)     # and where it was waiting
+
+    def test_proceeds_once_the_cohort_arrives(self) -> None:
+        """A second worker registering releases the first: the gate opens on
+        worker_count, and each worker counts ITSELF via its own heartbeat."""
+        server = self._server()
+
+        # Stand in for the second island: register a heartbeat id directly, which is
+        # exactly what a remote worker's heartbeat thread does.
+        def join_late() -> None:
+            time.sleep(1.0)
+            urllib.request.urlopen(
+                f"{server.heartbeat_address()}?worker_id=island-1", timeout=5
+            ).read()
+
+        t = threading.Thread(target=join_late, daemon=True)
+        t.start()
+        started = time.monotonic()
+        with self._worker(server, min_replicas=2, min_replicas_timeout=30.0):
+            waited = time.monotonic() - started
+        t.join(timeout=5)
+        self.assertGreater(waited, 0.5)            # it really did wait
+        self.assertLess(waited, 25.0)              # and it really did proceed
+        self.assertGreaterEqual(server.worker_count(), 2)
+
+
+    def test_cohort_is_rechecked_mid_run(self) -> None:
+        """Lighthouse parity: the floor holds for the WHOLE run, not just startup.
+
+        Enter with the cohort satisfied, let the peer stop heartbeating, and the next
+        sync boundary must block and then fail -- not push alone. Without this a run
+        that starts as two islands and loses one silently becomes a solo run, which
+        is the same green-but-meaningless outcome as never overlapping at all.
+        """
+        d = 8
+        global_model = _make_model(d)
+        server = AsyncDiLoCoServer(
+            global_model, optim.SGD(global_model.parameters(), lr=0.1), port=0,
+            heartbeat_timeout=1.0,        # let the peer expire quickly
+        )
+        # Peer joins once and then goes silent, like an island that finished early.
+        urllib.request.urlopen(
+            f"{server.heartbeat_address()}?worker_id=island-1", timeout=5
+        ).read()
+
+        m = _make_model(d)
+        inner = optim.SGD(m.parameters(), lr=0.01)
+        sync_every = 2
+        worker = AsyncDiLoCo(
+            server.address(), m, inner, sync_every=sync_every,
+            heartbeat_address=server.heartbeat_address(),
+            min_replicas=2, min_replicas_timeout=3.0,
+        )
+        with self.assertRaises(TimeoutError):
+            with worker:
+                self.assertGreaterEqual(server.worker_count(), 2)   # startup was fine
+                time.sleep(1.5)                                     # peer expires
+                x, y = torch.randn(4, d), torch.randint(0, d, (4,))
+                for _ in range(sync_every):                         # -> boundary
+                    inner.zero_grad()
+                    nn.CrossEntropyLoss()(m(x), y).backward()
+                    inner.step()

@@ -544,6 +544,9 @@ class AsyncDiLoCoServer:
         self._worker_speeds: List[Tuple[float, float]] = []
         # Heartbeat registry: worker_id → last_seen monotonic timestamp
         self._heartbeats: Dict[str, float] = {}
+        # Workers that announced completion via /done. Kept apart from _heartbeats so a
+        # finished worker can never be mistaken for a lost one (see the /done handler).
+        self._finished: set[str] = set()
         self._heartbeat_timeout: float = heartbeat_timeout
 
         # Global-model revision: incremented on every committed outer step.
@@ -750,6 +753,21 @@ class AsyncDiLoCoServer:
                     if is_new:
                         logger.info(f"Worker joined: {worker_id} ({n} active)")
                     self._respond(200, b"ok")
+                elif parsed.path == "/done":
+                    # A worker that finished its planned steps is NOT a lost worker.
+                    # Without this the two are indistinguishable -- both simply stop
+                    # heartbeating -- so a fast island that completed its run made the
+                    # slower island's cohort gate block until it timed out.
+                    wids = parse_qs(parsed.query).get("worker_id", [])
+                    if not wids:
+                        self._respond(400, b"missing worker_id")
+                        return
+                    with server_ref._lock:
+                        server_ref._finished.add(wids[0])
+                        server_ref._heartbeats.pop(wids[0], None)
+                        n = len(server_ref._finished)
+                    logger.info(f"Worker finished: {wids[0]} ({n} done)")
+                    self._respond(200, b"ok")
                 elif parsed.path == "/status":
                     self._respond(
                         200,
@@ -824,6 +842,9 @@ class AsyncDiLoCoServer:
             return {
                 "active_workers": active,  # worker_id → heartbeat staleness (s)
                 "worker_count": len(active),
+                # Workers that completed their planned steps and left cleanly. A
+                # cohort gate must count these as present: they are done, not lost.
+                "finished_count": len(self._finished),
                 "revision": self._revision,
                 "applied_pushes": self._applied_pushes,
                 "last_outer_step_time": self._last_step_time,
@@ -1609,7 +1630,12 @@ class AsyncDiLoCo:
             count = -1
             try:
                 with urllib.request.urlopen(self._status_url, timeout=10.0) as resp:
-                    count = int(json.loads(resp.read()).get("worker_count", 0))
+                    snap = json.loads(resp.read())
+                    # finished_count matters as much as worker_count: an island that
+                    # completed its steps has left for a GOOD reason, and blocking on
+                    # it deadlocks the slower island's last boundary (run 9a64a0588dc3).
+                    count = (int(snap.get("worker_count", 0))
+                             + int(snap.get("finished_count", 0)))
             except Exception as e:  # noqa: BLE001 - the server may still be coming up
                 logger.debug("cohort probe failed: %s", e)
             if count >= self._min_replicas:
@@ -1669,6 +1695,12 @@ class AsyncDiLoCo:
         exc_value: Optional[BaseException],
         traceback: Optional[TracebackType],
     ) -> bool:
+        # Announce completion BEFORE the heartbeat stops: a peer still training reads
+        # the cohort from /status, and a worker that simply goes quiet is
+        # indistinguishable from one that crashed. Only on a clean exit -- an
+        # exception here is a real loss and must keep blocking the cohort.
+        if exc_type is None:
+            self._announce_done()
         self._stop_heartbeat()
         # Fragment mode: drain (never adopt) an in-flight exchange — the
         # process is shutting down and replica followers couldn't join the
@@ -1683,6 +1715,24 @@ class AsyncDiLoCo:
             hook.remove()
         self._hooks.clear()
         return False
+
+    def _announce_done(self) -> None:
+        """Tell the parameter server this worker finished its planned steps.
+
+        Best-effort: a failure here costs a peer a cohort-timeout at worst, never
+        correctness, so it must not raise on the way out of a successful run.
+        """
+        if self._status_url is None or not self._is_lead:
+            return
+        url = self._status_url.replace("/status", "/done")
+        sep = "&" if "?" in url else "?"
+        try:
+            with urllib.request.urlopen(
+                f"{url}{sep}worker_id={self._worker_id}", timeout=10.0
+            ):
+                pass
+        except Exception as e:  # noqa: BLE001 - never fail a completed run on this
+            logger.debug("done announcement failed: %s", e)
 
     def _stop_heartbeat(self) -> None:
         if self._heartbeat_stop is not None:

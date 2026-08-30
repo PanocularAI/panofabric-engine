@@ -1926,7 +1926,12 @@ class TestCohortGate(TestCase):
         t.join(timeout=5)
         self.assertGreater(waited, 0.5)            # it really did wait
         self.assertLess(waited, 25.0)              # and it really did proceed
-        self.assertGreaterEqual(server.worker_count(), 2)
+        # Both islands are accounted for -- but this worker has now LEFT its context,
+        # so it announced /done and moved from active to finished. Counting only
+        # worker_count here would assert that a completed worker is still training.
+        status = server.status()
+        self.assertGreaterEqual(
+            status["worker_count"] + status["finished_count"], 2)
 
 
     def test_cohort_is_rechecked_mid_run(self) -> None:

@@ -412,6 +412,7 @@ class HeLoCoRLClient(AsyncDiLoCo):
         sync_timeout: float = 600.0,
         num_fragments: int = 1,
         busy_retries: int = 10,
+        wire_bf16: bool = True,
     ) -> None:
         # Intentionally do NOT call super().__init__: it requires an nn.Module
         # and an inner optimizer, neither of which exists here. The parent
@@ -422,6 +423,15 @@ class HeLoCoRLClient(AsyncDiLoCo):
         # everything else is overridden.
         self._server_address = server_address
         self._quantize = should_quantize
+        # Mirrors AsyncDiLoCo.__init__ (this class skips super().__init__ but
+        # inherits _session_roundtrip, which reads both): bf16 wire is
+        # negotiated per response, default on. See async_diloco.py.
+        self._wire_bf16 = wire_bf16
+        self._server_bf16 = False
+        # Delta-download state, mirroring AsyncDiLoCo (same _session_roundtrip).
+        self._have_baseline = False
+        self._delta_refresh_every = 8
+        self._deltas_since_full = 0
         self._sync_timeout = sync_timeout
         # 503 (all max_sessions slots busy) re-sends the SAME push after
         # Retry-After — required by _session_roundtrip on every roundtrip.
@@ -594,6 +604,10 @@ class HeLoCoRLClient(AsyncDiLoCo):
                 target.copy_(flat_params[offset : offset + n].view(target.shape))
                 offset += n
         self._baseline_revision = revision
+        if names is None:
+            # a fragment adopt updates one slice; only a whole-model
+            # adopt makes the baseline usable for delta downloads
+            self._have_baseline = True
         self.last_dylu_steps = new_steps
 
 

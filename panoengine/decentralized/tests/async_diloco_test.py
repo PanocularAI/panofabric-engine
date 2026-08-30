@@ -40,6 +40,15 @@ def _total_numel(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
+def _fp32_client(*args, **kwargs):
+    """AsyncDiLoCo with the wire pinned to bitwise fp32. Spawned-child tests must
+    use this: the conftest autouse patch that pins the wire for in-process tests
+    does not propagate into torch.multiprocessing children, and these suites
+    assert exact equality across the exchange."""
+    kwargs.setdefault("wire_bf16", False)
+    return AsyncDiLoCo(*args, **kwargs)
+
+
 def push_pull(
     addr: str,
     model: nn.Module,
@@ -357,6 +366,8 @@ class TestAsyncDiLoCoServer(TestCase):
         ad._total_numel = _total_numel(worker)
         ad._param_numels = [p.numel() for p in worker.parameters()]
         ad._quantize = False
+        ad._wire_bf16 = False       # _session_roundtrip reads both bf16 flags
+        ad._server_bf16 = False
         ad._baseline_revision = 0
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             ad._session_roundtrip(1.0, 1.0, torch.zeros(_total_numel(worker)))
@@ -1257,7 +1268,7 @@ def _replica_sync_child(
         model = _replica_base_model()
         _shard_params_(model)
         opt = optim.SGD(model.parameters(), lr=0.1)
-        client = AsyncDiLoCo(
+        client = _fp32_client(
             server_addr,
             model,
             opt,
@@ -1297,7 +1308,7 @@ def _replica_dylu_child(
         model = _replica_base_model()
         _shard_params_(model)
         opt = optim.SGD(model.parameters(), lr=0.1)
-        client = AsyncDiLoCo(
+        client = _fp32_client(
             server_addr, model, opt, sync_every=5,
             replica_pg=pt_dist.group.WORLD,
         )
@@ -1319,7 +1330,7 @@ def _replica_failure_child(
         model = _replica_base_model()
         _shard_params_(model)
         opt = optim.SGD(model.parameters(), lr=0.1)
-        client = AsyncDiLoCo(
+        client = _fp32_client(
             server_addr, model, opt, sync_every=2,
             replica_pg=pt_dist.group.WORLD,
         )
@@ -1361,7 +1372,7 @@ def _replica_blend_child(
         init = {n: p.to_local().clone() for n, p in model.named_parameters()}
         opt = optim.SGD(model.parameters(), lr=0.1)
         alpha = 0.5
-        client = AsyncDiLoCo(
+        client = _fp32_client(
             server_addr, model, opt, sync_every=1,
             fragment_update_alpha=alpha,
             replica_pg=pt_dist.group.WORLD,
@@ -1495,7 +1506,7 @@ def _replica_fragment_child(
         model = _replica_base_model()
         _shard_params_(model)
         opt = optim.SGD(model.parameters(), lr=0.1)
-        client = AsyncDiLoCo(
+        client = _fp32_client(
             server_addr, model, opt, sync_every=4, num_fragments=2,
             replica_pg=pt_dist.group.WORLD,
         )
@@ -1764,7 +1775,7 @@ class TestFragmentSync(TestCase):
             torch.manual_seed(3)
             model = nn.Linear(4, 5)
             opt = optim.SGD(model.parameters(), lr=0.1)
-            client = AsyncDiLoCo(
+            client = _fp32_client(
                 server.address(), model, opt, sync_every=4, num_fragments=2
             )
             order: list = []
@@ -1807,7 +1818,7 @@ class TestFragmentSync(TestCase):
             torch.manual_seed(9)  # different init: resync must adopt server's
             model = nn.Linear(4, 5)
             opt = optim.SGD(model.parameters(), lr=0.1)
-            client = AsyncDiLoCo(
+            client = _fp32_client(
                 server.address(), model, opt, sync_every=4, num_fragments=2
             )
             real = client._session_roundtrip
@@ -1848,7 +1859,7 @@ class TestFragmentSync(TestCase):
             torch.manual_seed(7)
             model = nn.Linear(4, 5)
             opt = optim.SGD(model.parameters(), lr=0.1)
-            client = AsyncDiLoCo(
+            client = _fp32_client(
                 server.address(), model, opt, sync_every=4, num_fragments=2
             )
             with client:

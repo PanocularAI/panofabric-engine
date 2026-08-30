@@ -14,6 +14,8 @@ Reference: https://arxiv.org/pdf/2401.09135
 """
 
 import dataclasses
+from collections import OrderedDict
+
 import json
 import logging
 import math
@@ -142,6 +144,15 @@ def _bytes_to_tensor(
     if not isinstance(data, bytearray):
         data = bytearray(data)
     return torch.frombuffer(data, dtype=dtype)
+
+
+def _bf16_bytes(t: torch.Tensor) -> bytes:
+    """fp32 tensor -> bf16 wire bytes (numel * 2). Bitcast through uint16 because
+    numpy has no bfloat16; the bytes are the bf16 pattern either way."""
+    return (
+        t.detach().to(torch.bfloat16).contiguous().view(torch.uint16)
+        .numpy().tobytes()
+    )
 
 
 def _quantize_int8(
@@ -378,7 +389,7 @@ class AsyncDiLoCoServer:
     ``named_parameters()`` order, little-endian):
       - Request body: one JSON line
         ``{"flag": 0|1, "speed": float, "baseline_revision": int,
-        "dtype": "float32"|"int8", "numel": int}``
+        "dtype": "float32"|"bfloat16"|"int8", "numel": int}``
         followed, when ``flag == 1`` (full sync; ``flag == 0`` is
         pull-only), by the raw pseudo-gradient payload:
           - ``dtype == "float32"``: ``numel × 4`` bytes.
@@ -551,6 +562,15 @@ class AsyncDiLoCoServer:
 
         # Global-model revision: incremented on every committed outer step.
         self._revision: int = 0
+        # Whole-model snapshots by revision, retained for delta downloads: a
+        # worker asking for a delta names the revision it holds
+        # (baseline_revision), and the delta is computed against the snapshot
+        # SERVED at that revision. Bounded ring -- a baseline older than the
+        # ring falls back to a full download, so eviction is never a
+        # correctness problem, only a bandwidth one. 8 revisions of a 0.6B
+        # model is ~19 GB on the hub.
+        self._served: "OrderedDict[int, torch.Tensor]" = OrderedDict()
+        self._served_max = 8
         self._applied_pushes: int = 0
         self._last_step_time: Optional[float] = None  # wall clock, for /status
         # One snapshot per FRAGMENT shared by all sessions until that
@@ -665,6 +685,11 @@ class AsyncDiLoCoServer:
                             flat_grads = _dequantize_int8(
                                 q, scales, server_ref._param_numels
                             )
+                        elif wire_dtype == "bfloat16":
+                            flat_grads = _bytes_to_tensor(
+                                _read_exact(self.rfile, numel * 2),
+                                torch.bfloat16,
+                            ).to(torch.float32)
                         elif wire_dtype == "float32":
                             flat_grads = _bytes_to_tensor(
                                 _read_exact(self.rfile, numel * 4),
@@ -706,17 +731,68 @@ class AsyncDiLoCoServer:
                         )
 
                     resp["numel"] = snapshot_flat.numel()
+                    # bf16 download, sent only to a client that
+                    # advertised `accept_dtype` in its push header, and the
+                    # response always names its encoding in `dtype` (a client
+                    # also uses the key's presence to learn this server takes
+                    # bf16 uploads).
+                    # fp32 on the wire carried precision the worker's bf16
+                    # inner compute immediately discarded; the server's own
+                    # master copy stays fp32, so each download's rounding is
+                    # one bf16 ulp of the authoritative value, never
+                    # cumulative.
+                    # Delta download: the worker names the revision it holds
+                    # and we ship only the CHANGE since then, int8-quantized --
+                    # a delta is small-magnitude and zero-centered, so it earns
+                    # the same treatment the pseudo-gradient upload gets. Only
+                    # for whole-model exchanges (a fragment worker's baseline
+                    # is mutated slice-by-slice and never matches a retained
+                    # whole-model snapshot), and only while the baseline is
+                    # still in the ring -- otherwise fall through to full.
+                    base_rev = int(header.get("baseline_revision", -1))
+                    delta_base = None
+                    if (
+                        header.get("accept_delta")
+                        and fragment is None
+                        and server_ref._num_fragments == 1
+                    ):
+                        with server_ref._lock:
+                            delta_base = server_ref._served.get(base_rev)
+                    if delta_base is not None:
+                        resp["dtype"] = "delta_int8"
+                        resp["delta_from"] = base_rev
+                        q, scales = _quantize_int8(
+                            snapshot_flat - delta_base,
+                            server_ref._param_numels,
+                        )
+                        body_bytes = (
+                            _tensor_to_bytes(scales) + _tensor_to_bytes(q)
+                        )
+                        payload = memoryview(body_bytes)
+                    elif header.get("accept_dtype") == "bfloat16":
+                        resp["dtype"] = "bfloat16"
+                        body_t = (
+                            snapshot_flat.contiguous()
+                            .to(torch.bfloat16).view(torch.uint16)
+                        )
+                        payload = memoryview(body_t.numpy()).cast("B")
+                    else:
+                        resp["dtype"] = "float32"
+                        # Zero-copy body: a memoryview over the snapshot's own
+                        # storage; converting would duplicate the whole-model
+                        # response (2.2 GiB at 0.6B) per in-flight reply. The
+                        # snapshot is a per-revision immutable copy, so writing
+                        # from it directly is safe even after the cache moves
+                        # on — our reference keeps this revision alive.
+                        payload = memoryview(
+                            snapshot_flat.contiguous().numpy()
+                        ).cast("B")
+                    if fragment is None and server_ref._num_fragments == 1:
+                        with server_ref._lock:
+                            server_ref._served[resp["revision"]] = snapshot_flat
+                            while len(server_ref._served) > server_ref._served_max:
+                                server_ref._served.popitem(last=False)
                     head = (json.dumps(resp) + "\n").encode()
-                    # Zero-copy body: a memoryview over the snapshot's own
-                    # storage. _tensor_to_bytes here (.numpy().tobytes()) would
-                    # duplicate the whole-model response (2.2 GiB at 0.6B) per
-                    # in-flight reply. The snapshot is a per-revision immutable
-                    # copy (torch.cat output, cached in _snapshot_flat), so
-                    # writing from it directly is safe even after the cache
-                    # moves on — our reference keeps this revision alive.
-                    payload = memoryview(
-                        snapshot_flat.contiguous().numpy()
-                    ).cast("B")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/octet-stream")
                     self.send_header(
@@ -998,6 +1074,13 @@ class AsyncDiLoCoServer:
             for i, (name, n) in enumerate(zip(names, numels)):
                 q = _bytes_to_tensor(_read_exact(rfile, n), torch.int8)
                 torch.mul(q.float(), scales[i], out=bufs[name].view(-1))
+        elif wire_dtype == "bfloat16":
+            for name, n in zip(names, numels):
+                bufs[name].view(-1).copy_(
+                    _bytes_to_tensor(
+                        _read_exact(rfile, n * 2), torch.bfloat16
+                    )
+                )
         elif wire_dtype == "float32":
             for name in names:
                 flat = bufs[name].view(-1)
@@ -1394,6 +1477,7 @@ class AsyncDiLoCo:
         min_replicas_timeout: float = 600.0,
         replica_pg: Optional[dist.ProcessGroup] = None,
         num_fragments: int = 1,
+        wire_bf16: bool = True,
     ) -> None:
         """
         Args:
@@ -1486,6 +1570,26 @@ class AsyncDiLoCo:
         self._sync_every = sync_every
         self._fragment_update_alpha = fragment_update_alpha
         self._quantize = should_quantize
+        # bf16 wire, negotiated: advertised in every header; a response that
+        # NAMES its dtype proves the server bf16-capable, and uploads switch
+        # too. Default on -- the exchange is link-limited so halving the bytes
+        # halves the boundary, and the server's master copy stays fp32 so the 
+        # rounding is one bf16 ulp
+        # of the authoritative value, never cumulative. `wire_bf16=False`
+        # keeps the wire bitwise fp32 (tests that assert exact equality;
+        # debugging).
+        self._wire_bf16 = wire_bf16
+        self._server_bf16 = False
+        # Delta downloads ride the same knob as bf16 (wire_bf16=False means a
+        # bitwise-fp32 wire, full stop). _have_baseline flips once
+        # _global_params holds a WHOLE adopted model; the refresh counter
+        # forces a full download every _delta_refresh_every-th exchange, which
+        # bounds the drift a chain of quantized deltas can accumulate (each
+        # delta is exact against the snapshot the SERVER holds, but the worker
+        # holds the quantized reconstruction of it -- see _session_roundtrip).
+        self._have_baseline = False
+        self._delta_refresh_every = 8
+        self._deltas_since_full = 0
         self._reset_inner_state = reset_inner_state
         self._sync_timeout = sync_timeout
         self._local_step = 0
@@ -2303,6 +2407,9 @@ class AsyncDiLoCo:
                 del full
         if self._is_lead:
             self._baseline_revision = revision
+        # A whole adopted model is what delta downloads reconstruct
+        # against; fragment adopts never flip this.
+        self._have_baseline = True
         if self._reset_inner_state:
             self._inner_optimizer.state.clear()
         # DyLU: new_steps arrives via the outcome broadcast, so every rank
@@ -2360,6 +2467,23 @@ class AsyncDiLoCo:
             "speed": speed,
             "baseline_revision": self._baseline_revision,
         }
+        if self._wire_bf16:
+            # Download negotiation: an old server ignores this key and replies
+            # fp32 with no `dtype` field; a new one replies bf16 AND names it.
+            header["accept_dtype"] = "bfloat16"
+            # Delta download: only when this worker holds a whole adopted
+            # baseline the server can still have (fragment workers mutate the
+            # baseline slice-wise and never qualify), and not on a refresh
+            # round. The server falls back to full on its own whenever the
+            # named revision has left its ring, so this is an offer, not a
+            # demand.
+            if (
+                self._have_baseline
+                and fragment is None
+                and getattr(self, "_num_fragments", 1) == 1
+                and self._deltas_since_full < self._delta_refresh_every
+            ):
+                header["accept_delta"] = 1
         expected_numel = (
             self._total_numel
             if fragment is None
@@ -2378,6 +2502,13 @@ class AsyncDiLoCo:
                 q, scales = _quantize_int8(flat_grads, numels)
                 header["dtype"] = "int8"
                 body = _tensor_to_bytes(scales) + _tensor_to_bytes(q)
+            elif self._server_bf16:
+                # The server named a dtype in an earlier response (the initial
+                # pull, at the latest), so it understands bf16 uploads. Never
+                # sent blind: a pre-bf16 server would 500 the push and the
+                # catch-all in _step_post_hook would silently drop the window.
+                header["dtype"] = "bfloat16"
+                body = _bf16_bytes(flat_grads)
             else:
                 header["dtype"] = "float32"
                 body = _tensor_to_bytes(flat_grads)
@@ -2409,9 +2540,39 @@ class AsyncDiLoCo:
                             f"global param numel mismatch: got {numel}, "
                             f"expected {expected_numel} — model/server mismatch?"
                         )
-                    flat_params = _bytes_to_tensor(
-                        _read_exact(resp, numel * 4), torch.float32
+                    # A response that names its dtype is from a server that
+                    # also takes bf16 uploads; remember for the next push.
+                    self._server_bf16 = (
+                        self._wire_bf16 and "dtype" in resp_header
                     )
+                    if resp_header.get("dtype") == "delta_int8":
+                        if int(resp_header["delta_from"]) != self._baseline_revision:
+                            raise ValueError(
+                                "delta against revision "
+                                f"{resp_header['delta_from']} but this worker "
+                                f"holds {self._baseline_revision}"
+                            )
+                        scales = _bytes_to_tensor(
+                            _read_exact(resp, len(self._param_numels) * 4),
+                            torch.float32,
+                        )
+                        q = _bytes_to_tensor(
+                            _read_exact(resp, numel), torch.int8
+                        )
+                        flat_params = self._baseline_flat() + _dequantize_int8(
+                            q, scales, self._param_numels
+                        )
+                        self._deltas_since_full += 1
+                    elif resp_header.get("dtype") == "bfloat16":
+                        flat_params = _bytes_to_tensor(
+                            _read_exact(resp, numel * 2), torch.bfloat16
+                        ).to(torch.float32)
+                    else:
+                        flat_params = _bytes_to_tensor(
+                            _read_exact(resp, numel * 4), torch.float32
+                        )
+                    if resp_header.get("dtype") != "delta_int8":
+                        self._deltas_since_full = 0
                 break
             except urllib.error.HTTPError as exc:
                 if exc.code != 503 or attempt == self._busy_retries:
@@ -2437,6 +2598,16 @@ class AsyncDiLoCo:
             bool(resp_header["applied"]),
         )
 
+    def _baseline_flat(self) -> torch.Tensor:
+        """This worker's adopted baseline as one flat fp32 tensor, in the
+        canonical parameter order (the layout every wire payload uses)."""
+        return torch.cat(
+            [
+                self._global_params[name].reshape(-1).float()
+                for name in self._param_names
+            ]
+        )
+
     def _adopt_global(
         self,
         flat_params: torch.Tensor,
@@ -2459,6 +2630,9 @@ class AsyncDiLoCo:
                         self._fragment_update_alpha,
                     )
         self._baseline_revision = revision
+        # A whole adopted model is what delta downloads reconstruct
+        # against; fragment adopts never flip this.
+        self._have_baseline = True
 
         if self._reset_inner_state:
             # Optional deviation from DiLoCo (which persists inner state

@@ -10,8 +10,7 @@ from torchtitan.components.validate import Validator
 from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
-from panoengine.train.strategies import semi_sync
-from torchtitan.experiments.torchft.optimizer import default_ft_adamw
+from panoengine.train.strategies import adamw, semi_sync
 from torchtitan.experiments.torchft.trainer import FaultTolerantTrainer
 from torchtitan.tools.profiler import Profiler
 
@@ -39,7 +38,7 @@ def resnet18_cifar10() -> FaultTolerantTrainer.Config:
             enable_wandb=False,
         ),
         model_spec=model_registry("18"),
-        optimizer=default_ft_adamw(lr=0.01),
+        optimizer=adamw(lr=0.01),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,
@@ -98,7 +97,7 @@ def resnet34_cifar10() -> FaultTolerantTrainer.Config:
             enable_wandb=False,
         ),
         model_spec=model_registry("34"),
-        optimizer=default_ft_adamw(lr=0.01),
+        optimizer=adamw(lr=0.01),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,
@@ -157,7 +156,7 @@ def resnet50_cifar10() -> FaultTolerantTrainer.Config:
             enable_wandb=False,
         ),
         model_spec=model_registry("50"),
-        optimizer=default_ft_adamw(lr=0.01),
+        optimizer=adamw(lr=0.01),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,
@@ -216,7 +215,7 @@ def resnet152_cifar10() -> FaultTolerantTrainer.Config:
             enable_wandb=False,
         ),
         model_spec=model_registry("152"),
-        optimizer=default_ft_adamw(lr=0.01),
+        optimizer=adamw(lr=0.01),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,

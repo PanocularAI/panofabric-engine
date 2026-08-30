@@ -13,8 +13,7 @@ from torchtitan.components.validate import Validator
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.config import CommConfig, ParallelismConfig, TrainingConfig
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
-from panoengine.train.strategies import semi_sync
-from torchtitan.experiments.torchft.optimizer import default_ft_adamw
+from panoengine.train.strategies import adamw, semi_sync
 from torchtitan.experiments.torchft.trainer import FaultTolerantTrainer
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.tools.profiler import Profiler
@@ -46,7 +45,7 @@ def hf_debugmodel() -> HFFTConfig:
             enable_wandb=False,
         ),
         model_spec=model_registry("debugmodel"),
-        optimizer=default_ft_adamw(lr=8e-4, eps=1e-8),
+        optimizer=adamw(lr=8e-4, eps=1e-8),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,
@@ -106,7 +105,7 @@ def hf_full() -> HFFTConfig:
             enable_wandb=False,
         ),
         model_spec=model_registry("full"),
-        optimizer=default_ft_adamw(lr=3e-4, eps=1e-8),
+        optimizer=adamw(lr=3e-4, eps=1e-8),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=200,
         ),
@@ -154,7 +153,7 @@ def hf_finetune() -> HFFTConfig:
     config = hf_full()
     # Full fine-tuning moves every weight: ~10x cooler than the pretrain
     # schedule (3e-4) or gradients shear the pretrained features off.
-    config.optimizer = default_ft_adamw(lr=2e-5, eps=1e-8)
+    config.optimizer = adamw(lr=2e-5, eps=1e-8)
     config.lr_scheduler.warmup_steps = 20
     config.checkpoint.enable = True               # the initial HF-weight load is gated on it
     config.checkpoint.initial_load_in_hf = True   # pretrained safetensors from hf_assets_path

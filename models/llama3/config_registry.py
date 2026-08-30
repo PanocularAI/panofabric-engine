@@ -11,8 +11,7 @@ from torchtitan.components.validate import Validator
 from torchtitan.config import CommConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
-from panoengine.train.strategies import semi_sync
-from torchtitan.experiments.torchft.optimizer import default_ft_adamw
+from panoengine.train.strategies import adamw, semi_sync
 from torchtitan.experiments.torchft.trainer import FaultTolerantTrainer
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.tools.profiler import Profiler
@@ -37,7 +36,7 @@ def llama3_8b() -> FaultTolerantTrainer.Config:
             enable_wandb=False,
         ),
         model_spec=model_registry("8B"),
-        optimizer=default_ft_adamw(lr=3e-4),
+        optimizer=adamw(lr=3e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=200,
         ),
@@ -94,7 +93,7 @@ def llama3_debugmodel() -> FaultTolerantTrainer.Config:
             enable_wandb=False,
         ),
         model_spec=model_registry("debugmodel"),
-        optimizer=default_ft_adamw(lr=8e-4),
+        optimizer=adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,

@@ -54,9 +54,19 @@ private ``_StreamingDiLoCoFragment``) and the additive ``manager.py`` /
 ``local_sgd.py`` hooks. See FORK-DELTA.md.
 """
 
-from torchtitan.experiments.torchft.config.job_config import FaultTolerance
+import sys
 
-__all__ = ["semi_sync"]
+from torchtitan.components.optimizer import OptimizersContainer, default_adamw
+from torchtitan.experiments.torchft.config.job_config import FaultTolerance
+from torchtitan.experiments.torchft.optimizer import default_ft_adamw
+
+__all__ = ["semi_sync", "adamw"]
+
+#: The flag controld emits for a CENTRALIZED run. It emits the positive
+#: `--fault_tolerance.enable` otherwise -- always one or the other, never
+#: omission, because every preset here hardcodes enable=True and an omitted flag
+#: would silently keep fault tolerance on. See ResolvedIsland.ft_flags().
+_FT_DISABLED_FLAG = "--fault_tolerance.no_enable"
 
 #: The values torchtitan's `maybe_semi_sync_training` dispatches on. "solo" is
 #: NOT one of them — controld's strategy axis has it, and it means "leave
@@ -122,3 +132,28 @@ def semi_sync(
     )
     fields.update(overrides)   # every default above is overridable
     return FaultTolerance(**fields)
+
+
+def adamw(lr: float = 8e-4, **kwargs) -> OptimizersContainer.Config:
+    """The optimizer every recipe under ``models/`` shares -- FT-aware.
+
+    ``default_ft_adamw`` builds a ``TorchFTOptimizersContainer``, and the FT trainer
+    picks that container purely from the config TYPE
+    (``experiments/torchft/trainer.py``: ``isinstance(config.optimizer,
+    TorchFTOptimizersContainer.Config)``). Its ``__init__`` then reads
+    ``ft_manager.manager``, which ASSERTS when fault tolerance is off -- so a preset
+    that hardcodes the FT optimizer cannot run centralized at all. A centralized
+    island should be plain torchtitan: no manager, no torchft optimizer wrapper.
+
+    The preset cannot be handed that decision as a parameter: ``ConfigManager``
+    strips only ``--module``/``--config``, calls this registry function with no
+    arguments, and lets tyro apply the remaining CLI on top of what it returns. So
+    the flag is read here from the very argv tyro is about to parse. That is a real
+    contract, not a guess -- controld always emits one of the two spellings.
+
+    Standalone (``./run_train.sh`` with no FT flags) keeps the FT optimizer, which
+    is what the presets' ``semi_sync()`` block expects.
+    """
+    if _FT_DISABLED_FLAG in sys.argv:
+        return default_adamw(lr, **kwargs)
+    return default_ft_adamw(lr, **kwargs)

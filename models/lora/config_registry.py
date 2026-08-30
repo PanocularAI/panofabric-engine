@@ -32,9 +32,8 @@ from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
 from torchtitan.experiments.torchft.config.job_config import FaultTolerantModelSpec
-from panoengine.train.strategies import semi_sync
+from panoengine.train.strategies import adamw, semi_sync
 from torchtitan.experiments.torchft.diloco import fragment_llm
-from torchtitan.experiments.torchft.optimizer import default_ft_adamw
 from torchtitan.experiments.torchft.trainer import FaultTolerantTrainer
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.tools.profiler import Profiler
@@ -160,7 +159,7 @@ def _lora_preset(
         model_spec=model_spec,
         # LoRA fine-tunes run hotter than full fine-tuning (only the adapters
         # move): 1e-4 vs the pretrain presets' 3e-4-per-token-budget schedules.
-        optimizer=default_ft_adamw(lr=1e-4, eps=1e-8),
+        optimizer=adamw(lr=1e-4, eps=1e-8),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=warmup_steps,
         ),

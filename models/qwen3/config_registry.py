@@ -11,8 +11,7 @@ from torchtitan.components.validate import Validator
 from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
-from panoengine.train.strategies import semi_sync
-from torchtitan.experiments.torchft.optimizer import default_ft_adamw
+from panoengine.train.strategies import adamw, semi_sync
 from torchtitan.experiments.torchft.trainer import FaultTolerantTrainer
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.tools.profiler import Profiler
@@ -36,7 +35,7 @@ def qwen3_0_6b() -> FaultTolerantTrainer.Config:
             save_tb_folder="tb",
         ),
         model_spec=model_registry("0.6B"),
-        optimizer=default_ft_adamw(lr=3e-4),
+        optimizer=adamw(lr=3e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
         ),
@@ -88,7 +87,7 @@ def qwen3_1_7b() -> FaultTolerantTrainer.Config:
             save_tb_folder="tb",
         ),
         model_spec=model_registry("1.7B"),
-        optimizer=default_ft_adamw(lr=8e-4),
+        optimizer=adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=20,
         ),
@@ -141,7 +140,7 @@ def qwen3_32b() -> FaultTolerantTrainer.Config:
             save_tb_folder="tb",
         ),
         model_spec=model_registry("32B"),
-        optimizer=default_ft_adamw(lr=8e-4),
+        optimizer=adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=600,
         ),
@@ -193,7 +192,7 @@ def qwen3_moe_debug() -> FaultTolerantTrainer.Config:
             save_tb_folder="tb",
         ),
         model_spec=model_registry("debugmodel_moe"),
-        optimizer=default_ft_adamw(lr=3e-4),
+        optimizer=adamw(lr=3e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
         ),

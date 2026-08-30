@@ -14,8 +14,8 @@ TORCHTITAN_DIR ?= $(FORKS_DIR)/torchtitan
 TORCHFT_DIR    ?= $(FORKS_DIR)/torchft
 TORCHTITAN_URL ?= https://github.com/PanocularAI/torchtitan.git
 TORCHFT_URL    ?= https://github.com/PanocularAI/torchft.git
-TORCHTITAN_REF ?= 8dab07165c50e46e076293a26011443d8443df8f
-TORCHFT_REF    ?= 429a9dba61b8a04b7d202c9a4ca0be4c42324184
+TORCHTITAN_REF ?= 39f909614862def052998cc21815166641602619
+TORCHFT_REF    ?= edad86ca1c8a95195961e555cf0ab3982bb860f7
 
 TORCH_SPEC ?= torch
 PYTORCH_BASE_URL ?= https://download.pytorch.org/whl/nightly

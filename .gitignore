@@ -15,8 +15,8 @@ wandb
 
 
 # hf assets
-assets/hf/*
-assets/tokenizer/*
+/assets/hf/*
+/assets/tokenizer/*
 
 # temp files
 *.log

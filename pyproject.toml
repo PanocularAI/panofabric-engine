@@ -39,12 +39,12 @@ dependencies = []
 # one-way: the torchtitan fork's RL adapter imports panoengine.decentralized, and since
 # this extra pulls no torchtitan, there is no dependency cycle. Do not add torchtitan here.
 decentralized = [
-  "torchft @ git+https://github.com/PanocularAI/torchft.git@429a9dba61b8a04b7d202c9a4ca0be4c42324184",
+  "torchft @ git+https://github.com/PanocularAI/torchft.git@edad86ca1c8a95195961e555cf0ab3982bb860f7",
 ]
 
 train = [
   "panofabric-engine[decentralized]",
-  "torchtitan @ git+https://github.com/PanocularAI/torchtitan.git@8dab07165c50e46e076293a26011443d8443df8f",
+  "torchtitan @ git+https://github.com/PanocularAI/torchtitan.git@39f909614862def052998cc21815166641602619",
   # models.hf_transformers needs it, and torchtitan's
   # transformers_modeling_backend imports it without declaring it in either its
   # pyproject or requirements.txt — so without this line that recipe fails to

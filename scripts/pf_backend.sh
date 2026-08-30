@@ -41,25 +41,38 @@ fi
 if command -v rocminfo >/dev/null 2>&1 || [ -x /opt/rocm/bin/rocminfo ]; then
 	printf 'rocm7.0'
 elif command -v nvidia-smi >/dev/null 2>&1; then
-	cuda_version=$(nvidia-smi | grep "CUDA Version" | sed 's/.*CUDA Version: //' | sed 's/ .*//')
-	if [ -n "$cuda_version" ]; then
-		major=${cuda_version%%.*}
-		case "$major" in
-		'' | *[!0-9]*) : ;; # unparseable version -> no claim about the driver
-		*)
-			if [ "$major" -lt 13 ] && [ -z "$compat_dir" ]; then
-				echo "[pf_backend] WARNING: driver reports CUDA $cuda_version, but the engine" \
-					"needs torch>=2.13 (CUDA 13 only). Update the NVIDIA driver to r580+, or" \
-					"install NVIDIA's cuda-compat libs and put their dir on LD_LIBRARY_PATH" \
-					"(on PanoFabric: compute page -> Slurm settings -> Worker environment)." \
-					"Without one of these, torch will fail to initialize CUDA." >&2
-			fi
-			;;
-		esac
-		printf 'cu130'
-	else
-		printf 'cpu'
-	fi
+	# A working nvidia-smi means CUDA, FULL STOP: nothing below may downgrade that to
+	# `cpu`. It used to, and it cost a live debug (lcluster13, 2026-08-28). The driver
+	# version came from scraping nvidia-smi's human-readable header, which is not a
+	# stable interface -- r610 renamed its fields:
+	#   r580: | NVIDIA-SMI 580.173.02  Driver Version: 580.173.02  CUDA Version: 13.0 |
+	#   r610: | NVIDIA-SMI 610.43.02   KMD Version: 610.43.02  CUDA UMD Version: 13.3 |
+	# so `grep "CUDA Version"` matched NOTHING on r610, the old code fell through to
+	# `cpu`, and the engine built a CPU-only torch on an H100. Worse, `ensure` keys its
+	# cache on this token, so the junk env was published under a `cpu` fingerprint and
+	# the training run died with no hint that a STRING PARSE was the cause. The cluster
+	# was mixed (V100s on r580, H100s on r610), so the prewarm looked healthy and only
+	# runs landing on the newer nodes broke.
+	#
+	# So: query the driver version through the machine-readable interface, and use it
+	# ONLY to decide whether to warn about forward-compat.
+	driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null |
+		head -1 | tr -d ' \r')
+	major=${driver%%.*}
+	case "$major" in
+	'' | *[!0-9]*) : ;; # unparseable/unavailable -> no claim about the driver
+	*)
+		# CUDA 13 wheels need an r580+ driver, or NVIDIA's forward-compat userspace.
+		if [ "$major" -lt 580 ] && [ -z "$compat_dir" ]; then
+			echo "[pf_backend] WARNING: NVIDIA driver $driver predates r580, but the engine" \
+				"needs torch>=2.13 (CUDA 13 only). Update the driver to r580+, or install" \
+				"NVIDIA's cuda-compat libs and put their dir on LD_LIBRARY_PATH" \
+				"(on PanoFabric: compute page -> Slurm settings -> Worker environment)." \
+				"Without one of these, torch will fail to initialize CUDA." >&2
+		fi
+		;;
+	esac
+	printf 'cu130'
 else
 	printf 'cpu'
 fi

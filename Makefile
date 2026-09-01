@@ -14,7 +14,7 @@ TORCHTITAN_DIR ?= $(FORKS_DIR)/torchtitan
 TORCHFT_DIR    ?= $(FORKS_DIR)/torchft
 TORCHTITAN_URL ?= https://github.com/PanocularAI/torchtitan.git
 TORCHFT_URL    ?= https://github.com/PanocularAI/torchft.git
-TORCHTITAN_REF ?= 39f909614862def052998cc21815166641602619
+TORCHTITAN_REF ?= 1ec4992a207dc317433ed3f014caf782b2a3dd98
 TORCHFT_REF    ?= edad86ca1c8a95195961e555cf0ab3982bb860f7
 
 TORCH_SPEC ?= torch
@@ -98,7 +98,7 @@ install-torch: export VIRTUAL_ENV := $(abspath $(VENV))
 install-torch:
 	@backend=$$(sh scripts/pf_backend.sh); \
 	case "$$backend" in \
-		cu130|rocm7.0|cpu) \
+		cu130|rocm7.2|cpu) \
 			index_url="$(PYTORCH_BASE_URL)/$$backend"; \
 			;; \
 		*) \
@@ -109,8 +109,12 @@ install-torch:
 	echo "[make install-torch] Backend: $$backend"; \
 	echo "[make install-torch] Index URL: $$index_url"; \
 	set -x; \
-	$(UV_PIP_CMD) --pre $(TORCH_SPEC) --index-url "$$index_url" --force-reinstall; \
-	set +x
+	$(UV_PIP_CMD) --pre $(TORCH_SPEC) --index-url "$$index_url" --force-reinstall
+# NO trailing `set +x`: it was the recipe's LAST command, so its 0 exit status MASKED a
+# failed torch install and the build marched on. The next target then resolved
+# torchdata's `torch` dep off PyPI and installed a STABLE CUDA torch over the backend-
+# matched one — a silently wrong env, published under a valid-looking cache fingerprint.
+# Seen live on an MI300X node whose home quota ran out mid-download (2026-08-31).
 
 # Clone the forks as siblings if they are ABSENT (at the pinned ref). An existing
 # clone is left exactly as it is — never checked out to the pin, because it is the

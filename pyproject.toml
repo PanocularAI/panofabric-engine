@@ -44,7 +44,7 @@ decentralized = [
 
 train = [
   "panofabric-engine[decentralized]",
-  "torchtitan @ git+https://github.com/PanocularAI/torchtitan.git@39f909614862def052998cc21815166641602619",
+  "torchtitan @ git+https://github.com/PanocularAI/torchtitan.git@1ec4992a207dc317433ed3f014caf782b2a3dd98",
   # models.hf_transformers needs it, and torchtitan's
   # transformers_modeling_backend imports it without declaring it in either its
   # pyproject or requirements.txt — so without this line that recipe fails to

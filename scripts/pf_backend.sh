@@ -1,5 +1,5 @@
 #!/bin/sh
-# Print THIS node's torch backend token: cu130 | rocm7.0 | cpu.
+# Print THIS node's torch backend token: cu130 | rocm7.2 | cpu.
 # `sh scripts/pf_backend.sh compat-dir` instead prints the CUDA forward-compat lib dir
 # when one is resolvable (else nothing) — a diagnostic for setting up old-driver clusters.
 #
@@ -39,7 +39,7 @@ if [ "${1:-}" = "compat-dir" ]; then
 fi
 
 if command -v rocminfo >/dev/null 2>&1 || [ -x /opt/rocm/bin/rocminfo ]; then
-	printf 'rocm7.0'
+	printf 'rocm7.2'
 elif command -v nvidia-smi >/dev/null 2>&1; then
 	# A working nvidia-smi means CUDA, FULL STOP: nothing below may downgrade that to
 	# `cpu`. It used to, and it cost a live debug (lcluster13, 2026-08-28). The driver

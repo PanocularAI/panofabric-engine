@@ -432,6 +432,12 @@ class HeLoCoRLClient(AsyncDiLoCo):
         self._have_baseline = False
         self._delta_refresh_every = 8
         self._deltas_since_full = 0
+        # Comm accounting, also read by the inherited _session_roundtrip.
+        self._exchange_count = 0
+        self._comm_seconds_total = 0.0
+        self._comm_bytes_up_total = 0
+        self._comm_bytes_down_total = 0
+        self._sync_every = getattr(self, "_sync_every", 1)   # metric step tag
         self._sync_timeout = sync_timeout
         # 503 (all max_sessions slots busy) re-sends the SAME push after
         # Retry-After — required by _session_roundtrip on every roundtrip.

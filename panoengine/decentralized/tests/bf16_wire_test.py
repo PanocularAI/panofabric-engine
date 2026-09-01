@@ -127,3 +127,24 @@ class TestBf16Wire(TestCase):
             worker._inner_optimizer.step()
         # server-side model must have taken the (bf16) push
         self.assertGreaterEqual(server.status()["applied_pushes"], 0)
+
+
+class TestWireEnvEscape(TestCase):
+    def test_env_disables_the_compressed_wire(self):
+        """The fp32 control arm of the convergence study: islands reach the
+        worker constructor only through their env, so PF_WIRE_BF16=0 must pin
+        the wire to bitwise fp32 (bf16 AND deltas both ride this flag)."""
+        import os
+        from unittest import mock
+        model = _make_model()
+        with mock.patch.dict(os.environ, {"PF_WIRE_BF16": "0"}):
+            w = AsyncDiLoCo("http://127.0.0.1:9/sync", model,
+                            optim.SGD(model.parameters(), lr=0.1),
+                            sync_every=1, wire_bf16=None)
+        self.assertFalse(w._wire_bf16)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PF_WIRE_BF16", None)
+            w2 = AsyncDiLoCo("http://127.0.0.1:9/sync", model,
+                             optim.SGD(model.parameters(), lr=0.1),
+                             sync_every=1, wire_bf16=None)
+        self.assertTrue(w2._wire_bf16)

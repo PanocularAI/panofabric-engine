@@ -1477,7 +1477,7 @@ class AsyncDiLoCo:
         min_replicas_timeout: float = 600.0,
         replica_pg: Optional[dist.ProcessGroup] = None,
         num_fragments: int = 1,
-        wire_bf16: bool = True,
+        wire_bf16: Optional[bool] = None,
     ) -> None:
         """
         Args:
@@ -1578,6 +1578,13 @@ class AsyncDiLoCo:
         # of the authoritative value, never cumulative. `wire_bf16=False`
         # keeps the wire bitwise fp32 (tests that assert exact equality;
         # debugging).
+        # None -> honor $PF_WIRE_BF16 (default on). The knob exists for the
+        # convergence study's fp32 CONTROL arm: the compressed wire is
+        # default-on with no spec field, and islands can only reach a worker
+        # constructor through their env. "0"/"false"/"off" disable.
+        if wire_bf16 is None:
+            wire_bf16 = os.environ.get("PF_WIRE_BF16", "1").strip().lower() not in (
+                "0", "false", "off")
         self._wire_bf16 = wire_bf16
         self._server_bf16 = False
         # Delta downloads ride the same knob as bf16 (wire_bf16=False means a
@@ -1593,6 +1600,13 @@ class AsyncDiLoCo:
         self._reset_inner_state = reset_inner_state
         self._sync_timeout = sync_timeout
         self._local_step = 0
+        # Communication accounting for the metrics sink (see _emit_comm_metrics):
+        # per-exchange bytes and wall time, plus running totals, so a run reports
+        # what it actually moved rather than an estimate.
+        self._exchange_count = 0
+        self._comm_seconds_total = 0.0
+        self._comm_bytes_up_total = 0
+        self._comm_bytes_down_total = 0
         self._hooks: List[Any] = []
         self._window_start: float = 0.0
         # Replica mode (see the docstring): rank 0 of `replica_pg` is the
@@ -2442,6 +2456,41 @@ class AsyncDiLoCo:
     # Session plumbing                                                    #
     # ------------------------------------------------------------------ #
 
+    # Bytes on the wire per element, by the dtype the header names.
+    _WIRE_ITEMSIZE = {"float32": 4, "bfloat16": 2, "delta_int8": 1, "int8": 1}
+
+    def _emit_comm_metrics(self, seconds: float, bytes_up: int,
+                           bytes_down: int, fragment: Optional[int]) -> None:
+        """One `PFMETRICS {json}` line per exchange.
+
+        The control plane parses any PFMETRICS payload verbatim (numeric values,
+        `step` required), so these keys reach the metrics store and the charts
+        with no parser change. Communication used to be only INFERRABLE, by
+        differencing step timestamps around a boundary — which cannot separate
+        transfer time from the stall it causes, and cannot see bytes at all."""
+        self._exchange_count += 1
+        self._comm_seconds_total += seconds
+        self._comm_bytes_up_total += bytes_up
+        self._comm_bytes_down_total += bytes_down
+        total = bytes_up + bytes_down
+        payload = {
+            "step": self._sync_every * self._exchange_count,
+            "comm/exchange": self._exchange_count,
+            "comm/seconds": round(seconds, 4),
+            "comm/bytes_up": bytes_up,
+            "comm/bytes_down": bytes_down,
+            "comm/bytes_total": total,
+            # Effective goodput for THIS exchange: payload bytes over the
+            # blocking round trip (a whole-model sync stops training for it).
+            "comm/mbps": round(total * 8 / seconds / 1e6, 2) if seconds > 0 else 0.0,
+            "comm/seconds_cumulative": round(self._comm_seconds_total, 3),
+            "comm/gb_cumulative": round(
+                (self._comm_bytes_up_total + self._comm_bytes_down_total) / 1e9, 4),
+        }
+        if fragment is not None:
+            payload["comm/fragment"] = fragment
+        logger.info("PFMETRICS %s", json.dumps(payload, sort_keys=True))
+
     def _session_roundtrip(
         self,
         flag: float,
@@ -2529,6 +2578,10 @@ class AsyncDiLoCo:
                 headers={"Content-Type": "application/octet-stream"},
                 method="POST",
             )
+            # Times the BLOCKING round trip: upload, server-side outer step, and
+            # the download the worker then adopts. With num_fragments=1 this is
+            # exactly the training stall at a boundary.
+            _comm_t0 = time.monotonic()
             try:
                 with urllib.request.urlopen(
                     request, timeout=self._sync_timeout
@@ -2573,6 +2626,20 @@ class AsyncDiLoCo:
                         )
                     if resp_header.get("dtype") != "delta_int8":
                         self._deltas_since_full = 0
+                    # Downstream bytes from the dtype the server named: the body
+                    # is streamed, so count it from the wire format rather than
+                    # buffering it twice. delta_int8 also carries one fp32 scale
+                    # per parameter.
+                    _dt = resp_header.get("dtype", "float32")
+                    _down = numel * self._WIRE_ITEMSIZE.get(_dt, 4)
+                    if _dt == "delta_int8":
+                        _down += len(self._param_numels) * 4
+                    self._emit_comm_metrics(
+                        time.monotonic() - _comm_t0,
+                        len(payload),
+                        _down + len(json.dumps(resp_header)) + 1,   # + its header line
+                        fragment,
+                    )
                 break
             except urllib.error.HTTPError as exc:
                 if exc.code != 503 or attempt == self._busy_retries:

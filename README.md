@@ -1,11 +1,18 @@
-<div align="center">
+<p align="center">
+</p>
 
-# panofabric-engine
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/418f6c0d-9293-48d0-9fb1-bfac8c73102a" alt="PanocularAI - PanoFabric" width="312">
+</p>
 
-#### A PyTorch-native engine for heterogeneous & decentralized training of large-scale AI models
+---
 
-![panofabric-engine](docs/assets/panofabric-engine.png)
-</div>
+<h3 align="center">
+panofabric-engine: PyTorch-native engine for heterogeneous & decentralized AI training & serving
+</h3>
+
+---
+
 
 ## 🧭 Overview
 

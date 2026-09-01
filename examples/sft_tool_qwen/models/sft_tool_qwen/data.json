@@ -1,0 +1,1191 @@
+[
+  {
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "City name."
+              },
+              "units": {
+                "type": "string",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ],
+                "description": "Temperature unit. Defaults to celsius."
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "web_search",
+          "description": "Search the public web.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "top_k": {
+                "type": "integer",
+                "description": "Results to return, 1-10."
+              }
+            },
+            "required": [
+              "query"
+            ]
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant with tool access. Call a tool only when it is needed to answer."
+      },
+      {
+        "role": "user",
+        "content": "What's the weather in Lisbon right now?"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": {
+                "city": "Lisbon"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "{\"temp_c\": 19, \"conditions\": \"clear\"}"
+      },
+      {
+        "role": "assistant",
+        "content": "It's 19 °C and clear in Lisbon."
+      }
+    ]
+  },
+  {
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "City name."
+              },
+              "units": {
+                "type": "string",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ],
+                "description": "Temperature unit. Defaults to celsius."
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant with tool access. Call a tool only when it is needed to answer."
+      },
+      {
+        "role": "user",
+        "content": "Compare the weather in Oslo and Athens."
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": {
+                "city": "Oslo"
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": {
+                "city": "Athens"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "{\"temp_c\": 3, \"conditions\": \"snow\"}"
+      },
+      {
+        "role": "tool",
+        "content": "{\"temp_c\": 24, \"conditions\": \"sunny\"}"
+      },
+      {
+        "role": "assistant",
+        "content": "Oslo is 3 °C with snow; Athens is 24 °C and sunny — a 21-degree gap."
+      }
+    ]
+  },
+  {
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_stock_price",
+          "description": "Latest trade price for a ticker.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "ticker": {
+                "type": "string"
+              },
+              "currency": {
+                "type": "string",
+                "description": "Quote currency. Defaults to USD."
+              }
+            },
+            "required": [
+              "ticker"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "convert_currency",
+          "description": "Convert an amount between currencies.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "amount": {
+                "type": "number"
+              },
+              "from": {
+                "type": "string"
+              },
+              "to": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "amount",
+              "from",
+              "to"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "web_search",
+          "description": "Search the public web.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "top_k": {
+                "type": "integer",
+                "description": "Results to return, 1-10."
+              }
+            },
+            "required": [
+              "query"
+            ]
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant with tool access. Call a tool only when it is needed to answer."
+      },
+      {
+        "role": "user",
+        "content": "How much is one NVDA share in euros?"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_stock_price",
+              "arguments": {
+                "ticker": "NVDA"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "{\"price\": 178.42, \"currency\": \"USD\"}"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "convert_currency",
+              "arguments": {
+                "amount": 178.42,
+                "from": "USD",
+                "to": "EUR"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "{\"amount\": 164.31, \"currency\": \"EUR\"}"
+      },
+      {
+        "role": "assistant",
+        "content": "One NVDA share is $178.42, about €164.31."
+      }
+    ]
+  },
+  {
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "City name."
+              },
+              "units": {
+                "type": "string",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ],
+                "description": "Temperature unit. Defaults to celsius."
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant with tool access. Call a tool only when it is needed to answer."
+      },
+      {
+        "role": "user",
+        "content": "Weather in Springfield?"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": {
+                "city": "Springfield"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "{\"error\": \"ambiguous_city\", \"candidates\": [\"Springfield, IL\", \"Springfield, MA\"]}"
+      },
+      {
+        "role": "assistant",
+        "content": "Springfield is ambiguous — Illinois or Massachusetts?"
+      },
+      {
+        "role": "user",
+        "content": "Illinois."
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": {
+                "city": "Springfield, IL"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "{\"temp_c\": 11, \"conditions\": \"overcast\"}"
+      },
+      {
+        "role": "assistant",
+        "content": "Springfield, IL is 11 °C and overcast."
+      }
+    ]
+  },
+  {
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "City name."
+              },
+              "units": {
+                "type": "string",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ],
+                "description": "Temperature unit. Defaults to celsius."
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "web_search",
+          "description": "Search the public web.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "top_k": {
+                "type": "integer",
+                "description": "Results to return, 1-10."
+              }
+            },
+            "required": [
+              "query"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "send_email",
+          "description": "Send an email on the user's behalf.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "to": {
+                "type": "string"
+              },
+              "subject": {
+                "type": "string"
+              },
+              "body": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "to",
+              "subject",
+              "body"
+            ]
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant with tool access. Call a tool only when it is needed to answer."
+      },
+      {
+        "role": "user",
+        "content": "Thanks, that's all I needed."
+      },
+      {
+        "role": "assistant",
+        "content": "Happy to help — just say the word if anything else comes up."
+      }
+    ]
+  },
+  {
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "City name."
+              },
+              "units": {
+                "type": "string",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ],
+                "description": "Temperature unit. Defaults to celsius."
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "get_stock_price",
+          "description": "Latest trade price for a ticker.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "ticker": {
+                "type": "string"
+              },
+              "currency": {
+                "type": "string",
+                "description": "Quote currency. Defaults to USD."
+              }
+            },
+            "required": [
+              "ticker"
+            ]
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant with tool access. Call a tool only when it is needed to answer."
+      },
+      {
+        "role": "user",
+        "content": "Book me a table at Nobu for Friday at eight."
+      },
+      {
+        "role": "assistant",
+        "content": "I can't book restaurants — I only have weather and stock-price tools here. I can look up their number if you'd like to call."
+      }
+    ]
+  },
+  {
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "send_email",
+          "description": "Send an email on the user's behalf.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "to": {
+                "type": "string"
+              },
+              "subject": {
+                "type": "string"
+              },
+              "body": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "to",
+              "subject",
+              "body"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "create_calendar_event",
+          "description": "Create an event in the user's calendar.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "start": {
+                "type": "string",
+                "description": "ISO 8601 start time."
+              },
+              "duration_minutes": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "title",
+              "start"
+            ]
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant with tool access. Call a tool only when it is needed to answer."
+      },
+      {
+        "role": "user",
+        "content": "Email Priya about the schedule slip."
+      },
+      {
+        "role": "assistant",
+        "content": "What's Priya's address, and what should the body say?"
+      },
+      {
+        "role": "user",
+        "content": "priya@example.com — tell her the review moves to Thursday."
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "send_email",
+              "arguments": {
+                "to": "priya@example.com",
+                "subject": "Review moved to Thursday",
+                "body": "Hi Priya, the review has moved to Thursday. Sorry for the short notice."
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "{\"status\": \"sent\", \"id\": \"msg_8813\"}"
+      },
+      {
+        "role": "assistant",
+        "content": "Sent — she'll see it as \"Review moved to Thursday\"."
+      }
+    ]
+  },
+  {
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "City name."
+              },
+              "units": {
+                "type": "string",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ],
+                "description": "Temperature unit. Defaults to celsius."
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant with tool access. Call a tool only when it is needed to answer."
+      },
+      {
+        "role": "user",
+        "content": "Give me Phoenix in fahrenheit."
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": {
+                "city": "Phoenix",
+                "units": "fahrenheit"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "{\"temp_f\": 104, \"conditions\": \"clear\"}"
+      },
+      {
+        "role": "assistant",
+        "content": "Phoenix is 104 °F and clear. Stay inside."
+      }
+    ]
+  },
+  {
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "web_search",
+          "description": "Search the public web.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "top_k": {
+                "type": "integer",
+                "description": "Results to return, 1-10."
+              }
+            },
+            "required": [
+              "query"
+            ]
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant with tool access. Call a tool only when it is needed to answer."
+      },
+      {
+        "role": "user",
+        "content": "Any news about the Kepler-452b atmosphere survey?"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "web_search",
+              "arguments": {
+                "query": "Kepler-452b atmosphere survey",
+                "top_k": 5
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "{\"results\": []}"
+      },
+      {
+        "role": "assistant",
+        "content": "Nothing came back for that — I'd rather say so than guess. Want me to try a broader query?"
+      }
+    ]
+  },
+  {
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "City name."
+              },
+              "units": {
+                "type": "string",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ],
+                "description": "Temperature unit. Defaults to celsius."
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "web_search",
+          "description": "Search the public web.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "top_k": {
+                "type": "integer",
+                "description": "Results to return, 1-10."
+              }
+            },
+            "required": [
+              "query"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "send_email",
+          "description": "Send an email on the user's behalf.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "to": {
+                "type": "string"
+              },
+              "subject": {
+                "type": "string"
+              },
+              "body": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "to",
+              "subject",
+              "body"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "create_calendar_event",
+          "description": "Create an event in the user's calendar.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "start": {
+                "type": "string",
+                "description": "ISO 8601 start time."
+              },
+              "duration_minutes": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "title",
+              "start"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "convert_currency",
+          "description": "Convert an amount between currencies.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "amount": {
+                "type": "number"
+              },
+              "from": {
+                "type": "string"
+              },
+              "to": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "amount",
+              "from",
+              "to"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "get_stock_price",
+          "description": "Latest trade price for a ticker.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "ticker": {
+                "type": "string"
+              },
+              "currency": {
+                "type": "string",
+                "description": "Quote currency. Defaults to USD."
+              }
+            },
+            "required": [
+              "ticker"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "translate_text",
+          "description": "Translate text between languages.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "target_lang": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text",
+              "target_lang"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "database_query",
+          "description": "Run a read-only SQL query against the analytics warehouse.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "sql": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "sql"
+            ]
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant with tool access. Call a tool only when it is needed to answer."
+      },
+      {
+        "role": "user",
+        "content": "How do you say 'the deploy is finished' in Japanese?"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "translate_text",
+              "arguments": {
+                "text": "the deploy is finished",
+                "target_lang": "ja"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "{\"translation\": \"\\u30c7\\u30d7\\u30ed\\u30a4\\u304c\\u5b8c\\u4e86\\u3057\\u307e\\u3057\\u305f\"}"
+      },
+      {
+        "role": "assistant",
+        "content": "デプロイが完了しました。"
+      }
+    ]
+  },
+  {
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "create_calendar_event",
+          "description": "Create an event in the user's calendar.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "start": {
+                "type": "string",
+                "description": "ISO 8601 start time."
+              },
+              "duration_minutes": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "title",
+              "start"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "City name."
+              },
+              "units": {
+                "type": "string",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ],
+                "description": "Temperature unit. Defaults to celsius."
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant with tool access. Call a tool only when it is needed to answer."
+      },
+      {
+        "role": "user",
+        "content": "Put a 30-minute standup on my calendar for tomorrow 9am."
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "create_calendar_event",
+              "arguments": {
+                "title": "Standup",
+                "start": "2026-09-02T09:00:00",
+                "duration_minutes": 30
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "{\"status\": \"created\", \"id\": \"evt_4471\"}"
+      },
+      {
+        "role": "assistant",
+        "content": "Standup is on for 9:00 tomorrow, 30 minutes."
+      },
+      {
+        "role": "user",
+        "content": "Will I need a coat? I'm in Berlin."
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": {
+                "city": "Berlin"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "{\"temp_c\": 7, \"conditions\": \"light rain\"}"
+      },
+      {
+        "role": "assistant",
+        "content": "7 °C and light rain in Berlin — take the coat."
+      }
+    ]
+  },
+  {
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "database_query",
+          "description": "Run a read-only SQL query against the analytics warehouse.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "sql": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "sql"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "web_search",
+          "description": "Search the public web.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "top_k": {
+                "type": "integer",
+                "description": "Results to return, 1-10."
+              }
+            },
+            "required": [
+              "query"
+            ]
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant with tool access. Call a tool only when it is needed to answer."
+      },
+      {
+        "role": "user",
+        "content": "How many signups did we get last week?"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "database_query",
+              "arguments": {
+                "sql": "SELECT count(*) AS n FROM signups WHERE created_at >= current_date - 7"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "{\"rows\": [{\"n\": 1284}]}"
+      },
+      {
+        "role": "assistant",
+        "content": "1,284 signups in the last seven days."
+      }
+    ]
+  }
+]

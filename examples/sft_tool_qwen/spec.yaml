@@ -1,0 +1,36 @@
+# Tool-calling SFT of Qwen3-4B, entirely from user code.
+#
+# Submit with:
+#   panofabric run submit spec.yaml --code models/sft_tool_qwen
+#
+# --code packs that dir into a deterministic models/<pkg>/ tar.gz, runs the same
+# trust-boundary checks and uploads it.
+#
+# model.hf_model makes the scheduler fetch that repo's tokenizer AND
+# safetensors into each island's assets dir before launch; the preset
+# fine-tunes from them.
+name: sft-tool-qwen
+workload:
+  kind: pretrain          # SFT is a pretrain-shaped workload: one trainer, CE loss
+  sync_method: local      # single island, no coordination plane (implies ft off)
+model:
+  module: models.sft_tool_qwen
+  preset: sft_tool_qwen_hermes   # or sft_tool_qwen_hermes to stream a hub dataset
+  hf_model: Qwen/Qwen3-4B
+training:
+  steps: 200
+  seq_len: 4096
+# NOTE: do NOT set data.dataset here. The launcher would emit
+# --dataloader.dataset, which ChatDataLoader.Config has no field for, and tyro
+# aborts the run before the first step. data.dataset_path IS accepted, and
+# overrides whatever the preset points at (a local file, a dir, or a hub id).
+islands:
+  - count: 1
+    local_batch_size: 4
+    resources:
+      accelerators: "H100:8"
+      # cloud ("nebius", "aws/us-east-1") or enrolled backend ("ssh/<pool>",
+      # "slurm/<cluster>[/<partition>]", "k8s/<ctx>"). `panofabric backend list`
+      # prints the exact strings; omit the field to let PanoFabric pick.
+      use_spot: true
+      infra: "nebius"

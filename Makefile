@@ -178,7 +178,8 @@ RL_MATH_VERIFY_VERSION ?= 0.9.0
 
 install-rl: export VIRTUAL_ENV := $(abspath $(VENV))
 install-rl:
-	@backend=$$(sh scripts/pf_backend.sh); \
+	@set -e; \
+	backend=$$(sh scripts/pf_backend.sh); \
 	case "$$backend" in \
 		cu130) : ;; \
 		*) echo "[make install-rl] RL runtime is CUDA-only; backend=$$backend" >&2; exit 1;; \
@@ -232,13 +233,15 @@ ensure:
 	     esac;; esac; \
 	export UV_PYTHON_INSTALL_DIR="$$root/uv-python"; \
 	backend=$$(sh scripts/pf_backend.sh); \
+	verify='import torch,torchtitan,torchft'; \
+	case "$${PF_RL:-0}" in 1) verify="$$verify,vllm";; esac; \
 	src=$$(sh scripts/pf_env_fp.sh --source); \
 	[ -n "$$src" ] || { echo "[ensure] no fingerprint; per-run make all"; exec $(MAKE) all; }; \
 	fp=$$(printf '%s:%s:rl%s' "$$src" "$$backend" "$${PF_RL:-0}" | sha256sum | cut -c1-16); \
 	env="$$root/env-$$fp"; \
 	restore() { rm -rf .venv; ln -s "$$env/.venv" .venv; \
 	            mkdir -p "$(LOCAL_BIN)"; [ -x "$$env/uv" ] && ln -sf "$$env/uv" "$(LOCAL_BIN)/uv" || true; }; \
-	if [ -f "$$env/.stamp" ] && "$$env/.venv/bin/python" -c 'import torch,torchtitan,torchft' 2>/dev/null; then \
+	if [ -f "$$env/.stamp" ] && "$$env/.venv/bin/python" -c "$$verify" 2>/dev/null; then \
 	  echo "[ensure] HIT $$fp backend=$$backend"; restore; exit 0; fi; \
 	stale=""; [ -e "$$env" ] && { stale=1; echo "[ensure] existing $$fp is unusable; rebuilding"; }; \
 	tmp="$$root/.build.$$fp.$$$$.$$(hostname)"; rm -rf "$$tmp"; mkdir -p "$$tmp"; \
@@ -246,7 +249,7 @@ ensure:
 	$(MAKE) build-into VENV="$$tmp/.venv"; \
 	cp -f "$(UV)" "$$tmp/uv" 2>/dev/null || true; \
 	"$(UV)" pip freeze --python "$$tmp/.venv/bin/python" > "$$tmp/freeze.txt" 2>/dev/null || true; \
-	"$$tmp/.venv/bin/python" -c 'import torch,torchtitan,torchft'; \
+	"$$tmp/.venv/bin/python" -c "$$verify"; \
 	printf '%s\n%s\n%s\n' "$$fp" "$$backend" "$$(date -u +%FT%TZ)" > "$$tmp/.stamp"; \
 	if [ -n "$$stale" ]; then mv -T "$$env" "$$env.stale.$$$$" 2>/dev/null || rm -rf "$$env"; fi; \
 	if mv -T "$$tmp" "$$env" 2>/dev/null; then echo "[ensure] published $$fp"; \

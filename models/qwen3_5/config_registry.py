@@ -92,10 +92,12 @@ def qwen35_9b() -> FaultTolerantTrainer.Config:
     """Qwen3.5-9B (dense decoder + vision tower) on text.
 
     Parallelism and activation checkpointing mirror torchtitan's own
-    ``qwen35_9b``: TP=2 with full AC. To fine-tune from published weights,
-    point ``hf_assets_path`` at a directory holding the repo's safetensors --
-    the control plane only auto-fetches weights for LoRA / HF-backend / RL /
-    overlay runs, not for a native module like this one.
+    ``qwen35_9b``: TP=2 with full AC.
+
+    Trains from scratch as written. To fine-tune from published weights, set
+    ``model.init_from`` on the run spec (e.g. ``Qwen/Qwen3.5-9B``): the control
+    plane fetches that repo's safetensors and emits the ``--checkpoint`` flags
+    that load them, so this one preset serves both.
     """
     model_spec = model_registry("9B")
     return FaultTolerantTrainer.Config(

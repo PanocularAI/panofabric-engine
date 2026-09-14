@@ -52,3 +52,50 @@ def test_preset_is_text_only_and_fault_tolerant():
     assert "Text" in type(cfg.dataloader).__qualname__, type(cfg.dataloader).__qualname__
     assert cfg.model_spec.fragment_fn is not None
     assert cfg.model_spec.state_dict_adapter is not None
+
+
+# --------------------------------------------------------------------------- #
+# Partial-load guard. The base adapter drops unrecognised checkpoint keys with a
+# bare `continue`, so a mapping gap leaves parameters at random init and the run
+# still looks healthy. VerifyingQwen35StateDictAdapter turns that into an error.
+# --------------------------------------------------------------------------- #
+def _adapter_and_roundtrip():
+    """A debugmodel adapter plus an HF state dict that should load completely."""
+    from models.qwen3_5 import VerifyingQwen35StateDictAdapter
+    from models.qwen3_5.config_registry import qwen35_debugmodel
+
+    config = qwen35_debugmodel().model_spec.model
+    adapter = VerifyingQwen35StateDictAdapter(config, hf_assets_path=None)
+    with torch.device("meta"):
+        model = config.build()
+    # to_hf gives us exactly the checkpoint this model would produce, which is
+    # the checkpoint it must be able to read back.
+    hf = adapter.to_hf({n: p for n, p in model.state_dict().items()})
+    return adapter, hf
+
+
+def test_complete_checkpoint_loads_without_complaint():
+    adapter, hf = _adapter_and_roundtrip()
+    out = adapter.from_hf(dict(hf))
+    assert out, "round-trip produced nothing"
+
+
+def test_dropped_decoder_weight_is_caught():
+    """Simulate the mapping gap: drop a GatedDeltaNet tensor the model needs.
+
+    A linear_attn weight is the apt victim -- those hybrid layers are exactly
+    what the lookup table is most likely to miss on a checkpoint revision."""
+    adapter, hf = _adapter_and_roundtrip()
+    victim = next(k for k in hf if "linear_attn.out_proj" in k)
+    broken = {k: v for k, v in hf.items() if k != victim}
+    with pytest.raises(ValueError, match="would train from random init"):
+        adapter.from_hf(broken)
+
+
+def test_missing_vision_weights_only_warn(caplog):
+    """Our presets feed text, so an absent vision tower must not block the run."""
+    adapter, hf = _adapter_and_roundtrip()
+    text_only = {k: v for k, v in hf.items() if ".visual." not in k}
+    with caplog.at_level("WARNING"):
+        adapter.from_hf(text_only)          # must not raise
+    assert "vision-tower" in caplog.text

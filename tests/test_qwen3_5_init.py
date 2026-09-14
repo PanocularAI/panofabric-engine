@@ -93,9 +93,45 @@ def test_dropped_decoder_weight_is_caught():
 
 
 def test_missing_vision_weights_only_warn(caplog):
-    """Our presets feed text, so an absent vision tower must not block the run."""
-    adapter, hf = _adapter_and_roundtrip()
-    text_only = {k: v for k, v in hf.items() if ".visual." not in k}
+    """On a MULTIMODAL build, an absent tower warns rather than raises.
+
+    Needs text_only=False explicitly: the presets are text-only now, so the
+    default config has no tower and there would be nothing to report. In a real
+    run DCP raises before this branch is reached (it plans from the model's
+    params and finds the checkpoint short); this keeps the backstop honest.
+    """
+    from models.qwen3_5 import VerifyingQwen35StateDictAdapter, model_registry
+
+    config = model_registry("debugmodel", text_only=False).model
+    adapter = VerifyingQwen35StateDictAdapter(config, hf_assets_path=None)
+    with torch.device("meta"):
+        model = config.build()
+    hf = adapter.to_hf(dict(model.state_dict()))
+    stripped = {k: v for k, v in hf.items() if ".visual." not in k}
     with caplog.at_level("WARNING"):
-        adapter.from_hf(text_only)          # must not raise
+        adapter.from_hf(stripped)           # must not raise
     assert "vision-tower" in caplog.text
+
+
+def test_text_only_drops_the_vision_tower_by_default():
+    """A text workload should not carry the tower: it is ~0.45B of the 9B in
+    params and optimizer state, and bytes on the wire at every HeLoCo boundary,
+    for a module that never sees an image."""
+    from models.qwen3_5 import model_registry
+
+    spec = model_registry("debugmodel")
+    with torch.device("meta"):
+        model = spec.model.build()
+    names = [n for n, _ in model.named_parameters()]
+    assert not any(n.startswith("vision_encoder.") for n in names)
+    assert model.vision_encoder is None
+
+
+def test_text_only_false_keeps_it_for_multimodal():
+    from models.qwen3_5 import model_registry
+
+    spec = model_registry("debugmodel", text_only=False)
+    with torch.device("meta"):
+        model = spec.model.build()
+    assert model.vision_encoder is not None
+    assert any(n.startswith("vision_encoder.") for n, _ in model.named_parameters())

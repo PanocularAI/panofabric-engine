@@ -20,6 +20,7 @@ torchtitan imports it at module scope for the GatedDeltaNet kernels but declares
 it only in a VLM-CI requirements file that nothing installs.
 """
 
+import dataclasses
 import logging
 
 import torch
@@ -121,6 +122,8 @@ def model_registry(
     flavor: str,
     attn_backend: str = "flex",
     moe_comm_backend: str | None = None,
+    *,
+    text_only: bool = True,
 ) -> FaultTolerantModelSpec:
     """A Qwen3.5 flavor as a fault-tolerant spec (adds ``fragment_fn``).
 
@@ -130,16 +133,27 @@ def model_registry(
     FT wrapper and ``fragment_llm``, which is what lets HeLoCo/DiLoCo fragment
     the decoder for cross-site sync.
 
-    Every Qwen3.5 flavor carries a vision encoder (it is part of the published
-    checkpoint), but the decoder's forward takes ``pixel_values=None`` and falls
-    back to plain ``positions`` when no MRoPE positions arrive, so a text-only
-    dataloader trains the decoder correctly. The vision tower is then dead
-    weight: ~0.4B of the 9B, which also syncs on every HeLoCo boundary.
+    ``text_only`` (the default) drops the vision tower. Every published Qwen3.5
+    flavor carries one, and for a text workload it is pure cost: ~0.4B of the 9B
+    in parameters and optimizer state, and bytes on the wire at every HeLoCo
+    boundary, for a tower that never sees an image. Dropping it also avoids a
+    hard blocker -- ``apply_fsdp_to_vision_encoder`` cannot shard the tower on
+    this stack ("When dp_mesh_dims is provided, all parameters must be DTensors
+    on the full SPMD mesh"), which makes ANY multi-GPU Qwen3.5 run fail while
+    the tower is attached.
+
+    The checkpoint's 57 vision tensors are then simply unused: the loader plans
+    from the model's own parameters, so it never asks for them.
+
+    Pass ``text_only=False`` for a multimodal run, which also needs the
+    multimodal dataloader and tokenizer (see config_registry).
     """
     kwargs = dict(attn_backend=attn_backend)
     if moe_comm_backend is not None:
         kwargs["moe_comm_backend"] = moe_comm_backend
     config = qwen3_5_configs[flavor](**kwargs)
+    if text_only:
+        config = dataclasses.replace(config, vision_encoder=None)
     return FaultTolerantModelSpec(
         name="ft/qwen3_5",
         flavor=flavor,

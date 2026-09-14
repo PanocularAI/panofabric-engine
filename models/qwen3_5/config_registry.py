@@ -65,6 +65,11 @@ def qwen35_debugmodel() -> FaultTolerantTrainer.Config:
             seq_len=1024,
             max_norm=1.0,
             steps=10,
+            # Required, not a preference: GatedDeltaNet consumes per-batch
+            # document offsets (cu_seqlens), so the forward's auxiliary inputs
+            # change shape from step to step and graph capture aborts with
+            # "CUDA graph auxiliary input structure must remain constant".
+            disable_cuda_graphs=True,
         ),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
         parallelism=ParallelismConfig(
@@ -126,6 +131,7 @@ def qwen35_9b() -> FaultTolerantTrainer.Config:
             seq_len=4096,
             max_norm=1.0,
             steps=1000,
+            disable_cuda_graphs=True,   # see qwen35_debugmodel
         ),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
         parallelism=ParallelismConfig(

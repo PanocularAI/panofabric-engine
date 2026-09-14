@@ -56,9 +56,20 @@ class VerifyingQwen35StateDictAdapter(Qwen35StateDictAdapter):
     actually received a tensor.
 
     Decoder parameters raise: a fine-tune that silently starts part of the
-    network from noise is not worth running. Vision-tower parameters only warn
-    -- our presets feed text, so the tower is unused, and a text-only Qwen3.5
-    checkpoint legitimately carries no vision weights.
+    network from noise is not worth running.
+
+    This is NOT redundant with DCP's own "Missing key in checkpoint state_dict"
+    check, which fires when the checkpoint lacks a tensor the mapping knows to
+    ask for. The gap this closes is the symmetric one: a key missing from
+    `from_hf_map` is never asked for either, so DCP is satisfied and `from_hf`
+    drops it -- the parameter keeps its init value and nothing says a word.
+
+    Vision-tower parameters only warn rather than raise, since our presets feed
+    text and the tower is then unused. In practice DCP raises first for a
+    checkpoint with no vision weights at all (observed:
+    "Missing key in checkpoint state_dict: model.visual.blocks.0.attn.proj.bias"),
+    so this branch is a backstop, not the thing that makes a vision-free
+    checkpoint work. The published Qwen3.5 checkpoints all ship the tower.
     """
 
     def __init__(self, model_config, hf_assets_path):

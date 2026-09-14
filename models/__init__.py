@@ -23,5 +23,5 @@ there imports a recipe.
 #: tenant code overlay from shadowing a built-in (spec/runspec.py's
 #: _ENGINE_BUILTIN_PKGS mirrors it).
 _supported_models = frozenset(
-    ["llama3", "gpt_oss", "qwen3", "resnet", "hf_transformers", "lora"]
+    ["llama3", "gpt_oss", "qwen3", "qwen3_5", "resnet", "hf_transformers", "lora"]
 )

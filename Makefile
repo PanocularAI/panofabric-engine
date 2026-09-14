@@ -149,6 +149,13 @@ install-torchtt-ft: forks
 	# that recipe fails to import on a node without this line. Unpinned deliberately
 	# (the backend's own 4.57 pin predates the 5.x we run locally, matched to vLLM).
 	$(UV_PIP_CMD) transformers
+	# flash-linear-attention: the same gap for Qwen3.5. torchtitan's native
+	# models/qwen3_5 imports `fla` at MODULE scope for the GatedDeltaNet kernels but
+	# declares it only in .ci/docker/requirements-vlm.txt, which the requirements.txt
+	# line above does not pull. Without it `--module models.qwen3_5` cannot import,
+	# which is what pushed a customer onto the HF backend (where a hybrid model
+	# silently NaNs instead of failing loudly).
+	$(UV_PIP_CMD) flash-linear-attention
 
 # ------------------------------------------------- RL runtime (PF_RL=1)
 # The decentralized-RL engine needs a stack the training-only env does NOT: vLLM (the

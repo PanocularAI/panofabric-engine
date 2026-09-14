@@ -51,6 +51,14 @@ train = [
   # import on an otherwise-complete node. Unpinned deliberately: the backend's
   # own 4.57 pin predates the 5.x we run, matched to vLLM.
   "transformers",
+  # Same story as transformers above: models.qwen3_5 (and torchtitan's native
+  # models/qwen3_5, which imports it at MODULE scope for the GatedDeltaNet
+  # kernels) needs it, but torchtitan declares it only in
+  # .ci/docker/requirements-vlm.txt — a CI-only file nothing installs. Without
+  # this line Qwen3.5 fails to import on an otherwise-complete node, which is
+  # what pushed a customer onto the HF backend, where a hybrid model silently
+  # NaNs instead. Unpinned to track the kernels against the torch we run.
+  "flash-linear-attention",
 ]
 
 # The serving plane. torch and vllm are DELIBERATELY NOT DECLARED: every runtime

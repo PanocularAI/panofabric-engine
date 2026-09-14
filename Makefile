@@ -14,7 +14,7 @@ TORCHTITAN_DIR ?= $(FORKS_DIR)/torchtitan
 TORCHFT_DIR    ?= $(FORKS_DIR)/torchft
 TORCHTITAN_URL ?= https://github.com/PanocularAI/torchtitan.git
 TORCHFT_URL    ?= https://github.com/PanocularAI/torchft.git
-TORCHTITAN_REF ?= 1ec4992a207dc317433ed3f014caf782b2a3dd98
+TORCHTITAN_REF ?= 057eb4c77e8e0c8683fd85402c13cddecdf4d494
 TORCHFT_REF    ?= edad86ca1c8a95195961e555cf0ab3982bb860f7
 
 TORCH_SPEC ?= torch

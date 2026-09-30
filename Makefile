@@ -167,6 +167,9 @@ install-torchtt-ft: forks
 #     it is installed --no-deps from a pinned source tarball with its real deps by hand.
 #   - flash-attn-3 comes from the pytorch TEST index, not nightly. The RL trainer imports
 #     flash_attn_interface on Hopper+; pre-Hopper (e.g. L40S/Ada) falls back to FA2.
+#   - nvidia-cuda-nvcc: vLLM's default FlashInfer sampler JIT-compiles with nvcc at
+#     startup, and neither a runtime-only image nor every host has a toolkit that
+#     matches torch's CUDA (torchtitan's own RL CI installs it for the same reason).
 #   - math-verify is the dapo_math example rubric's dep; cheap and pure-python, so it
 #     rides here rather than needing model.requirements (whose file is not packaged).
 #   - renderers is pinned EXACTLY by torchtitan itself (==0.1.11 at a182e530).
@@ -202,7 +205,7 @@ install-rl:
 	  --extra-index-url "$$index_url" --index-strategy unsafe-best-match; \
 	$(UV_PIP_CMD) "torchmonarch==$(RL_TORCHMONARCH_VERSION)" \
 	  "renderers==$(RL_RENDERERS_VERSION)" pygtrie portpicker \
-	  opentelemetry-sdk opentelemetry-exporter-otlp-proto-http \
+	  opentelemetry-sdk opentelemetry-exporter-otlp-proto-http nvidia-cuda-nvcc \
 	  "math-verify==$(RL_MATH_VERIFY_VERSION)"; \
 	$(UV_PIP_CMD) --no-deps \
 	  "torchstore @ https://github.com/meta-pytorch/torchstore/archive/$(RL_TORCHSTORE_SHA).tar.gz"; \

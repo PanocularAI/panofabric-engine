@@ -147,13 +147,30 @@ def spawn_gpu_procs(num_gpus: int, env: dict[str, str], *, bootstrap=_preimport_
 
 
 def _ensure_cuda_toolchain() -> None:
-    """Point the CUDA toolchain at a >=12 toolkit before spawning actors.
+    """Point CUDA_HOME at an nvcc matching torch's CUDA before spawning actors.
 
-    vLLM's FlashInfer kernels JIT-compile with nvcc; the box's default
-    /usr/bin/nvcc may be <12. Set CUDA_HOME/PATH so the Monarch-spawned
-    generator subprocess inherits a working nvcc.
+    vLLM's FlashInfer sampler JIT-compiles with nvcc, found through CUDA_HOME and
+    then PATH, so the Monarch-spawned generator subprocess inherits whatever is
+    set here. A system /usr/bin/nvcc may be too old, or another CUDA major than
+    the one torch was built for (a cu130 torch cannot use a CUDA 12 toolkit), so
+    prefer: an explicit CUDA_HOME, then the newest /usr/local/cuda-<major>*, then
+    the pip-installed nvcc (nvidia-cuda-nvcc, how the runtime-only image gets one).
     """
-    for home in ("/usr/local/cuda-12.8", "/usr/local/cuda-12.3", "/usr/local/cuda-12"):
+    import glob
+
+    import torch
+
+    major = (torch.version.cuda or "").split(".")[0]
+    candidates = [os.environ["CUDA_HOME"]] if os.environ.get("CUDA_HOME") else []
+    candidates += sorted(glob.glob(f"/usr/local/cuda-{major}*"), reverse=True)
+    try:
+        import nvidia
+
+        for root in nvidia.__path__:
+            candidates += [os.path.join(root, f"cu{major}"), os.path.join(root, "cuda_nvcc")]
+    except ImportError:
+        pass
+    for home in candidates:
         if os.path.isfile(os.path.join(home, "bin", "nvcc")):
             os.environ["CUDA_HOME"] = home
             os.environ["PATH"] = (
@@ -161,7 +178,10 @@ def _ensure_cuda_toolchain() -> None:
             )
             logger.info("CUDA toolchain set to %s", home)
             return
-    logger.warning("no CUDA >=12 toolkit found; FlashInfer JIT may fail")
+    logger.warning(
+        "no CUDA %s toolkit (nvcc) found; FlashInfer JIT will fail -- install "
+        "nvidia-cuda-nvcc or set CUDA_HOME", major,
+    )
 
 
 async def main() -> None:

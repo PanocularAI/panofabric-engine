@@ -14,9 +14,13 @@ from pathlib import Path
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE / "models"))
 
+import grain.python as grain  # noqa: E402
+import numpy as np  # noqa: E402
+from torchtitan.components.data import DatasetBuildContext  # noqa: E402
+
 from sft_tool_qwen.tool_chat import (  # noqa: E402
     IGNORE_INDEX,
-    ToolChatDataset,
+    ToolChatProcessor,
     assistant_header_ids,
     conversation_processor,
     load_conversations,
@@ -82,18 +86,20 @@ def main() -> None:
         raise AssertionError("a sample with no assistant turn must raise")
 
     # --- end to end over the packaged data -----------------------------------
-    ds = ToolChatDataset(
-        dataset=load_conversations(str(DATA)),
-        tokenizer=tk,
-        sample_processor=conversation_processor,
-        seq_len=4096,
+    process = ToolChatProcessor.Config(messages_fn=conversation_processor).build(
+        context=DatasetBuildContext(
+            tokenizer=tk,
+            max_context_length=4096,
+            num_tokens_per_microbatch=4 * 4096,
+            read_options=grain.ReadOptions(),
+        )
     )
     rows = list(load_conversations(str(DATA)))
     total_spans = total_trained = total_tokens = 0
     for i, row in enumerate(rows):
-        result = ds._tokenize_sample(row)
-        assert result is not None, f"row {i} was dropped -- raise seq_len"
-        inputs, labels = result
+        result = process(row, np.random.default_rng(0))
+        assert result is not None, f"row {i} was dropped -- raise max_context_length"
+        inputs, labels = result.input_ids.tolist(), result.labels.tolist()
         assert len(inputs) == len(labels)
 
         payload = conversation_processor(row)

@@ -328,8 +328,8 @@ def test_train_end_to_end_pure_learner_on_fakes(caplog):
 
         r.trainer = SimpleNamespace(
             sync_log_step=_ep(lambda step: _areturn(None)),
-            forward_backward=_ep(lambda mb, n: _areturn({"loss": 0.25})),
-            optim_step=_ep(
+            forward_backward_steps=_ep(lambda mbs, n: _areturn({"loss/mean": 0.25})),
+            optimizer_step=_ep(
                 lambda: _areturn(SimpleNamespace(policy_version=next(versions)))
             ),
             get_full_state_dict_cpu=_ep(get_full),
@@ -347,10 +347,13 @@ def test_train_end_to_end_pure_learner_on_fakes(caplog):
             build_from_group=lambda *, rollout_group: rollout_group
         )
         r._batcher = SimpleNamespace(
-            add_training_samples=lambda *, training_sample_group: SimpleNamespace(
-                microbatches=["mb"],
-                num_global_valid_tokens=4,
-                min_policy_versions=[0],
+            add_training_samples=lambda *, training_sample_group: (
+                SimpleNamespace(
+                    microbatches=["mb"],
+                    num_global_valid_tokens=4,
+                    min_policy_versions=[0],
+                ),
+                True,
             )
         )
 
@@ -371,8 +374,8 @@ def test_train_end_to_end_pure_learner_on_fakes(caplog):
         # The pure-learner path tracks per-window rollout accounting and
         # ships it on the PFMETRICS line (trainable yield -- see
         # _collect_and_build). 2 windows x 2 steps x 1 group per packed
-        # batch = 2 consumed per window; the passthrough builder fake has
-        # no .training_samples, so every group also counts untrainable.
+        # batch = 2 consumed per window; the fake batcher reports every
+        # group trainable, so none is counted as dropped.
         pf_lines = [rec.getMessage() for rec in caplog.records
                     if rec.getMessage().startswith("PFMETRICS ")]
         assert len(pf_lines) == 2
@@ -380,7 +383,7 @@ def test_train_end_to_end_pure_learner_on_fakes(caplog):
             payload = json.loads(line.removeprefix("PFMETRICS "))
             assert payload["groups_consumed"] == 2
             assert payload["dropped_stale"] == 0
-            assert payload["dropped_zero_std"] == 2
+            assert payload["dropped_zero_std"] == 0
         # read-and-reset: nothing carries over past the last window
         assert r._window_yield_snapshot() is None
 

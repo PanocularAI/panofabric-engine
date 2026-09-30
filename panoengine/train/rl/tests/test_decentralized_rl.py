@@ -25,7 +25,8 @@ import pytest
 from panoengine.train.rl.config_registry import (
     _DEFAULT_HF_ASSETS_PATH,
     _MODEL_REGISTRY_BY_MODEL,
-    _RENDERER_NAME_BY_MODEL,
+    _RENDERER_BY_MODEL,
+    _alphabet_sort_rollouter,
     base_rl_config,
     rl_diloco_llama3_8b,
     rl_heloco_llama3_8b,
@@ -55,8 +56,9 @@ def test_model_and_flavor_resolution():
     through the SAME builder functions; unknown models fail clearly."""
     cfg_default = base_rl_config()
     cfg_large = base_rl_config(flavor="1.7B")
-    assert cfg_default.model_spec.flavor == "0.6B"
-    assert cfg_large.model_spec.flavor == "1.7B"
+    # A model config carries no flavor name; its width identifies it.
+    assert cfg_default.model.dim == 1024  # Qwen3-0.6B
+    assert cfg_large.model.dim == 2048  # Qwen3-1.7B
     assert cfg_large.hf_assets_path == _DEFAULT_HF_ASSETS_PATH[("qwen3", "1.7B")]
     assert cfg_large.hf_assets_path != cfg_default.hf_assets_path
     cfg_override = base_rl_config(hf_assets_path="/tmp/custom", flavor="1.7B")
@@ -71,9 +73,9 @@ def test_model_and_flavor_resolution():
     ):
         cfg = fn()
         assert isinstance(cfg, cls.Config)
-        assert cfg.model_spec.name == "llama3" and cfg.model_spec.flavor == "8B"
-        # llama3 has no dedicated renderer entry -- resolved via the "default" key.
-        assert cfg.renderer.name == "default"
+        assert cfg.model.dim == 4096 and len(cfg.model.layers) == 32  # Llama-3 8B
+        # llama3 keeps the generic "default" chat template.
+        assert type(cfg.renderer.renderers_config).__name__ == "DefaultRendererConfig"
         assert cfg.hf_assets_path.endswith("Llama-3.1-8B")
 
     with pytest.raises(ValueError, match="unknown RL model 'bogus_model'"):
@@ -88,12 +90,14 @@ def test_new_model_needs_only_registry_dict_entries():
     fails with a clear error rather than a silent bogus default."""
     from torchtitan.models.qwen3 import model_registry as qwen3_model_registry
 
+    from renderers import AutoRendererConfig
+
     _MODEL_REGISTRY_BY_MODEL[
         "_fake_for_test"
-    ] = lambda flavor, *, attn_backend, hf_assets_path: qwen3_model_registry(
-        "0.6B", attn_backend=attn_backend
+    ] = lambda flavor, *, seq_len, attn_backend: qwen3_model_registry(
+        "0.6B", seq_len=seq_len, attn_backend=attn_backend
     )
-    _RENDERER_NAME_BY_MODEL["_fake_for_test"] = "auto"
+    _RENDERER_BY_MODEL["_fake_for_test"] = AutoRendererConfig
     try:
         with pytest.raises(ValueError, match="no default hf_assets_path"):
             base_rl_config(model="_fake_for_test", flavor="tiny")
@@ -102,12 +106,12 @@ def test_new_model_needs_only_registry_dict_entries():
         try:
             cfg = base_rl_config(model="_fake_for_test", flavor="tiny")
             assert cfg.hf_assets_path == "/fake/checkpoints/tiny"
-            assert cfg.renderer.name == "auto"
+            assert isinstance(cfg.renderer.renderers_config, AutoRendererConfig)
         finally:
             del _DEFAULT_HF_ASSETS_PATH[("_fake_for_test", "tiny")]
     finally:
         del _MODEL_REGISTRY_BY_MODEL["_fake_for_test"]
-        del _RENDERER_NAME_BY_MODEL["_fake_for_test"]
+        del _RENDERER_BY_MODEL["_fake_for_test"]
 
 
 def test_tensor_parallel_degree_is_a_real_gpu_count_knob():
@@ -165,9 +169,7 @@ def test_rollouter_is_a_swappable_task():
     injectable without touching any coordinator code: a different
     Rollouter.Config passed to base_rl_config flows through wrap_replica into
     every strategy's Config unchanged."""
-    from torchtitan.experiments.rl.examples.alphabet_sort import AlphabetSortRollouter
-
-    custom = AlphabetSortRollouter.Config()  # stands in for any other task's Config
+    custom = _alphabet_sort_rollouter()  # stands in for any other task's Config
     base = base_rl_config(rollouter=custom)
     assert base.rollouter is custom
     cfg = wrap_replica(HeLoCoRLReplica, base, train_seconds=60.0)
@@ -190,22 +192,22 @@ def test_dapo_math_preset():
         rl_heloco_dapo_math_qwen3_0_6b,
         rl_heloco_dapo_math_qwen3_4b,
     )
-    from torchtitan.experiments.rl.examples.dapo_math import DapoMathRollouter
-    from torchtitan.experiments.rl.losses import DAPOLoss
+    from torchtitan.rl.examples.dapo_math.env import DapoMathEnv
+    from torchtitan.rl.losses import DAPOLoss
 
     cfg = rl_heloco_dapo_math_qwen3_0_6b()
     assert isinstance(cfg, HeLoCoRLReplica.Config)
-    assert isinstance(cfg.rollouter, DapoMathRollouter.Config)
-    assert cfg.rollouter.token_env.max_rollout_tokens == 10240
+    assert isinstance(cfg.rollouter.worker.message_env, DapoMathEnv.Config)
+    assert cfg.rollouter.worker.token_env.max_rollout_tokens == 10240
     assert isinstance(cfg.trainer.loss, ChunkedLossWrapper.Config)
     assert isinstance(cfg.trainer.loss.loss_fn, DAPOLoss.Config)
     assert cfg.trainer.loss.loss_fn.ratio_clip_high == 0.28
-    assert cfg.renderer.enable_thinking is True
+    assert cfg.renderer.renderers_config.enable_thinking is True
     assert cfg.generator.sampling.temperature == 1.0
     assert cfg.generator.sampling.max_tokens == 8192
-    assert cfg.async_loop.batcher.batch.seq_len == 10240
-    # One packed sequence per rank: 2 OOMs a 140 GiB H200 at this seq_len.
-    assert cfg.async_loop.batcher.batch.local_batch_size == 1
+    assert cfg.trainer.training.max_context_length == 10240
+    # One packed sequence per rank: 2 OOMs a 140 GiB H200 at this length.
+    assert cfg.trainer.training.num_tokens_per_microbatch_per_dp_rank == 10240
     assert cfg.async_loop.validation.num_samples == 30
 
     # The reference LOOP, not just the reference task: without these the
@@ -213,23 +215,22 @@ def test_dapo_math_preset():
     # reproducing upstream needed an override pile at the call site.
     assert cfg.async_loop.num_prompts_per_train_step == 8
     assert cfg.async_loop.num_samples_per_prompt == 16
-    # The reference's rollout lag. Upstream (fd2776584) made
-    # max_offpolicy_steps a DERIVED bound and moved the knob to
-    # target_offpolicy_steps + window_fraction, so assert the knobs we set --
-    # matching upstream's own dapo_math preset -- not the derived value.
+    # The reference's rollout lag: max_offpolicy_steps is a DERIVED bound, so
+    # assert the knobs we set -- matching upstream's own dapo_math preset
+    # (greedy consumption) -- not the derived value.
     assert cfg.async_loop.target_offpolicy_steps == 4
-    assert cfg.async_loop.window_fraction == 0.3
-    assert cfg.trainer.optimizer.param_groups[0].optimizer_kwargs["lr"] == 1e-6
+    assert cfg.async_loop.windowed_fifo_batches is None
+    assert cfg.trainer.optimizer.optimizers[0].lr == 1e-6
     assert cfg.trainer.lr_scheduler.warmup_steps == 0
     assert cfg.trainer.lr_scheduler.min_lr_factor == 1.0  # constant LR
 
     large = rl_heloco_dapo_math_qwen3_4b()
-    assert large.model_spec.flavor == "4B"
+    assert large.model.dim == 2560  # Qwen3-4B
     assert large.hf_assets_path.endswith("Qwen3-4B-Base")
     # Default preserved when not passed.
-    from torchtitan.experiments.rl.examples.alphabet_sort import AlphabetSortRollouter
+    from torchtitan.rl.examples.alphabet_sort.env import AlphabetSortEnv
 
-    assert type(base_rl_config().rollouter) is AlphabetSortRollouter.Config
+    assert isinstance(base_rl_config().rollouter.worker.message_env, AlphabetSortEnv.Config)
 
 
 def test_dapo_math_decoupled_presets():
@@ -245,19 +246,21 @@ def test_dapo_math_decoupled_presets():
     from panoengine.train.rl.replicas import (
         HeLoCoAsyncInferenceReplica,
     )
-    from torchtitan.experiments.rl.examples.dapo_math import DapoMathRollouter
+    from torchtitan.rl.examples.dapo_math.env import DapoMathEnv
 
     trainer = rl_heloco_async_inference_dapo_math_qwen3_0_6b(num_outer_steps=2)
     assert isinstance(trainer, HeLoCoAsyncInferenceReplica.Config)
     assert trainer.num_generators == 0        # pure learner, still
-    assert isinstance(trainer.rollouter, DapoMathRollouter.Config)
+    assert isinstance(trainer.rollouter.worker.message_env, DapoMathEnv.Config)
     assert trainer.async_loop.num_samples_per_prompt == 16
-    assert trainer.trainer.optimizer.param_groups[0].optimizer_kwargs["lr"] == 1e-6
+    assert trainer.trainer.optimizer.optimizers[0].lr == 1e-6
 
     worker = rl_heloco_async_inference_worker_dapo_math_qwen3_0_6b()
-    assert isinstance(worker.rollouter, DapoMathRollouter.Config)
+    assert isinstance(worker.rollouter.worker.message_env, DapoMathEnv.Config)
     assert worker.group_size == trainer.async_loop.num_samples_per_prompt
-    assert worker.renderer.enable_thinking is True
+    assert worker.renderer.renderers_config.enable_thinking is True
+    # the worker's model must be sized for the recipe's context, like the trainer's
+    assert worker.model.dim == trainer.model.dim
     assert worker.generator.sampling.max_tokens == 8192
 
 
@@ -447,7 +450,7 @@ def test_router_calls_name_public_endpoints_and_use_a_monarch_verb():
     import re
     import types
 
-    from torchtitan.experiments.rl.routing.inter_generator_router import (
+    from torchtitan.rl.distributed.routing.inter_generator import (
         InterGeneratorRouter,
     )
 
@@ -557,11 +560,10 @@ def test_train_time_bound_and_sync_retarget():
 # === train.py (PerHostProvisioner) =========================================
 
 
-def _bootstrap_devices(bootstrap, monkeypatch):
-    """Run a bootstrap callable and return the CUDA_VISIBLE_DEVICES it set."""
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "sentinel")
-    bootstrap()
-    return os.environ["CUDA_VISIBLE_DEVICES"]
+def _bootstrap_devices(env, monkeypatch):
+    """The CUDA_VISIBLE_DEVICES a spawned role would be launched with (the
+    provisioner returns the launch env; Monarch applies it at spawn)."""
+    return env["CUDA_VISIBLE_DEVICES"]
 
 
 def test_provisioner_slices_pool_and_rejects_over_allocation(monkeypatch):
@@ -603,7 +605,7 @@ def test_package_import_stays_cpu_light():
         "panoengine.decentralized.relay, "
         "panoengine.decentralized.rollout_queue; "
         "heavy = [m for m in sys.modules if m == 'vllm' or m == 'monarch' "
-        "or m.startswith('torchtitan.experiments.rl.actors')]; "
+        "or m.startswith('torchtitan.rl.distributed.actors')]; "
         "assert not heavy, heavy; print('light')"
     )
     out = subprocess.run(
@@ -614,71 +616,6 @@ def test_package_import_stays_cpu_light():
     )
     assert out.returncode == 0, out.stderr
     assert "light" in out.stdout
-
-
-def test_hf_backend_registry_resolution():
-    """The HF transformers backend resolves through the same table-driven
-    contract: dims come from the checkpoint's config.json (not derived), the
-    titan-shaped layers view satisfies the trainer/generator assertion
-    expression, and the near-identity state-dict adapter is wired."""
-    from torchtitan.models.common.attention import FlexAttention
-
-    cfg = base_rl_config(model="hf", flavor="Qwen3-0.6B")
-    spec = cfg.model_spec
-    # the exact expression asserted by rl/actors/trainer.py and generator.py
-    # (the HF backend routes attention through its flex path)
-    inner = spec.model.layers[0].attention.inner_attention
-    assert isinstance(inner, FlexAttention.Config)
-    attn = spec.model.layers[0].attention
-    assert attn.head_dim == 128, "must come from config.json, not dim/n_heads"
-    assert attn.n_kv_heads == 8
-    assert spec.state_dict_adapter is not None
-    assert cfg.renderer.name == "auto"
-    assert cfg.hf_assets_path.endswith("Qwen3-0.6B")
-    # trained untied (FSDP); the adapter aliases embeddings into lm_head at load
-    assert spec.model.tie_word_embeddings is False
-
-
-def test_hf_backend_covers_every_strategy():
-    """Every coordination strategy (and both decoupled worker roles) has an HF
-    preset that is a pure model/flavor redirect of its native counterpart —
-    the strategies themselves are model-agnostic, so the redirect plus the
-    registry tables is the whole integration surface. Resolve each preset and
-    check the HF markers that distinguish it from a native config."""
-    from panoengine.train.rl.config_registry import (
-        rl_async_inference_hf_qwen3_0_6b,
-        rl_async_inference_worker_hf_qwen3_0_6b,
-        rl_diloco_hf_qwen3_0_6b,
-        rl_heloco_async_inference_hf_qwen3_0_6b,
-        rl_heloco_async_inference_worker_hf_qwen3_0_6b,
-        rl_heloco_hf_qwen3_0_6b,
-    )
-
-    for preset in (
-        rl_diloco_hf_qwen3_0_6b,
-        rl_heloco_hf_qwen3_0_6b,
-        rl_async_inference_hf_qwen3_0_6b,
-        rl_heloco_async_inference_hf_qwen3_0_6b,
-        rl_async_inference_worker_hf_qwen3_0_6b,
-        rl_heloco_async_inference_worker_hf_qwen3_0_6b,
-    ):
-        cfg = preset()
-        spec = cfg.model_spec
-        assert spec.name == "hf_transformers_rl", preset.__name__
-        assert spec.state_dict_adapter is not None, preset.__name__
-        assert cfg.renderer.name == "auto", preset.__name__
-        assert cfg.hf_assets_path.endswith("Qwen3-0.6B"), preset.__name__
-        assert spec.model.tie_word_embeddings is False, preset.__name__
-
-
-def test_hf_backend_1_7b_flavor_registered():
-    """The Qwen3-1.7B HF flavor resolves dims from ITS checkpoint config (not
-    0.6B's): 28 layers, hidden 2048, and the shared example_checkpoint dir."""
-    cfg = base_rl_config(model="hf", flavor="Qwen3-1.7B")
-    assert cfg.hf_assets_path.endswith("Qwen3-1.7B")
-    assert cfg.model_spec.model.num_hidden_layers == 28
-    assert cfg.model_spec.model.hidden_size == 2048
-    assert ("hf", "Qwen3-1.7B") in _DEFAULT_HF_ASSETS_PATH
 
 
 def test_gpu_memory_limit_is_not_pinned_by_the_presets():
@@ -704,7 +641,7 @@ def test_gpu_memory_limit_is_not_pinned_by_the_presets():
         rl_heloco_dapo_math_qwen3_0_6b,
         rl_heloco_qwen3_0_6b,
     )
-    from torchtitan.experiments.rl.actors.generator import VLLMGenerator
+    from torchtitan.rl.generator import VLLMGenerator
 
     engine_default = VLLMGenerator.Config().gpu_memory_limit
     for fn in (

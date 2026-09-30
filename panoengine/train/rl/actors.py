@@ -1,9 +1,9 @@
 # Copyright (c) Panocular AI.
 #
 # On-GPU trainer actors for the decentralized_rl coordination strategies. Each class
-# extends torchtitan.experiments.rl's PolicyTrainer (the base
-# forward_backward/optim_step -- stock token-level GRPO loss -- is reused
-# unchanged) with only its strategy's weight-exchange endpoints:
+# extends torchtitan.rl's TrainerActor (the base forward_backward_steps /
+# optimizer_step -- stock token-level GRPO loss -- are reused unchanged) with
+# only its strategy's weight-exchange endpoints:
 #
 #   - DiLoCoManagerTrainer: wraps the model + inner optimizer in torchft's
 #     ``local_sgd.DiLoCo`` (stock DiLoCo, Douillard et al., 2311.08105), which
@@ -33,21 +33,21 @@ from torchft.local_sgd import DiLoCo
 from torchft.manager import Manager
 from torchft.process_group import ProcessGroupGloo
 
-from torchtitan.components.checkpoint_utils import canonical_fqn
+from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.config import TORCH_DTYPE_MAP
-from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
+from torchtitan.rl.distributed.actors.trainer import TrainerActor
 
 logger = logging.getLogger(__name__)
 
 
-class DiLoCoManagerTrainer(PolicyTrainer):
-    """PolicyTrainer that syncs across replicas via torchft ``local_sgd.DiLoCo``.
+class DiLoCoManagerTrainer(TrainerActor):
+    """Trainer that syncs across replicas via torchft ``local_sgd.DiLoCo``.
 
     Each replica is a single-GPU trainer (TP=1, world_size=1): the model params
     are unsharded on this rank, so DiLoCo's pseudo-gradient all-reduce moves whole
     tensors across replicas (the small-model transport assumption). The base
-    ``forward_backward`` / ``optim_step`` are reused unchanged -- the DiLoCo sync
-    is driven entirely by the inner-optimizer post-step hook.
+    ``forward_backward_steps`` / ``optimizer_step`` are reused unchanged -- the
+    DiLoCo sync is driven entirely by the inner-optimizer post-step hook.
     """
 
     def _diloco_state_dict(self) -> dict:
@@ -55,12 +55,12 @@ class DiLoCoManagerTrainer(PolicyTrainer):
         # behind after a failed all-reduce). Not exercised in a clean run.
         return {
             "model": self.model.state_dict(),
-            "inner_optim": self.optimizers.optimizers[0].state_dict(),
+            "inner_optim": self.engine.optimizers.optimizers[0].state_dict(),
         }
 
     def _diloco_load_state_dict(self, state_dict: dict) -> None:
         self.model.load_state_dict(state_dict["model"])
-        self.optimizers.optimizers[0].load_state_dict(state_dict["inner_optim"])
+        self.engine.optimizers.optimizers[0].load_state_dict(state_dict["inner_optim"])
 
     @concurrent_endpoint
     async def setup_diloco(
@@ -108,7 +108,7 @@ class DiLoCoManagerTrainer(PolicyTrainer):
             init_sync=False,
         )
 
-        inner_optimizer = self.optimizers.optimizers[0]
+        inner_optimizer = self.engine.optimizers.optimizers[0]
         outer_optimizer = torch.optim.SGD(
             self.model.parameters(),
             lr=outer_lr,
@@ -117,10 +117,10 @@ class DiLoCoManagerTrainer(PolicyTrainer):
         )
         self._diloco = DiLoCo(
             self._diloco_manager,
-            [self.model_parts[0]],
+            [self.engine.model_parts[0]],
             inner_optimizer,
             outer_optimizer,
-            backup_device=self.device,
+            backup_device=self.engine.device,
             sync_every=sync_every,
         )
         self._diloco.__enter__()
@@ -152,10 +152,10 @@ class DiLoCoManagerTrainer(PolicyTrainer):
             self._diloco_manager = None
 
 
-class HeLoCoPolicyTrainer(PolicyTrainer):
-    """PolicyTrainer + full-parameter snapshot/restore for the HeLoCo sync.
+class HeLoCoPolicyTrainer(TrainerActor):
+    """Trainer + full-parameter snapshot/restore for the HeLoCo sync.
 
-    The base forward_backward/optim_step are reused unchanged (stock token-level
+    The base forward_backward_steps/optimizer_step are reused unchanged (stock token-level
     GRPO loss); only the parameter-server exchange endpoints are added. The
     controller drives one window like::
 
@@ -251,8 +251,8 @@ class HeLoCoPolicyTrainer(PolicyTrainer):
                 ref.copy_(v)
 
         if clear_optimizer:
-            self.optimizers.zero_grad(set_to_none=True)
-            for opt in self.optimizers:
+            self.engine.optimizers.zero_grad(set_to_none=True)
+            for opt in self.engine.optimizers:
                 opt.state.clear()
         logger.info(
             "HeLoCoPolicyTrainer loaded global theta (policy_version=%d)",
@@ -260,12 +260,12 @@ class HeLoCoPolicyTrainer(PolicyTrainer):
         )
 
 
-class SnapshotPolicyTrainer(PolicyTrainer):
-    """PolicyTrainer + full-parameter snapshot/restore endpoints.
+class SnapshotPolicyTrainer(TrainerActor):
+    """Trainer + full-parameter snapshot/restore endpoints.
 
     Used by AsyncInferenceReplica to read the whole model out for relay
     publishing (see replicas.py's AsyncInferenceReplica.setup_async). The base
-    forward_backward/optim_step are reused unchanged (stock token-level
+    forward_backward_steps/optimizer_step are reused unchanged (stock token-level
     GRPO loss); only the full-state-dict exchange endpoints are added::
 
         theta = trainer.get_full_state_dict_cpu()   # native names, CPU, fp32
@@ -322,8 +322,8 @@ class SnapshotPolicyTrainer(PolicyTrainer):
             to_load[k] = v
         self.model.load_state_dict(to_load, strict=False)
 
-        self.optimizers.zero_grad(set_to_none=True)
-        for opt in self.optimizers:
+        self.engine.optimizers.zero_grad(set_to_none=True)
+        for opt in self.engine.optimizers:
             opt.state.clear()
         logger.info(
             "SnapshotPolicyTrainer loaded full theta (policy_version=%d)",

@@ -44,21 +44,15 @@ decentralized = [
 
 train = [
   "panofabric-engine[decentralized]",
-  "torchtitan @ git+https://github.com/PanocularAI/torchtitan.git@057eb4c77e8e0c8683fd85402c13cddecdf4d494",
+  "torchtitan @ git+https://github.com/PanocularAI/torchtitan.git@0b45dad7f95b6cea4be9fb9f14b17d0e8e0fdeaf",
   # models.hf_transformers needs it, and torchtitan's
   # transformers_modeling_backend imports it without declaring it in either its
   # pyproject or requirements.txt — so without this line that recipe fails to
   # import on an otherwise-complete node. Unpinned deliberately: the backend's
   # own 4.57 pin predates the 5.x we run, matched to vLLM.
   "transformers",
-  # Same story as transformers above: models.qwen3_5 (and torchtitan's native
-  # models/qwen3_5, which imports it at MODULE scope for the GatedDeltaNet
-  # kernels) needs it, but torchtitan declares it only in
-  # .ci/docker/requirements-vlm.txt — a CI-only file nothing installs. Without
-  # this line Qwen3.5 fails to import on an otherwise-complete node, which is
-  # what pushed a customer onto the HF backend, where a hybrid model silently
-  # NaNs instead. Unpinned to track the kernels against the torch we run.
-  "flash-linear-attention",
+  # (No flash-linear-attention: Qwen3.5's GatedDeltaNet kernels come from
+  # attn-gym[linear], which torchtitan now declares itself.)
 ]
 
 # The serving plane. torch and vllm are DELIBERATELY NOT DECLARED: every runtime

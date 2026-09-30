@@ -64,9 +64,7 @@ COPY . /build
 # the pyproject git pins). This is where torchft compiles from source — paid once.
 # `transformers` is torchtitan's undeclared transformers_modeling_backend dep, which
 # panoengine.train.pretrain.hf_transformers imports (see the Makefile for the long version).
-# `flash-linear-attention` is the same kind of gap for Qwen3.5: torchtitan's native
-# models/qwen3_5 imports it at module scope for the GatedDeltaNet kernels but declares it
-# only in .ci/docker/requirements-vlm.txt, which the line above does not read.
+# Qwen3.5's GatedDeltaNet kernels come from attn-gym[linear], a declared torchtitan dep.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,from=torchtitan,target=/src/torchtitan,rw \
     --mount=type=bind,from=torchft,target=/src/torchft,rw \
@@ -74,7 +72,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && uv pip install /src/torchtitan \
     && uv pip install /src/torchft \
     && uv pip install --no-deps . \
-    && uv pip install transformers flash-linear-attention
+    && uv pip install transformers
 
 # install-torch LAST + --force-reinstall so the backend-matched torch NIGHTLY wins over
 # whatever stable torch the engine install pulled in (cf. Makefile `install-torch`).
@@ -226,7 +224,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       "torchmonarch==${TORCHMONARCH_VERSION}" \
       "renderers==${RENDERERS_VERSION}" \
       "math-verify==${MATH_VERIFY_VERSION}" \
-      pygtrie portpicker \
+      pygtrie portpicker opentelemetry-sdk opentelemetry-exporter-otlp-proto-http \
     && uv pip install --python ${VIRTUAL_ENV}/bin/python --no-deps \
       "torchstore @ https://github.com/meta-pytorch/torchstore/archive/${TORCHSTORE_SHA}.tar.gz" \
     && uv pip install --python ${VIRTUAL_ENV}/bin/python \

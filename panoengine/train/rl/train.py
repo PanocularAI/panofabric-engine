@@ -147,14 +147,18 @@ def spawn_gpu_procs(num_gpus: int, env: dict[str, str], *, bootstrap=_preimport_
 
 
 def _ensure_cuda_toolchain() -> None:
-    """Point CUDA_HOME at an nvcc matching torch's CUDA before spawning actors.
+    """Point CUDA_HOME at a toolkit matching torch's CUDA before spawning actors.
 
     vLLM's FlashInfer sampler JIT-compiles with nvcc, found through CUDA_HOME and
     then PATH, so the Monarch-spawned generator subprocess inherits whatever is
     set here. A system /usr/bin/nvcc may be too old, or another CUDA major than
     the one torch was built for (a cu130 torch cannot use a CUDA 12 toolkit), so
-    prefer: an explicit CUDA_HOME, then the newest /usr/local/cuda-<major>*, then
-    the pip-installed nvcc (nvidia-cuda-nvcc, how the runtime-only image gets one).
+    prefer an explicit CUDA_HOME, then the newest /usr/local/cuda-<major>*.
+
+    Only direct launches need this. controld sets VLLM_USE_FLASHINFER_SAMPLER=0
+    on every RL island (the runtime-only image has no usable nvcc: the one pip
+    ships under nvidia/cu13 is version-mixed and FlashInfer rejects it), so
+    vLLM's native sampler runs and nothing is compiled.
     """
     import glob
 
@@ -163,13 +167,6 @@ def _ensure_cuda_toolchain() -> None:
     major = (torch.version.cuda or "").split(".")[0]
     candidates = [os.environ["CUDA_HOME"]] if os.environ.get("CUDA_HOME") else []
     candidates += sorted(glob.glob(f"/usr/local/cuda-{major}*"), reverse=True)
-    try:
-        import nvidia
-
-        for root in nvidia.__path__:
-            candidates += [os.path.join(root, f"cu{major}"), os.path.join(root, "cuda_nvcc")]
-    except ImportError:
-        pass
     for home in candidates:
         if os.path.isfile(os.path.join(home, "bin", "nvcc")):
             os.environ["CUDA_HOME"] = home
@@ -179,8 +176,8 @@ def _ensure_cuda_toolchain() -> None:
             logger.info("CUDA toolchain set to %s", home)
             return
     logger.warning(
-        "no CUDA %s toolkit (nvcc) found; FlashInfer JIT will fail -- install "
-        "nvidia-cuda-nvcc or set CUDA_HOME", major,
+        "no CUDA %s toolkit (nvcc) found; vLLM's FlashInfer sampler cannot JIT -- "
+        "set CUDA_HOME or VLLM_USE_FLASHINFER_SAMPLER=0", major,
     )
 
 

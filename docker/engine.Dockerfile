@@ -225,7 +225,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       "renderers==${RENDERERS_VERSION}" \
       "math-verify==${MATH_VERIFY_VERSION}" \
       pygtrie portpicker opentelemetry-sdk opentelemetry-exporter-otlp-proto-http \
-      nvidia-cuda-nvcc \
     && uv pip install --python ${VIRTUAL_ENV}/bin/python --no-deps \
       "torchstore @ https://github.com/meta-pytorch/torchstore/archive/${TORCHSTORE_SHA}.tar.gz" \
     && uv pip install --python ${VIRTUAL_ENV}/bin/python \

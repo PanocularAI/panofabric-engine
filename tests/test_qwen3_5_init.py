@@ -19,7 +19,6 @@ from __future__ import annotations
 import pytest
 
 torch = pytest.importorskip("torch")
-pytest.importorskip("fla", reason="Qwen3.5 needs flash-linear-attention")
 
 
 def test_gated_deltanet_params_are_initialised():
@@ -27,7 +26,7 @@ def test_gated_deltanet_params_are_initialised():
 
     cfg = qwen35_debugmodel()
     with torch.device("meta"):
-        model = cfg.model_spec.model.build()
+        model = cfg.model.build()
     model.to_empty(device="cpu")
     with torch.no_grad():
         model.init_weights(buffer_device=torch.device("cpu"))
@@ -45,13 +44,16 @@ def test_gated_deltanet_params_are_initialised():
 
 def test_preset_is_text_only_and_fault_tolerant():
     """The presets must feed text (not torchtitan's cc12m image-text loader) and
-    carry fragment_fn, or cross-site HeLoCo has nothing to fragment."""
+    carry the _fragment hook, or cross-site HeLoCo has nothing to fragment."""
+    from models.qwen3_5 import VerifyingQwen35StateDictAdapter
     from models.qwen3_5.config_registry import qwen35_9b
 
     cfg = qwen35_9b()
-    assert "Text" in type(cfg.dataloader).__qualname__, type(cfg.dataloader).__qualname__
-    assert cfg.model_spec.fragment_fn is not None
-    assert cfg.model_spec.state_dict_adapter is not None
+    processor = type(cfg.dataloader.dataset.dataset.processor).__qualname__
+    assert "TextProcessor" in processor, processor
+    model_cls = type(cfg.model)._owner
+    assert model_cls._fragment is not None
+    assert model_cls.state_dict_adapter_cls is VerifyingQwen35StateDictAdapter
 
 
 # --------------------------------------------------------------------------- #
@@ -64,7 +66,7 @@ def _adapter_and_roundtrip():
     from models.qwen3_5 import VerifyingQwen35StateDictAdapter
     from models.qwen3_5.config_registry import qwen35_debugmodel
 
-    config = qwen35_debugmodel().model_spec.model
+    config = qwen35_debugmodel().model
     adapter = VerifyingQwen35StateDictAdapter(config, hf_assets_path=None)
     with torch.device("meta"):
         model = config.build()
@@ -102,7 +104,7 @@ def test_missing_vision_weights_only_warn(caplog):
     """
     from models.qwen3_5 import VerifyingQwen35StateDictAdapter, model_registry
 
-    config = model_registry("debugmodel", text_only=False).model
+    config = model_registry("debugmodel", text_only=False)
     adapter = VerifyingQwen35StateDictAdapter(config, hf_assets_path=None)
     with torch.device("meta"):
         model = config.build()
@@ -119,9 +121,8 @@ def test_text_only_drops_the_vision_tower_by_default():
     for a module that never sees an image."""
     from models.qwen3_5 import model_registry
 
-    spec = model_registry("debugmodel")
     with torch.device("meta"):
-        model = spec.model.build()
+        model = model_registry("debugmodel").build()
     names = [n for n, _ in model.named_parameters()]
     assert not any(n.startswith("vision_encoder.") for n in names)
     assert model.vision_encoder is None
@@ -130,8 +131,32 @@ def test_text_only_drops_the_vision_tower_by_default():
 def test_text_only_false_keeps_it_for_multimodal():
     from models.qwen3_5 import model_registry
 
-    spec = model_registry("debugmodel", text_only=False)
     with torch.device("meta"):
-        model = spec.model.build()
+        model = model_registry("debugmodel", text_only=False).build()
     assert model.vision_encoder is not None
     assert any(n.startswith("vision_encoder.") for n, _ in model.named_parameters())
+
+
+def test_text_only_model_reads_a_multimodal_checkpoint(tmp_path):
+    """Every published Qwen3.5 checkpoint keys its decoder model.language_model.*
+    (it ships a vision tower). Upstream keys a tower-less model as a text-only
+    checkpoint (model.*), which asks the published 9B for 426 of its 427 decoder
+    keys under names that do not exist. The verifying adapter keys it the way the
+    checkpoint on disk does."""
+    import json
+
+    from models.qwen3_5 import model_registry, VerifyingQwen35StateDictAdapter
+
+    config = model_registry("debugmodel")  # text-only
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"model.language_model.norm.weight": "model-00001-of-00002.safetensors"}}
+    ))
+    with torch.device("meta"):
+        model = config.build()
+    sd = dict(model.state_dict())
+    hf = VerifyingQwen35StateDictAdapter(config, hf_assets_path=str(tmp_path)).to_hf(sd)
+    decoder = [k for k in hf if k != "lm_head.weight"]
+    assert decoder and all(k.startswith("model.language_model.") for k in decoder)
+    # no index / a text-only checkpoint keeps upstream's model.* keys
+    hf = VerifyingQwen35StateDictAdapter(config, hf_assets_path=None).to_hf(sd)
+    assert not any(k.startswith("model.language_model.") for k in hf)

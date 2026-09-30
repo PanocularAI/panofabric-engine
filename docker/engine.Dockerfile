@@ -114,10 +114,18 @@ ENV PATH=/opt/panoengine/.venv/bin:$PATH
 # the pod and rsyncs the workdir. Its pod-init `apt install openssh-server rsync` depends
 # on reaching apt mirrors on every launch (flaky); pre-baking them makes that a no-op and
 # guarantees /etc/ssh/sshd_config exists (its absence kills the pod at "apt-ssh-setup").
+#
+# libibverbs1 + ibverbs-providers + librdmacm1t64 are what NCCL needs to use InfiniBand.
+# torch's bundled NCCL dlopen()s libibverbs.so.1 at runtime and, when it is missing,
+# falls back to TCP sockets WITHOUT an error -- so a multi-node island placed on an
+# InfiniBand fabric (network_tier=best, /dev/infiniband passed into the
+# container) still synced over Ethernet. ibverbs-providers carries libmlx5, the driver
+# for the Mellanox NICs those fabrics use. The cudnn-runtime base ships none of them.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python${PYTHON_VERSION} python${PYTHON_VERSION}-dev build-essential \
         openssh-server rsync \
         libgomp1 libssl3 ca-certificates iproute2 \
+        libibverbs1 ibverbs-providers librdmacm1t64 \
     && rm -rf /var/lib/apt/lists/*
 
 # The whole engine: venv (torch + torchtitan + torchft + panoengine) + run_train.sh.
@@ -127,6 +135,12 @@ WORKDIR /opt/panoengine
 # Fail the build early if the baked engine can't even import (catches a broken nightly /
 # ABI mismatch before the image ships). `import torch` does not need a GPU.
 RUN python -c "import torch, torchtitan, torchft; print('baked torch', torch.__version__)"
+
+# And fail it if NCCL could not open InfiniBand: the fallback is silent at runtime, so
+# the build is the only place a missing verbs library is loud.
+RUN ldconfig -p | grep -q 'libibverbs.so.1' \
+    && ls /usr/lib/*/libibverbs/libmlx5-rdmav*.so >/dev/null \
+    && echo 'InfiniBand verbs + mlx5 provider present'
 
 # OCI labels: source -> THIS repo (so GHCR shows the engine's README, not the control
 # plane's); the build script passes the resolved source SHAs.

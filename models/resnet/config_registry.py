@@ -23,6 +23,7 @@ from . import model_registry
 
 def resnet18_cifar10() -> EngineTrainer.Config:
     return EngineTrainer.Config(
+        tokens_per_sample=1,  # one image: --local_batch_size counts images
         loss=ResNetCrossEntropyLoss.Config(),
         hf_assets_path="",
         tokenizer=None,
@@ -75,6 +76,7 @@ def resnet18_cifar10() -> EngineTrainer.Config:
 
 def resnet34_cifar10() -> EngineTrainer.Config:
     return EngineTrainer.Config(
+        tokens_per_sample=1,  # one image: --local_batch_size counts images
         loss=ResNetCrossEntropyLoss.Config(),
         hf_assets_path="",
         tokenizer=None,
@@ -127,6 +129,7 @@ def resnet34_cifar10() -> EngineTrainer.Config:
 
 def resnet50_cifar10() -> EngineTrainer.Config:
     return EngineTrainer.Config(
+        tokens_per_sample=1,  # one image: --local_batch_size counts images
         loss=ResNetCrossEntropyLoss.Config(),
         hf_assets_path="",
         tokenizer=None,
@@ -179,6 +182,7 @@ def resnet50_cifar10() -> EngineTrainer.Config:
 
 def resnet152_cifar10() -> EngineTrainer.Config:
     return EngineTrainer.Config(
+        tokens_per_sample=1,  # one image: --local_batch_size counts images
         loss=ResNetCrossEntropyLoss.Config(),
         hf_assets_path="",
         tokenizer=None,

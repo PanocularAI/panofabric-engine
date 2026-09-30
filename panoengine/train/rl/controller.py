@@ -34,6 +34,7 @@
 #                           bound.
 
 import asyncio
+import dataclasses
 import itertools
 import json
 import logging
@@ -55,6 +56,17 @@ from torchtitan.rl.rollout import RolloutGroup
 logger = logging.getLogger(__name__)
 
 
+def apply_lr(config) -> None:
+    """Fold ``config.lr`` (if set) into every trainer optimizer, in place."""
+    if getattr(config, "lr", None) is None:
+        return
+    optimizer = config.trainer.optimizer
+    config.trainer.optimizer = dataclasses.replace(
+        optimizer,
+        optimizers=[dataclasses.replace(o, lr=config.lr) for o in optimizer.optimizers],
+    )
+
+
 class RLTrainer(Controller):
     """Synchronous RL orchestration base for the decentralized_rl coordinators.
 
@@ -67,7 +79,15 @@ class RLTrainer(Controller):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Controller.Config):
-        """decentralized_rl replicas subclass this; it adds no fields of its own."""
+        """decentralized_rl replicas subclass this."""
+
+        lr: float | None = None
+        """Learning rate for every trainer optimizer. The control plane's knob:
+        upstream hides the optimizer list from the CLI (``tyro.conf.Suppress``)."""
+
+    def __init__(self, config: "RLTrainer.Config"):
+        apply_lr(config)
+        super().__init__(config)
 
     def _build_sync_pipeline(self) -> None:
         """Build the rollout→sample→batch pipeline components used by the

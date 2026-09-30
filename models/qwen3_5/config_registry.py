@@ -17,32 +17,33 @@ arrive.
 Run as:  --module models.qwen3_5 --config qwen35_9b
 """
 
+from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
-from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import LRSchedulersContainer
-from torchtitan.components.validate import Validator
-from torchtitan.config import ParallelismConfig, TrainingConfig
+from torchtitan.config import TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
-from torchtitan.experiments.torchft.trainer import FaultTolerantTrainer
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+from torchtitan.hf_datasets.text_datasets import DATASETS
 from torchtitan.models.common.config_utils import decoder_vocab_size
-from torchtitan.tools.profiler import Profiler
+from torchtitan.observability.metrics import MetricsProcessor
+from torchtitan.observability.profiler import Profiler
 
+from panoengine.train.config import EngineTrainer
 from panoengine.train.strategies import adamw, semi_sync
 
 from . import model_registry
 
 
-def qwen35_debugmodel() -> FaultTolerantTrainer.Config:
+def qwen35_debugmodel() -> EngineTrainer.Config:
     """Tiny Qwen3.5 for smoke tests: exercises the hybrid GatedDeltaNet +
     full-attention stack (and therefore the FLA kernels) without a real GPU
     budget. Run this before a 9B to prove the stack imports and steps."""
-    model_spec = model_registry("debugmodel")
-    return FaultTolerantTrainer.Config(
+    model = model_registry("debugmodel", seq_len=1024)
+    return EngineTrainer.Config(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
-                global_vocab_size=decoder_vocab_size(model_spec),
+                global_vocab_size=decoder_vocab_size(model),
             ),
         ),
         hf_assets_path="./tests/assets/tokenizer",
@@ -57,12 +58,12 @@ def qwen35_debugmodel() -> FaultTolerantTrainer.Config:
             enable_tensorboard=False,
             save_tb_folder="tb",
         ),
-        model_spec=model_spec,
+        model=model,
         optimizer=adamw(lr=3e-4),
         lr_scheduler=LRSchedulersContainer.Config(warmup_steps=2),
         training=TrainingConfig(
-            local_batch_size=4,
-            seq_len=1024,
+            num_tokens_per_microbatch_per_dp_rank=4 * 1024,
+            max_context_length=1024,
             max_norm=1.0,
             steps=10,
             # Required, not a preference: GatedDeltaNet consumes per-batch
@@ -71,7 +72,9 @@ def qwen35_debugmodel() -> FaultTolerantTrainer.Config:
             # "CUDA graph auxiliary input structure must remain constant".
             disable_cuda_graphs=True,
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+        ),
         parallelism=ParallelismConfig(
             data_parallel_replicate_degree=1,
             data_parallel_shard_degree=-1,
@@ -79,8 +82,7 @@ def qwen35_debugmodel() -> FaultTolerantTrainer.Config:
             pipeline_parallel_degree=1,
             context_parallel_degree=1,
         ),
-        checkpoint=TorchFTCheckpointManager.Config(
-            enable=False,
+        checkpointer=TorchFTCheckpointManager.Config(
             enable_ft_dataloader_checkpoints=False,
             folder="checkpoint",
             interval=50,
@@ -89,11 +91,10 @@ def qwen35_debugmodel() -> FaultTolerantTrainer.Config:
         ),
         activation_checkpoint=FullAC.Config(),
         fault_tolerance=semi_sync(),
-        validator=Validator.Config(enable=False),
     )
 
 
-def qwen35_9b() -> FaultTolerantTrainer.Config:
+def qwen35_9b() -> EngineTrainer.Config:
     """Qwen3.5-9B (dense decoder + vision tower) on text.
 
     Parallelism and activation checkpointing mirror torchtitan's own
@@ -101,14 +102,14 @@ def qwen35_9b() -> FaultTolerantTrainer.Config:
 
     Trains from scratch as written. To fine-tune from published weights, set
     ``model.init_from`` on the run spec (e.g. ``Qwen/Qwen3.5-9B``): the control
-    plane fetches that repo's safetensors and emits the ``--checkpoint`` flags
-    that load them, so this one preset serves both.
+    plane fetches that repo's safetensors and emits the ``--enable_checkpoint``
+    and ``--checkpointer.*`` flags that load them, so this one preset serves both.
     """
-    model_spec = model_registry("9B")
-    return FaultTolerantTrainer.Config(
+    model = model_registry("9B", seq_len=4096)
+    return EngineTrainer.Config(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
-                global_vocab_size=decoder_vocab_size(model_spec),
+                global_vocab_size=decoder_vocab_size(model),
             ),
         ),
         hf_assets_path="./assets/hf/Qwen3.5-9B",
@@ -123,17 +124,19 @@ def qwen35_9b() -> FaultTolerantTrainer.Config:
             enable_tensorboard=False,
             save_tb_folder="tb",
         ),
-        model_spec=model_spec,
+        model=model,
         optimizer=adamw(lr=5e-4),
         lr_scheduler=LRSchedulersContainer.Config(warmup_steps=20),
         training=TrainingConfig(
-            local_batch_size=4,
-            seq_len=4096,
+            num_tokens_per_microbatch_per_dp_rank=4 * 4096,
+            max_context_length=4096,
             max_norm=1.0,
             steps=1000,
             disable_cuda_graphs=True,   # see qwen35_debugmodel
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4"]),
+        ),
         parallelism=ParallelismConfig(
             data_parallel_replicate_degree=1,
             data_parallel_shard_degree=-1,
@@ -141,8 +144,7 @@ def qwen35_9b() -> FaultTolerantTrainer.Config:
             pipeline_parallel_degree=1,
             context_parallel_degree=1,
         ),
-        checkpoint=TorchFTCheckpointManager.Config(
-            enable=False,
+        checkpointer=TorchFTCheckpointManager.Config(
             enable_ft_dataloader_checkpoints=False,
             folder="checkpoint",
             interval=500,
@@ -151,5 +153,4 @@ def qwen35_9b() -> FaultTolerantTrainer.Config:
         ),
         activation_checkpoint=FullAC.Config(),
         fault_tolerance=semi_sync(),
-        validator=Validator.Config(enable=False),
     )

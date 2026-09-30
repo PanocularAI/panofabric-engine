@@ -6,21 +6,22 @@ hf_debugmodel/hf_full presets train it from scratch (random init); hf_finetune
 loads the repo's pretrained safetensors through the backend's near-identity
 HFTransformerStateDictAdapter (native keys == "model." + HF keys) — genuine
 full-parameter fine-tuning of any dense CausalLM repo. This package marries
-the backend to the torchft FaultTolerantTrainer, mirroring the
+the backend to the engine's fault-tolerant trainer, mirroring the
 models.llama3 glue, and is selected from a RunSpec via
 model.module: models.hf_transformers (a shim for this package).
+
+The model has no ``_fragment`` hook, so DiLoCo syncs it whole
+(``num_fragments`` must be 1). Its state-dict adapter -- near-identity HF<->DCP
+keys, plus aliasing a tied checkpoint's embed_tokens into our untied lm_head at
+load -- is the backend's ``HFTransformerModel.state_dict_adapter_cls``.
 """
+
+import copy
 
 from torchtitan.experiments.transformers_modeling_backend import (
     HFTransformerModel,
-    parallelize_hf_transformers,
-    pipeline_hf_transformers,
     TitanModelConfig,
 )
-from torchtitan.experiments.transformers_modeling_backend.state_dict_adapter import (
-    HFTransformerStateDictAdapter,
-)
-from torchtitan.experiments.torchft.config.job_config import FaultTolerantModelSpec
 
 
 def _untied_flavor(model_config: TitanModelConfig) -> HFTransformerModel.Config:
@@ -64,21 +65,10 @@ flavors = {
 }
 
 
-def model_registry(flavor: str) -> FaultTolerantModelSpec:
+def model_registry(flavor: str, *, seq_len: int) -> HFTransformerModel.Config:
     """flavor: "debugmodel" (tiny override dims, smoke test) | "full" (the repo's
     real dims from config.json — from-scratch pretraining or, with a
     weight-loading preset, fine-tuning)."""
-    return FaultTolerantModelSpec(
-        name="ft/hf_transformers",
-        flavor=flavor,
-        model=flavors[flavor],
-        parallelize_fn=parallelize_hf_transformers,
-        pipelining_fn=pipeline_hf_transformers,
-        post_optimizer_build_fn=None,
-        # Near-identity HF<->DCP mapping (wrapped modules ARE transformers
-        # modules); also aliases tied checkpoints' embed_tokens into our
-        # untied lm_head at load. Only exercised when a preset enables
-        # checkpointing (hf_finetune) — the from-scratch presets never load.
-        state_dict_adapter=HFTransformerStateDictAdapter,
-        fragment_fn=None,          # no splitter => whole-model DiLoCo (num_fragments must be 1)
-    )
+    config = copy.deepcopy(flavors[flavor])
+    config.max_seq_len = seq_len
+    return config

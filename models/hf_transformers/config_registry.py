@@ -8,21 +8,22 @@ from dataclasses import dataclass
 
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.optimizer import LRSchedulersContainer
-from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.validate import Validator
+from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.config import CommConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config import CommConfig, TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
+from panoengine.train.config import EngineTrainer
 from panoengine.train.strategies import adamw, semi_sync
-from torchtitan.experiments.torchft.trainer import FaultTolerantTrainer
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
-from torchtitan.tools.profiler import Profiler
+from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
+from torchtitan.hf_datasets.text_datasets import DATASETS
+from torchtitan.observability.profiler import Profiler
 
 from . import model_registry
 
 
 @dataclass(kw_only=True, slots=True)
-class HFFTConfig(FaultTolerantTrainer.Config):
+class HFFTConfig(EngineTrainer.Config):
     hf_model: str = ""
     """HuggingFace repo id (e.g. 'Qwen/Qwen2.5-7B'); architecture only, random init."""
 
@@ -44,7 +45,7 @@ def hf_debugmodel() -> HFFTConfig:
             save_tb_folder="tb",
             enable_wandb=False,
         ),
-        model_spec=model_registry("debugmodel"),
+        model=model_registry("debugmodel", seq_len=2048),
         optimizer=adamw(lr=8e-4, eps=1e-8),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
@@ -53,13 +54,13 @@ def hf_debugmodel() -> HFFTConfig:
             min_lr_factor=0.0,
         ),
         training=TrainingConfig(
-            local_batch_size=8,
-            seq_len=2048,
+            num_tokens_per_microbatch_per_dp_rank=8 * 2048,
+            max_context_length=2048,
             max_norm=1.0,
             steps=100,
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(
-            dataset="c4_test",
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
         ),
         parallelism=ParallelismConfig(
             data_parallel_replicate_degree=1,
@@ -68,8 +69,7 @@ def hf_debugmodel() -> HFFTConfig:
             pipeline_parallel_degree=1,
             context_parallel_degree=1,
         ),
-        checkpoint=TorchFTCheckpointManager.Config(
-            enable=False,
+        checkpointer=TorchFTCheckpointManager.Config(
             enable_ft_dataloader_checkpoints=False,
             folder="checkpoint",
             interval=10,
@@ -79,11 +79,6 @@ def hf_debugmodel() -> HFFTConfig:
         activation_checkpoint=SelectiveAC.Config(),
         comm=CommConfig(train_timeout_seconds=15),
         fault_tolerance=semi_sync(num_fragments=1),  # no fragment_fn: whole-model DiLoCo
-        validator=Validator.Config(
-            enable=False,
-            freq=5,
-            steps=10,
-        ),
     )
 
 
@@ -104,19 +99,19 @@ def hf_full() -> HFFTConfig:
             save_tb_folder="tb",
             enable_wandb=False,
         ),
-        model_spec=model_registry("full"),
+        model=model_registry("full", seq_len=8192),
         optimizer=adamw(lr=3e-4, eps=1e-8),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=200,
         ),
         training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=8192,
+            num_tokens_per_microbatch_per_dp_rank=1 * 8192,
+            max_context_length=8192,
             max_norm=1.0,
             steps=1000,
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(
-            dataset="c4",
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4"]),
         ),
         parallelism=ParallelismConfig(
             data_parallel_replicate_degree=1,
@@ -125,8 +120,7 @@ def hf_full() -> HFFTConfig:
             pipeline_parallel_degree=1,
             context_parallel_degree=1,
         ),
-        checkpoint=TorchFTCheckpointManager.Config(
-            enable=False,
+        checkpointer=TorchFTCheckpointManager.Config(
             enable_ft_dataloader_checkpoints=False,
             folder="checkpoint",
             interval=500,
@@ -135,9 +129,6 @@ def hf_full() -> HFFTConfig:
         ),
         activation_checkpoint=SelectiveAC.Config(),
         fault_tolerance=semi_sync(num_fragments=1),  # no fragment_fn: whole-model DiLoCo
-        validator=Validator.Config(
-            enable=False,
-        ),
     )
 
 
@@ -155,6 +146,6 @@ def hf_finetune() -> HFFTConfig:
     # schedule (3e-4) or gradients shear the pretrained features off.
     config.optimizer = adamw(lr=2e-5, eps=1e-8)
     config.lr_scheduler.warmup_steps = 20
-    config.checkpoint.enable = True               # the initial HF-weight load is gated on it
-    config.checkpoint.initial_load_in_hf = True   # pretrained safetensors from hf_assets_path
+    config.enable_checkpoint = True                  # the initial HF-weight load is gated on it
+    config.checkpointer.initial_load_in_hf = True   # pretrained safetensors from hf_assets_path
     return config

@@ -6,22 +6,25 @@
 
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.optimizer import LRSchedulersContainer
-from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.validate import Validator
-from torchtitan.config import ParallelismConfig, TrainingConfig
+from torchtitan.observability.metrics import MetricsProcessor
+from torchtitan.config import TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
+from torchtitan.models.common.config_utils import decoder_vocab_size
+from panoengine.train.config import EngineTrainer
 from panoengine.train.strategies import adamw, semi_sync
-from torchtitan.experiments.torchft.trainer import FaultTolerantTrainer
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
-from torchtitan.tools.profiler import Profiler
+from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
+from torchtitan.hf_datasets.text_datasets import DATASETS
+from torchtitan.observability.profiler import Profiler
 
 from . import model_registry
 
 
-def qwen3_0_6b() -> FaultTolerantTrainer.Config:
-    return FaultTolerantTrainer.Config(
-        loss=CrossEntropyLoss.Config(),
+def qwen3_0_6b() -> EngineTrainer.Config:
+    model = model_registry("0.6B", seq_len=4096)
+    return EngineTrainer.Config(
+        loss=CrossEntropyLoss.Config(global_vocab_size=decoder_vocab_size(model)),
         hf_assets_path="./assets/hf/Qwen3-0.6B",
         dump_folder="./outputs",
         profiler=Profiler.Config(
@@ -34,19 +37,19 @@ def qwen3_0_6b() -> FaultTolerantTrainer.Config:
             enable_tensorboard=False,
             save_tb_folder="tb",
         ),
-        model_spec=model_registry("0.6B"),
+        model=model,
         optimizer=adamw(lr=3e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
         ),
         training=TrainingConfig(
-            local_batch_size=4,
-            seq_len=4096,
+            num_tokens_per_microbatch_per_dp_rank=4 * 4096,
+            max_context_length=4096,
             max_norm=1.0,
             steps=1000,
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(
-            dataset="c4",
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4"]),
         ),
         parallelism=ParallelismConfig(
             data_parallel_replicate_degree=1,
@@ -55,8 +58,7 @@ def qwen3_0_6b() -> FaultTolerantTrainer.Config:
             pipeline_parallel_degree=1,
             context_parallel_degree=1,
         ),
-        checkpoint=TorchFTCheckpointManager.Config(
-            enable=False,
+        checkpointer=TorchFTCheckpointManager.Config(
             enable_ft_dataloader_checkpoints=False,
             folder="checkpoint",
             interval=500,
@@ -65,15 +67,13 @@ def qwen3_0_6b() -> FaultTolerantTrainer.Config:
         ),
         activation_checkpoint=SelectiveAC.Config(),
         fault_tolerance=semi_sync(),
-        validator=Validator.Config(
-            enable=False,
-        ),
     )
 
 
-def qwen3_1_7b() -> FaultTolerantTrainer.Config:
-    return FaultTolerantTrainer.Config(
-        loss=CrossEntropyLoss.Config(),
+def qwen3_1_7b() -> EngineTrainer.Config:
+    model = model_registry("1.7B", seq_len=4096)
+    return EngineTrainer.Config(
+        loss=CrossEntropyLoss.Config(global_vocab_size=decoder_vocab_size(model)),
         hf_assets_path="./assets/hf/Qwen3-1.7B",
         dump_folder="./outputs",
         profiler=Profiler.Config(
@@ -86,19 +86,19 @@ def qwen3_1_7b() -> FaultTolerantTrainer.Config:
             enable_tensorboard=False,
             save_tb_folder="tb",
         ),
-        model_spec=model_registry("1.7B"),
+        model=model,
         optimizer=adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=20,
         ),
         training=TrainingConfig(
-            local_batch_size=4,
-            seq_len=4096,
+            num_tokens_per_microbatch_per_dp_rank=4 * 4096,
+            max_context_length=4096,
             max_norm=1.0,
             steps=1000,
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(
-            dataset="c4",
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4"]),
         ),
         parallelism=ParallelismConfig(
             data_parallel_replicate_degree=1,
@@ -107,8 +107,7 @@ def qwen3_1_7b() -> FaultTolerantTrainer.Config:
             pipeline_parallel_degree=1,
             context_parallel_degree=1,
         ),
-        checkpoint=TorchFTCheckpointManager.Config(
-            enable=False,
+        checkpointer=TorchFTCheckpointManager.Config(
             enable_ft_dataloader_checkpoints=False,
             folder="checkpoint",
             interval=50,
@@ -117,16 +116,14 @@ def qwen3_1_7b() -> FaultTolerantTrainer.Config:
         ),
         activation_checkpoint=SelectiveAC.Config(),
         fault_tolerance=semi_sync(),
-        validator=Validator.Config(
-            enable=False,
-        ),
     )
 
 
-def qwen3_32b() -> FaultTolerantTrainer.Config:
+def qwen3_32b() -> EngineTrainer.Config:
     # Preset for 8 H100 GPUs with 96 GiB memory
-    return FaultTolerantTrainer.Config(
-        loss=CrossEntropyLoss.Config(),
+    model = model_registry("32B", seq_len=4096)
+    return EngineTrainer.Config(
+        loss=CrossEntropyLoss.Config(global_vocab_size=decoder_vocab_size(model)),
         hf_assets_path="./assets/hf/Qwen3-32B",
         dump_folder="./outputs",
         profiler=Profiler.Config(
@@ -139,19 +136,19 @@ def qwen3_32b() -> FaultTolerantTrainer.Config:
             enable_tensorboard=False,
             save_tb_folder="tb",
         ),
-        model_spec=model_registry("32B"),
+        model=model,
         optimizer=adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=600,
         ),
         training=TrainingConfig(
-            local_batch_size=2,
-            seq_len=4096,
+            num_tokens_per_microbatch_per_dp_rank=2 * 4096,
+            max_context_length=4096,
             max_norm=1.0,
             steps=3000,
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(
-            dataset="c4",
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4"]),
         ),
         parallelism=ParallelismConfig(
             data_parallel_replicate_degree=1,
@@ -160,8 +157,7 @@ def qwen3_32b() -> FaultTolerantTrainer.Config:
             pipeline_parallel_degree=1,
             context_parallel_degree=1,
         ),
-        checkpoint=TorchFTCheckpointManager.Config(
-            enable=False,
+        checkpointer=TorchFTCheckpointManager.Config(
             enable_ft_dataloader_checkpoints=False,
             folder="checkpoint",
             interval=500,
@@ -170,15 +166,13 @@ def qwen3_32b() -> FaultTolerantTrainer.Config:
         ),
         activation_checkpoint=FullAC.Config(),
         fault_tolerance=semi_sync(),
-        validator=Validator.Config(
-            enable=False,
-        ),
     )
 
 
-def qwen3_moe_debug() -> FaultTolerantTrainer.Config:
-    return FaultTolerantTrainer.Config(
-        loss=CrossEntropyLoss.Config(),
+def qwen3_moe_debug() -> EngineTrainer.Config:
+    model = model_registry("debugmodel_moe", seq_len=4096)
+    return EngineTrainer.Config(
+        loss=CrossEntropyLoss.Config(global_vocab_size=decoder_vocab_size(model)),
         hf_assets_path="./tests/assets/tokenizer",
         dump_folder="./outputs",
         profiler=Profiler.Config(
@@ -191,19 +185,19 @@ def qwen3_moe_debug() -> FaultTolerantTrainer.Config:
             enable_tensorboard=False,
             save_tb_folder="tb",
         ),
-        model_spec=model_registry("debugmodel_moe"),
+        model=model,
         optimizer=adamw(lr=3e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
         ),
         training=TrainingConfig(
-            local_batch_size=4,
-            seq_len=4096,
+            num_tokens_per_microbatch_per_dp_rank=4 * 4096,
+            max_context_length=4096,
             max_norm=1.0,
             steps=10,
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(
-            dataset="c4_test",
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
         ),
         parallelism=ParallelismConfig(
             data_parallel_replicate_degree=1,
@@ -213,8 +207,7 @@ def qwen3_moe_debug() -> FaultTolerantTrainer.Config:
             context_parallel_degree=1,
             expert_parallel_degree=1,
         ),
-        checkpoint=TorchFTCheckpointManager.Config(
-            enable=False,
+        checkpointer=TorchFTCheckpointManager.Config(
             enable_ft_dataloader_checkpoints=False,
             folder="checkpoint",
             interval=10,
@@ -223,7 +216,4 @@ def qwen3_moe_debug() -> FaultTolerantTrainer.Config:
         ),
         activation_checkpoint=SelectiveAC.Config(),
         fault_tolerance=semi_sync(),
-        validator=Validator.Config(
-            enable=False,
-        ),
     )

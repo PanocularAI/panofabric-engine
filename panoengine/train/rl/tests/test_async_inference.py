@@ -143,6 +143,32 @@ def test_relay_server_publish_and_fetch_round_trip():
     asyncio.run(scenario())
 
 
+def test_relay_advertises_only_complete_versions():
+    """A manifest whose shards are still landing is not "latest": a fetcher
+    would 404 on the missing shards and re-download the rest on every retry."""
+    async def scenario():
+        relay, server, base_url = await _start_relay()
+        try:
+            client = RelayClient([base_url])
+            sd = _state_dict()
+            shards = shard_state_dict(sd, num_shards=2)
+            await client.publish(1, shards, build_manifest(1, shards))
+
+            relay.publish_manifest(2, build_manifest(2, shards))
+            relay.publish_shard(2, 0, shards[0])
+            assert relay.latest_version() == 1
+            version, _ = await client.fetch_latest(min_version=0)
+            assert version == 1
+            assert await client.fetch_latest(min_version=1) is None
+
+            relay.publish_shard(2, 1, shards[1])
+            assert relay.latest_version() == 2
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
 # --------------------------------------------------------------------- #
 # The rollout-return queue (workers -> trainer).
 # --------------------------------------------------------------------- #

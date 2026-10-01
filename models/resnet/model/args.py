@@ -4,11 +4,13 @@ from typing import Literal, Optional
 import math
 from torch import nn
 
-import dataclasses
+from torchtitan.protocols import BaseModel
 
 
-@dataclass
-class ResNetModelArgs:
+# This is ResNetModel.Config; build() comes from Configurable and constructs
+# ResNetModel(config=...).
+@dataclass(kw_only=True, slots=True)
+class ResNetModelArgs(BaseModel.Config):
     """
     Configuration for building a ResNet-50 backbone.
     """
@@ -19,13 +21,6 @@ class ResNetModelArgs:
 
     def update_from_config(self, **kwargs) -> None:
         pass
-
-    def build(self):
-        from .model import ResNetModel
-        return ResNetModel(self)
-
-    def to_dict(self) -> dict:
-        return dataclasses.asdict(self)
 
     def get_nparams_and_flops(
         self, model: nn.Module, seq_len: int

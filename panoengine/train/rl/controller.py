@@ -18,7 +18,7 @@
 #                           (_collect_training_batch / _apply_training_batch)
 #                           for the windowed outer loops below. Trainer-actor
 #                           injection seam: Controller.setup_async resolves
-#                           the name ``PolicyTrainer`` from rl.controller's
+#                           the name ``TrainerActor`` from rl.controller's
 #                           module globals at spawn time, so replicas rebind
 #                           it (scoped monkeypatch) to spawn their subclass.
 #   RLControllerMixin    -- the shared windowed train loop: LlamaRL-style
@@ -34,6 +34,7 @@
 #                           bound.
 
 import asyncio
+import dataclasses
 import itertools
 import json
 import logging
@@ -42,23 +43,34 @@ import time
 from dataclasses import dataclass
 
 from panoengine.train.rl.train import setup_mesh_elastic_env
-from torchtitan.experiments.rl.components.weight_sync import WeightSyncManager
-from torchtitan.experiments.rl.controller import Controller
-from torchtitan.experiments.rl.controller_metrics import compute_rollout_metrics
+from torchtitan.rl.distributed.weight_sync import WeightSyncManager
+from torchtitan.rl.controller import Controller
+from torchtitan.rl.observability.controller import compute_rollout_metrics
 
 # Re-exported so config_registry keeps a single import site for the loss it
 # used to get from ``rl.trainer``; it now lives in the shared ``rl/losses``.
-from torchtitan.experiments.rl.losses import GRPOLoss  # noqa: F401  re-export: presets
+from torchtitan.rl.losses import GRPOLoss  # noqa: F401  re-export: presets
 # and stored specs named this path back when the losses lived in the fork's RL tree.
-from torchtitan.experiments.rl.rollout import RolloutGroup
+from torchtitan.rl.rollout import RolloutGroup
 
 logger = logging.getLogger(__name__)
+
+
+def apply_lr(config) -> None:
+    """Fold ``config.lr`` (if set) into every trainer optimizer, in place."""
+    if getattr(config, "lr", None) is None:
+        return
+    optimizer = config.trainer.optimizer
+    config.trainer.optimizer = dataclasses.replace(
+        optimizer,
+        optimizers=[dataclasses.replace(o, lr=config.lr) for o in optimizer.optimizers],
+    )
 
 
 class RLTrainer(Controller):
     """Synchronous RL orchestration base for the decentralized_rl coordinators.
 
-    Reuses ``Controller.__init__`` (metrics/renderer/sampling/rollouter/recorder),
+    Reuses ``Controller.__init__`` (metrics/tokenizer/renderer/sampling/rollouter/recorder),
     ``Controller.setup_async`` (actor spawn + initial weight sync),
     ``Controller.validate``, and ``Controller.close``. Adds synchronous
     single-step primitives the windowed ``RLControllerMixin`` loop drives; the
@@ -67,7 +79,15 @@ class RLTrainer(Controller):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Controller.Config):
-        """decentralized_rl replicas subclass this; it adds no fields of its own."""
+        """decentralized_rl replicas subclass this."""
+
+        lr: float | None = None
+        """Learning rate for every trainer optimizer. The control plane's knob:
+        upstream hides the optimizer list from the CLI (``tyro.conf.Suppress``)."""
+
+    def __init__(self, config: "RLTrainer.Config"):
+        apply_lr(config)
+        super().__init__(config)
 
     def _build_sync_pipeline(self) -> None:
         """Build the rollout→sample→batch pipeline components used by the
@@ -77,10 +97,15 @@ class RLTrainer(Controller):
         ``self.trainer_dp_degree``)."""
         async_loop = self.config.async_loop
         self._training_sample_builder = async_loop.training_sample_builder.build()
+        training = self.config.trainer.training
         self._batcher = async_loop.batcher.build(
+            num_tokens_per_microbatch_per_dp_rank=(
+                training.num_tokens_per_microbatch_per_dp_rank
+            ),
+            max_context_length=training.max_context_length,
             num_prompts_per_train_step=async_loop.num_prompts_per_train_step,
             dp_degree=self.trainer_dp_degree,
-            pad_id=self.renderer._tokenizer.eos_token_id,
+            pad_id=self.tokenizer.eos_id,
         )
         self._generate_fn = self._make_generate_fn(metrics_prefix="generator")
         self._group_counter = itertools.count()
@@ -134,7 +159,6 @@ class RLTrainer(Controller):
             group_id=next(self._group_counter),
             group_size=async_loop.num_samples_per_prompt,
             sampling=sampling,
-            renderer=self.renderer,
         )
         group.metrics = compute_rollout_metrics(
             prefix="rollout", rollouts=group.rollouts
@@ -177,33 +201,30 @@ class RLTrainer(Controller):
             training_sample_group = self._training_sample_builder.build_from_group(
                 rollout_group=group
             )
-            if self._producers_started and not training_sample_group.training_samples:
+            packed, trainable = self._batcher.add_training_samples(
+                training_sample_group=training_sample_group
+            )
+            if self._producers_started and not trainable:
                 await self._group_buffer.release_active_groups(
                     1, reason="untrainable_group"
                 )
-            packed = self._batcher.add_training_samples(
-                training_sample_group=training_sample_group
-            )
         return packed, rollout_groups
 
     async def _apply_training_batch(self, packed):
-        """Run fwd/bwd on every microbatch, then the optimizer step. Returns the
-        rank-0 optim result (``.policy_version``, ``.metrics``) plus the last
-        microbatch's mean loss for the divergence guard / log line."""
-        last_loss = 0.0
-        for microbatch in packed.microbatches:
-            mb = self._get_rank_0_value(
-                await self.trainer.forward_backward.call(
-                    microbatch, packed.num_global_valid_tokens
-                )
+        """Run fwd/bwd over the step's microbatches, then the optimizer step.
+        Returns the rank-0 optim result (``.policy_version``, ``.metrics``) plus
+        the step's mean loss for the divergence guard / log line."""
+        fwd_bwd = self._get_rank_0_value(
+            await self.trainer.forward_backward_steps.call(
+                packed.microbatches, packed.num_global_valid_tokens
             )
-            last_loss = mb.get("loss/mean", mb.get("loss", last_loss))
+        )
         if getattr(self, "_producers_started", False):
             # The previous step's overlapped weight push must land before this
             # optimizer step mutates the weights (upstream _trainer_loop order).
             await self._weight_sync.wait_prev_push()
-        optim_output = self._get_rank_0_value(await self.trainer.optim_step.call())
-        return optim_output, last_loss
+        optim_output = self._get_rank_0_value(await self.trainer.optimizer_step.call())
+        return optim_output, fwd_bwd["loss/mean"]
 
 
 class RLControllerMixin:
@@ -247,7 +268,7 @@ class RLControllerMixin:
         return await self._collect_training_batch(step)
 
     async def _train_on(self, packed, rollout_groups) -> dict:
-        """forward_backward loop + optim_step + generator weight refresh
+        """forward_backward_steps + optimizer_step + generator weight refresh
         (trainer-mesh work)."""
         pre_optim_policy_version = self._policy_version
 
@@ -383,7 +404,7 @@ class RLControllerMixin:
         return await self.validate(step=step)
 
     def _aggregate_validation(self, metrics) -> dict:
-        from torchtitan.experiments.rl.observability import metrics as m
+        from torchtitan.rl.observability import metrics as m
 
         return m.MetricsProcessor._aggregate_metrics(metrics)
 
@@ -640,18 +661,17 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
             # A pure learner runs no local generator, so the base Controller
             # config's generator-centric validations (num_generators>=1,
             # generator checkpoint/hot_swap/cudagraph/batch_invariant-generator)
-            # don't apply. Do the trainer-side essentials the base would
-            # otherwise do: the SP-divisibility check and mirroring the batcher
-            # width into trainer.training.seq_len for the model build.
+            # don't apply. Do the trainer-side essential the base would
+            # otherwise do: the SP-divisibility check.
             if self.trainer.parallelism.enable_sequence_parallel:
                 sp_degree = self.trainer.parallelism.tensor_parallel_degree
-                seq_len = self.async_loop.batcher.batch.seq_len
-                if sp_degree > 1 and seq_len % sp_degree != 0:
+                max_context_length = self.trainer.training.max_context_length
+                if sp_degree > 1 and max_context_length % sp_degree != 0:
                     raise ValueError(
-                        f"RL batcher sequence length ({seq_len}) must be "
-                        f"divisible by sequence parallel degree ({sp_degree})."
+                        "training.max_context_length "
+                        f"({max_context_length}) must be divisible "
+                        f"by sequence parallel degree ({sp_degree})."
                     )
-            self.trainer.training.seq_len = self.async_loop.batcher.batch.seq_len
 
             if self.sync_every < 1:
                 raise ValueError(f"sync_every must be >= 1, got {self.sync_every}")
@@ -702,10 +722,11 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
             "trainer",
             policy_trainer_cls,
             cfg.trainer,
-            model_spec=cfg.model_spec,
+            model_config=cfg.model,
             hf_assets_path=cfg.hf_assets_path,
             generator_dtype=cfg.generator.model_dtype,
             compile_config=cfg.compile,
+            max_num_documents=cfg.async_loop.batcher.max_num_documents,
             output_dir=cfg.dump_folder,
         )
 
@@ -819,14 +840,11 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
             training_sample_group = self._training_sample_builder.build_from_group(
                 rollout_group=group
             )
-            # getattr: this counter is diagnostics only and must never be the
-            # thing that breaks a train step -- test fakes and any future
-            # builder return shape are tolerated.
-            if not getattr(training_sample_group, "training_samples", None):
-                untrainable += 1
-            packed = self._batcher.add_training_samples(
+            packed, trainable = self._batcher.add_training_samples(
                 training_sample_group=training_sample_group
             )
+            if not trainable:
+                untrainable += 1
             if packed is None:
                 self._warn_if_starved(step, seen, stale, untrainable)
         # Window-level accounting for the PFMETRICS line: trainable yield is

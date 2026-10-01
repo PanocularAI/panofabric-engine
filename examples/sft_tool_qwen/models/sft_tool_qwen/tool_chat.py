@@ -1,21 +1,22 @@
-"""Tool-calling chat dataloader: multi-span assistant loss masking.
+"""Tool-calling chat data: multi-span assistant loss masking.
 
-torchtitan's ChatDataset is single-turn ([user, assistant]) and masks ONE
-prompt prefix, so it cannot express a tool-calling trajectory
+torchtitan's ChatProcessor is single-turn ([user, assistant]) and masks ONE
+prompt prefix (its `renderers` path is multi-turn but never passes `tools`), so
+it cannot express a tool-calling trajectory
 
     system, user, assistant+tool_call, tool, assistant
 
 which has TWO assistant spans with an environment turn between them.
 
-This loader renders the whole conversation once through the model's own chat
-template (tool schemas included), tokenizes once, then unmasks every span that
-follows the template's assistant header. Loss lands on the assistant's tokens
+ToolChatProcessor renders the whole conversation once through the model's own
+chat template (tool schemas included), tokenizes once, then unmasks every span
+that follows the template's assistant header. Loss lands on the assistant's tokens
 only -- the tool-call JSON, the final answer, and each turn's terminator --
 never on tool results: those are the environment's output, and training on them
 teaches the model to hallucinate results instead of waiting for them.
 
 Why scan for the header instead of re-rendering message prefixes (the obvious
-extension of ChatDataset's trick): Qwen3's template inserts an empty <think>
+extension of ChatProcessor's trick): Qwen3's template inserts an empty <think>
 block into an assistant message only when it is the LAST one, so
 render(msgs[:k]) is NOT a token prefix of render(msgs) and the per-turn length
 deltas are wrong. Header scanning is immune to that, needs one tokenization
@@ -25,20 +26,20 @@ pass, and has no BPE-boundary hazard because role headers are special tokens.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from datasets import Dataset, Features, Value, load_dataset
 
-from torchtitan.components.dataloader import ParallelAwareDataloader
+from torchtitan.components.data import TextSequence
+from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import BaseTokenizer
-from torchtitan.hf_datasets.text_datasets import (
-    ChatDataLoader,
-    ChatDataset,
-    IGNORE_INDEX,
-)
-from torchtitan.tools.logging import logger
+from torchtitan.hf_datasets.text_datasets import ChatProcessor
+
+logger = logging.getLogger(__name__)
 
 
 def assistant_header_ids(tokenizer: BaseTokenizer) -> list[int]:
@@ -99,15 +100,23 @@ def _split_payload(payload: Any) -> tuple[list[dict], list[dict]]:
     return payload, []
 
 
-class ToolChatDataset(ChatDataset):
-    """ChatDataset with tool schemas rendered and every assistant span trained."""
+class ToolChatProcessor(ChatProcessor):
+    """ChatProcessor with tool schemas rendered and every assistant span trained.
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    ``messages_fn`` returns a bare message list or {"messages", "tools"}.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(ChatProcessor.Config):
+        pass
+
+    def __init__(self, config: Config, *, context) -> None:
+        super().__init__(config, context=context)
         self._header = assistant_header_ids(self._tokenizer)
 
-    def _tokenize_sample(self, sample: dict) -> tuple[list[int], list[int]] | None:
-        messages, tools = _split_payload(self._sample_processor(sample))
+    def __call__(self, sample: dict, rng: np.random.Generator) -> TextSequence | None:
+        del rng
+        messages, tools = _split_payload(self._messages_fn(sample))
         # add_generation_prompt=False is load-bearing: the tokenizer wrapper
         # defaults it to True, which appends a dangling assistant header the
         # mask would then train the model to emit after every answer.
@@ -118,32 +127,27 @@ class ToolChatDataset(ChatDataset):
         if tokens[-1] != self._eos_id:
             tokens.append(self._eos_id)
 
-        if not self._logged_first_sample:
-            logger.info(f"[ToolChatDataset] first sample rendered:\n{text}")
-            self._logged_first_sample = True
-
         # Drop rather than truncate: a trajectory cut mid tool-call is poison.
-        if len(tokens) - 1 > self.seq_len:
+        if len(tokens) - 1 > self._max_context_length:
             logger.warning(
-                f"dropping sample {self._sample_idx}: {len(tokens)} tokens > "
-                f"seq_len {self.seq_len} (tool schemas are expensive -- raise "
-                f"training.seq_len)"
+                f"dropping sample: {len(tokens)} tokens > max_context_length "
+                f"{self._max_context_length} (tool schemas are expensive -- raise "
+                f"training.max_context_length)"
             )
             return None
 
-        return tokens[:-1], mask_labels(tokens, self._header, self._eos_id)
+        sequence = self._create_sequence(tokens, full_text=text)
+        sequence.labels[:] = mask_labels(tokens, self._header, self._eos_id)
+        return sequence
 
 
 def load_conversations(dataset_path: str, **load_kwargs):
     """Load conversations from a local JSON/JSONL file or any HF dataset id.
 
     A hub id (or anything else `datasets` understands) is passed straight to
-    load_dataset, so `streaming=True` in load_dataset_kwargs gives an
-    IterableDataset and nothing is downloaded up front. ChatDataset handles
-    both shapes: it shards with split_dataset_by_node, shuffles (a buffer
-    shuffle when streaming), and re-loops through set_epoch. The one thing
-    streaming loses is exact resume -- ChatDataset can only .skip() a
-    map-style dataset, so a restart replays the shard from its start.
+    load_dataset as a map-style Dataset; the Grain pipeline shuffles, shards
+    it per DP rank and repeats it. To stream a hub dataset instead, use
+    torchtitan's HuggingFaceStreamingSource (see sft_tool_qwen_hermes).
 
     A local file is read with plain json and re-encoded as ONE string column.
     That is deliberate: Arrow's schema inference over nested tool schemas
@@ -173,7 +177,7 @@ def conversation_processor(sample: dict) -> dict:
 
 # ShareGPT role tags -> chat roles. Hermes and most ShareGPT-derived tool sets
 # use these; a dataset with different tags needs its own mapping, which is
-# exactly the kind of per-dataset glue a sample_processor exists to hold.
+# exactly the kind of per-dataset glue a messages_fn exists to hold.
 _SHAREGPT_ROLES = {"system": "system", "human": "user", "gpt": "assistant",
                    "tool": "tool", "observation": "tool"}
 
@@ -195,42 +199,17 @@ def sharegpt_processor(sample: dict) -> dict:
     }
 
 
-class ToolChatDataLoader(ParallelAwareDataloader):
-    """ChatDataLoader's config surface, ToolChatDataset's masking."""
+@dataclass(frozen=True, kw_only=True, slots=True)
+class ConversationSource:
+    """Grain source over load_conversations: a local file or a map-style hub id.
 
-    @dataclass(kw_only=True, slots=True)
-    class Config(ChatDataLoader.Config):
-        pass
+    `path` and `load_dataset_kwargs` mirror torchtitan's HF sources, so the
+    engine's --dataset_path override swaps the path the same way.
+    """
 
-    def __init__(
-        self,
-        config: Config,
-        *,
-        dp_world_size: int,
-        dp_rank: int,
-        tokenizer: BaseTokenizer,
-        seq_len: int,
-        local_batch_size: int,
-        snapshot_every_n_steps: int | None = 1,
-        **kwargs,
-    ) -> None:
-        dataset = load_conversations(config.dataset_path, **config.load_dataset_kwargs)
-        super().__init__(
-            ToolChatDataset(
-                dataset=dataset,
-                tokenizer=tokenizer,
-                sample_processor=config.sample_processor,
-                seq_len=seq_len,
-                dp_rank=dp_rank,
-                dp_world_size=dp_world_size,
-                infinite=config.infinite,
-            ),
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            num_workers=config.num_workers,
-            persistent_workers=config.persistent_workers,
-            pin_memory=config.pin_memory,
-            prefetch_factor=config.prefetch_factor,
-            snapshot_every_n_steps=snapshot_every_n_steps,
-            batch_size=local_batch_size,
-        )
+    path: str
+    load_dataset_kwargs: dict[str, Any] = field(default_factory=dict)
+
+    def build(self, *, dataset_iteration_policy) -> Dataset:
+        del dataset_iteration_policy  # SingleDatasetConfig shuffles/shards/repeats
+        return load_conversations(self.path, **self.load_dataset_kwargs)

@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchtitan.experiments.torchft.config.job_config import FaultTolerantModelSpec
-
 from .infra.parallelize import parallelize_resnet
 from .model.args import ResNetModelArgs
 from .model.model import ResNetModel
@@ -45,14 +43,7 @@ resnet_configs = {
 }
 
 
-def model_registry(flavor: str) -> FaultTolerantModelSpec:
-    return FaultTolerantModelSpec(
-        name="ft/resnet",
-        flavor=flavor,
-        model=resnet_configs[flavor],
-        parallelize_fn=parallelize_resnet,
-        pipelining_fn=None,
-        post_optimizer_build_fn=None,
-        state_dict_adapter=None,
-        fragment_fn=None,
-    )
+# No fault-tolerant subclass: ResNet has no `_fragment` hook, so DiLoCo syncs the
+# whole model and the presets pin semi_sync(num_fragments=1).
+def model_registry(flavor: str) -> ResNetModel.Config:
+    return resnet_configs[flavor]

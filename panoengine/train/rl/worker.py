@@ -2,8 +2,8 @@
 #
 # Standalone inference-worker process for the async-inference relay swarm.
 #
-# This role has NO trainer actor at all. `torchtitan.experiments.rl.trainer
-# .RLTrainer.setup_async` always spawns a `PolicyTrainer` and binds
+# This role has NO trainer actor at all. `torchtitan.rl.controller
+# .Controller.setup_async` always spawns a `TrainerActor` and binds
 # TorchStore's storage volumes to the trainer mesh -- a coupling this role
 # deliberately doesn't have, so it can't reuse that setup path. This spawns
 # just a generator actor and binds TorchStore to ITS OWN mesh instead; weight
@@ -31,8 +31,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torchstore as ts  # noqa: E402
 
-from torchtitan.tools.logging import init_logger  # noqa: E402
-from monarch.actor import this_host  # noqa: E402
+from torchtitan.observability.logging import init_logger  # noqa: E402
 
 from torchtitan.config import CompileConfig  # noqa: E402
 from panoengine.decentralized.relay import RelayClient  # noqa: E402
@@ -41,19 +40,22 @@ from panoengine.decentralized.rollout_queue import (
 )  # noqa: E402
 
 from panoengine.train.rl.train import (
+    _bootstrap_generator,
     _ensure_cuda_toolchain,
     PerHostProvisioner,
     setup_mesh_elastic_env,
+    spawn_gpu_procs,
 )  # noqa: E402
-from torchtitan.experiments.rl.actors.generator import VLLMGenerator  # noqa: E402
-from torchtitan.experiments.rl.examples.alphabet_sort import (
-    AlphabetSortRollouter,
-)  # noqa: E402
-from torchtitan.experiments.rl.renderer import RendererConfig  # noqa: E402
-from torchtitan.experiments.rl.train import (
+from renderers import Qwen3RendererConfig  # noqa: E402
+from torchtitan.components.renderer import from_renderers, RendererConfig  # noqa: E402
+from torchtitan.components.tokenizer import HuggingFaceTokenizer  # noqa: E402
+from torchtitan.models.common.decoder import Decoder  # noqa: E402
+from torchtitan.rl.distributed.actors.generator import VLLMGeneratorActor  # noqa: E402
+from torchtitan.rl.generator import VLLMGenerator  # noqa: E402
+from torchtitan.rl.rollout.rollouter import Rollouter  # noqa: E402
+from torchtitan.rl.train import (
     _compute_generator_world_size as _compute_world_size,
 )  # noqa: E402
-from torchtitan.protocols.model_spec import ModelSpec  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -65,20 +67,23 @@ class AsyncInferenceWorker:
 
     @dataclass(kw_only=True, slots=True)
     class Config:
-        # Suppressed from the CLI like RLTrainer.Config.model_spec: tyro would
-        # otherwise recurse into the resolved spec's pickled model config (the
-        # HF backend's PretrainedConfig trips it with a NameError on torch).
-        # The concrete ModelSpec | None annotation matters — with a bare
-        # `object`, tyro narrows to the default instance's type and recurses
-        # anyway, Suppress notwithstanding.
-        model_spec: Annotated[ModelSpec | None, tyro.conf.Suppress] = None
+        # Set by the presets, not the CLI -- the same as Controller.Config.model.
+        # The concrete `X | None` annotations matter: with a bare `object`, tyro
+        # narrows to the default instance's type and recurses anyway, Suppress
+        # notwithstanding.
+        model: Annotated[Decoder.Config | None, tyro.conf.Suppress] = None
         hf_assets_path: str = ""
         generator: VLLMGenerator.Config = field(default_factory=VLLMGenerator.Config)
-        rollouter: object = field(default_factory=AlphabetSortRollouter.Config)
-        renderer: RendererConfig = field(
-            default_factory=lambda: RendererConfig(name="qwen3")
+        rollouter: Annotated[Rollouter.Config | None, tyro.conf.Suppress] = None
+        tokenizer: HuggingFaceTokenizer.Config = field(
+            default_factory=HuggingFaceTokenizer.Config
         )
-        compile: CompileConfig = field(default_factory=CompileConfig)
+        renderer: RendererConfig = field(
+            default_factory=lambda: from_renderers(
+                Qwen3RendererConfig(enable_thinking=False)
+            )
+        )
+        compile: Annotated[CompileConfig | None, tyro.conf.AvoidSubcommands] = None
         group_size: int = 8
         """Rollouts per group (mirrors the trainer configs' group_size)."""
         groups_per_round: int = 2
@@ -146,9 +151,9 @@ class AsyncInferenceWorker:
 
         self.generator = generator_mesh.spawn(
             "generator",
-            VLLMGenerator,
+            VLLMGeneratorActor,
             cfg.generator,
-            model_spec=cfg.model_spec,
+            model_config=cfg.model,
             model_path=cfg.hf_assets_path,
             compile_config=cfg.compile,
             max_num_seqs=cfg.groups_per_round * cfg.group_size,
@@ -167,7 +172,14 @@ class AsyncInferenceWorker:
         os.environ.setdefault("RANK", "0")
         await ts.initialize(mesh=generator_mesh, strategy=ts.LocalRankStrategy())
 
-        self.renderer = cfg.renderer.build(tokenizer_path=cfg.hf_assets_path)
+        tokenizer = cfg.tokenizer.build(tokenizer_path=cfg.hf_assets_path)
+        self.renderer = cfg.renderer.build(tokenizer=tokenizer)
+        # The rollouter drives its envs in its own CPU worker pool.
+        await self._rollouter.setup_async(
+            tokenizer_config=cfg.tokenizer,
+            renderer_config=cfg.renderer,
+            hf_assets_path=cfg.hf_assets_path,
+        )
         self._sampling = replace(
             cfg.generator.sampling,
             stop_token_ids=list(self.renderer.get_stop_token_ids()),
@@ -180,7 +192,7 @@ class AsyncInferenceWorker:
 
     async def _load_checkpoint(self, version: int, state_dict: dict) -> None:
         """Push the relay-fetched state dict into TorchStore under the same
-        key `PolicyTrainer.push_model_state_dict` uses, then pull it into the
+        key `Trainer.push_model_state_dict` uses, then pull it into the
         local engine through the generator's existing, unmodified endpoint."""
         await ts.put_state_dict(state_dict, "model_state_dict")
         await self.generator.pull_model_state_dict.call(version)
@@ -228,10 +240,11 @@ class AsyncInferenceWorker:
         group = await self._rollouter.run_group_rollouts(
             generate_fn=generate_fn,
             sample=self._rollouter.get_training_sample(),
-            group_id=f"worker={self.config.worker_id}/v{version}/group={index}",
+            # An int (the batcher sorts on it), unique per worker; the version
+            # travels alongside the group, not in its id.
+            group_id=self.config.worker_id * 1_000_000_000 + index,
             group_size=self.config.group_size,
             sampling=self._sampling,
-            renderer=self.renderer,
         )
         factor = self.config.round_slowdown_factor
         if factor > 1.0:
@@ -316,6 +329,7 @@ class AsyncInferenceWorker:
             await asyncio.gather(fetch, *inflight, return_exceptions=True)
 
     async def close(self) -> None:
+        await self._rollouter.close()
         if self.generator is not None:
             await self.generator.close.call()
         if self._proc_mesh is not None:
@@ -354,8 +368,10 @@ async def _main() -> None:
     worker = AsyncInferenceWorker(config)
     generator_ws = _compute_world_size(config.generator.parallelism)
     provisioner = PerHostProvisioner(total_gpus=generator_ws)
-    generator_mesh = this_host().spawn_procs(
-        per_host={"gpus": generator_ws}, bootstrap=provisioner.allocate(generator_ws)
+    generator_mesh = spawn_gpu_procs(
+        generator_ws,
+        provisioner.allocate(generator_ws),
+        bootstrap=_bootstrap_generator,
     )
     try:
         await worker.setup_async(generator_mesh=generator_mesh)

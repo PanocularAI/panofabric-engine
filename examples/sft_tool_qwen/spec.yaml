@@ -20,10 +20,10 @@ model:
 training:
   steps: 200
   seq_len: 4096
-# NOTE: do NOT set data.dataset here. The launcher would emit
-# --dataloader.dataset, which ChatDataLoader.Config has no field for, and tyro
-# aborts the run before the first step. data.dataset_path IS accepted, and
-# overrides whatever the preset points at (a local file, a dir, or a hub id).
+# NOTE: do NOT set data.dataset here. It names a torchtitan DATASETS entry,
+# which replaces the preset's whole dataset -- the tool-chat masking included.
+# data.dataset_path IS accepted, and overrides whatever the preset points at
+# (a local file, a dir, or a hub id).
 islands:
   - count: 1
     local_batch_size: 4

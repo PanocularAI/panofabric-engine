@@ -62,7 +62,7 @@ def test_diloco_state_dict_round_trip():
     actor = object.__new__(DiLoCoManagerTrainer)
     actor.model = nn.Linear(2, 2)
     optimizer = torch.optim.SGD(actor.model.parameters(), lr=0.1, momentum=0.9)
-    actor.optimizers = SimpleNamespace(optimizers=[optimizer])
+    actor.engine = SimpleNamespace(optimizers=SimpleNamespace(optimizers=[optimizer]))
 
     # Take a step so the optimizer has real momentum state to round-trip.
     actor.model(torch.randn(1, 2)).sum().backward()

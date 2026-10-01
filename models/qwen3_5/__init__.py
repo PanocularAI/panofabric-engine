@@ -15,25 +15,23 @@ matches nowhere, leaving ``A_log``/``dt_bias`` as uninitialized memory --
 ``models/qwen3_5`` builds the per-consumer mask dict and inits every parameter
 explicitly.
 
-Requires ``flash-linear-attention`` (declared in this repo's [train] extra):
-torchtitan imports it at module scope for the GatedDeltaNet kernels but declares
-it only in a VLM-CI requirements file that nothing installs.
+The GatedDeltaNet kernels come from ``attn-gym[linear]`` (a required torchtitan
+dependency since upstream #4389); ``flash-linear-attention`` is no longer needed.
 """
 
 import dataclasses
+import json
 import logging
+import os
+from dataclasses import dataclass
 
 import torch
 
-from torchtitan.experiments.torchft.config.job_config import FaultTolerantModelSpec
 from torchtitan.experiments.torchft.diloco import fragment_llm
-from torchtitan.models.qwen3_5 import (
-    parallelize_qwen3_5,
-    Qwen35StateDictAdapter,
-    qwen3_5_configs,
-)
-from torchtitan.components.optimizer import register_moe_load_balancing_hook
-from torchtitan.distributed.pipeline_parallel import pipeline_vlm
+from torchtitan.models.qwen3_5 import model_registry as _qwen35_registry, Qwen35Model
+from torchtitan.models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
+
+from panoengine.train.config import fault_tolerant
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +74,19 @@ class VerifyingQwen35StateDictAdapter(Qwen35StateDictAdapter):
     def __init__(self, model_config, hf_assets_path):
         super().__init__(model_config, hf_assets_path)
         self._expected: frozenset[str] | None = None
+        # Upstream keys a model WITHOUT a vision tower as a text-only checkpoint
+        # (``model.*``). Every published Qwen3.5 checkpoint is multimodal
+        # (``model.language_model.*`` + ``model.visual.*``), and our presets drop
+        # the tower, so loading one would ask for keys that do not exist. Key the
+        # decoder the way the checkpoint on disk does.
+        if model_config.vision_encoder is None and _checkpoint_is_multimodal(
+            hf_assets_path
+        ):
+            self.hf_language_model_prefix = "model.language_model"
+            self.from_hf_map = {
+                (f"model.language_model.{k[len('model.'):]}" if k.startswith("model.") else k): v
+                for k, v in self.from_hf_map.items()
+            }
 
     def _expected_params(self) -> frozenset[str]:
         """Parameter names of this config, from a meta build (allocates nothing)."""
@@ -118,20 +129,51 @@ class VerifyingQwen35StateDictAdapter(Qwen35StateDictAdapter):
         return tt_state_dict
 
 
+def _checkpoint_is_multimodal(hf_assets_path: str | None) -> bool:
+    """Whether the HF checkpoint at ``hf_assets_path`` keys its decoder under
+    ``model.language_model.`` -- read from the safetensors index, or from the
+    single file's header. No checkpoint (random init) means nothing to match."""
+    if not hf_assets_path:
+        return False
+    index = os.path.join(hf_assets_path, "model.safetensors.index.json")
+    if os.path.exists(index):
+        with open(index) as f:
+            keys = json.load(f)["weight_map"]
+    else:
+        single = os.path.join(hf_assets_path, "model.safetensors")
+        if not os.path.exists(single):
+            return False
+        from safetensors import safe_open
+
+        with safe_open(single, framework="pt") as f:
+            keys = f.keys()
+    return any(k.startswith("model.language_model.") for k in keys)
+
+
+class FaultTolerantQwen35Model(Qwen35Model):
+    """Qwen3.5 plus the `_fragment` hook DiLoCo splits the decoder with, loading
+    through the verifying adapter above."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Qwen35Model.Config):
+        pass
+
+    _fragment = staticmethod(fragment_llm)
+    state_dict_adapter_cls = VerifyingQwen35StateDictAdapter
+
+
 def model_registry(
     flavor: str,
-    attn_backend: str = "flex",
-    moe_comm_backend: str | None = None,
     *,
     text_only: bool = True,
-) -> FaultTolerantModelSpec:
-    """A Qwen3.5 flavor as a fault-tolerant spec (adds ``fragment_fn``).
+    enable_sp: bool = True,
+    **kwargs,
+) -> FaultTolerantQwen35Model.Config:
+    """A Qwen3.5 flavor, fault-tolerant. ``kwargs`` go to torchtitan's qwen3_5
+    ``model_registry`` (``seq_len``, ``attn_backend``, ``moe_comm_backend``).
 
-    Mirrors torchtitan's own ``qwen3_5.model_registry`` field for field --
-    including ``pipeline_vlm`` and the MoE load-balancing hook -- so a flavor
-    behaves here exactly as it does upstream. The only additions are the
-    FT wrapper and ``fragment_llm``, which is what lets HeLoCo/DiLoCo fragment
-    the decoder for cross-site sync.
+    ``enable_sp`` must match ``parallelism.enable_sequence_parallel`` (default
+    True): it picks the projection classes the sharding plan expects.
 
     ``text_only`` (the default) drops the vision tower. Every published Qwen3.5
     flavor carries one, and for a text workload it is pure cost: ~0.4B of the 9B
@@ -148,19 +190,7 @@ def model_registry(
     Pass ``text_only=False`` for a multimodal run, which also needs the
     multimodal dataloader and tokenizer (see config_registry).
     """
-    kwargs = dict(attn_backend=attn_backend)
-    if moe_comm_backend is not None:
-        kwargs["moe_comm_backend"] = moe_comm_backend
-    config = qwen3_5_configs[flavor](**kwargs)
+    config = _qwen35_registry(flavor, enable_sp=enable_sp, **kwargs)
     if text_only:
         config = dataclasses.replace(config, vision_encoder=None)
-    return FaultTolerantModelSpec(
-        name="ft/qwen3_5",
-        flavor=flavor,
-        model=config,
-        parallelize_fn=parallelize_qwen3_5,
-        pipelining_fn=pipeline_vlm,
-        post_optimizer_build_fn=register_moe_load_balancing_hook,
-        state_dict_adapter=VerifyingQwen35StateDictAdapter,
-        fragment_fn=fragment_llm,
-    )
+    return fault_tolerant(FaultTolerantQwen35Model, config)

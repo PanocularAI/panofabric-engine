@@ -1,6 +1,14 @@
+from typing import Any, Self
+
 import torch
 from torch import nn
 
+from torchtitan.config import TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.parallelism_context import ParallelismContext
+from torchtitan.protocols import BaseModel
+
+from ..infra.parallelize import parallelize_resnet
 from .args import ResNetModelArgs
 
 class ResidualBlock(nn.Module):
@@ -65,9 +73,13 @@ class BottleNeckBlock(nn.Module):
         return out
 
 
-class ResNetModel(nn.Module):
-    def __init__(self, model_args: ResNetModelArgs):
+class ResNetModel(BaseModel):
+    Config = ResNetModelArgs
+    supports_pipeline_parallel = False
+
+    def __init__(self, config: ResNetModelArgs):
         super().__init__()
+        model_args = config
 
         block = ResidualBlock if model_args.block == "ResidualBlock" else BottleNeckBlock
 
@@ -120,6 +132,8 @@ class ResNetModel(nn.Module):
                     nn.init.zeros_(module.bias)
 
             elif isinstance(module, nn.BatchNorm2d):
+                # to_empty() leaves the running stats as uninitialized memory
+                module.reset_running_stats()
                 if module.affine:
                     nn.init.ones_(module.weight)
                     nn.init.zeros_(module.bias)
@@ -142,8 +156,34 @@ class ResNetModel(nn.Module):
     def init_states(self, *, buffer_device=None) -> None:
         self.init_weights(buffer_device=buffer_device)
 
-    def verify_module_protocol(self) -> None:
-        pass
+    def preprocess_inputs(
+        self, input_dict: dict[str, Any], **kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        return input_dict["input"], input_dict["labels"], {}
+
+    def parallelize(
+        self,
+        *,
+        parallelism_context: ParallelismContext,
+        training: TrainingConfig,
+        parallelism: ParallelismConfig,
+        skip_dp: bool = False,
+        **kwargs: Any,
+    ) -> Self:
+        """Data parallelism only, as before the port: activation checkpointing
+        and compile are not applied. (The base lifecycle would also reject the
+        plain ``nn`` layers, which carry no ShardingConfig.)"""
+        if not skip_dp:
+            with parallelism_context.activate_spmd():
+                self._apply_fsdp(
+                    parallelism_context=parallelism_context,
+                    training=training,
+                    parallelism=parallelism,
+                )
+        return self
+
+    def _apply_fsdp(self, **kwargs: Any) -> None:
+        parallelize_resnet(self, **kwargs)
 
     def forward(
         self,

@@ -7,7 +7,7 @@
 # Copyright (c) Panocular AI.
 #
 # Worker launch entrypoint for every decentralized_rl coordination strategy (the
-# --config picks the strategy; mirrors torchtitan.experiments.rl.train):
+# --config picks the strategy; mirrors torchtitan.rl.train):
 #
 #   python -m panoengine.train.rl.train \
 #       --module decentralized_rl --config rl_heloco_qwen3_0_6b
@@ -32,14 +32,16 @@ import itertools  # noqa: E402
 import logging  # noqa: E402
 import socket  # noqa: E402
 
-from monarch.actor import ProcMesh, this_host  # noqa: E402
+from monarch.actor import default_bootstrap_cmd, ProcMesh, this_host  # noqa: E402
 from monarch.spmd import setup_torch_elastic_env_async  # noqa: E402
 
 from torchtitan.config import ConfigManager  # noqa: E402
-from torchtitan.tools.logging import init_logger  # noqa: E402
-from torchtitan.experiments.rl.train import (  # noqa: E402
+from torchtitan.observability.logging import init_logger  # noqa: E402
+from torchtitan.rl.train import (  # noqa: E402
+    _bootstrap_generator,
     _compute_generator_world_size,
     _compute_trainer_world_size,
+    _preimport_torch,
     PerHostProvisioner as _UpstreamProvisioner,
 )
 
@@ -102,9 +104,9 @@ class PerHostProvisioner(_UpstreamProvisioner):
     Here the bootstrap ids are drawn from the parent's visible-device pool,
     so children stay inside their replica's slice.
 
-    Lives here (not in torchtitan.experiments.rl) because we treat that base
-    RL experiment strictly as upstream: this subclass carries the one
-    behavior our launchers need that its PerHostProvisioner lacks.
+    Lives here (not in torchtitan.rl) because we treat that base RL package
+    strictly as upstream: this subclass carries the one behavior our
+    launchers need that its PerHostProvisioner lacks.
     """
 
     def __init__(self, total_gpus: int = 8):
@@ -115,7 +117,9 @@ class PerHostProvisioner(_UpstreamProvisioner):
         else:
             self.device_pool = [str(i) for i in range(total_gpus)]
 
-    def allocate(self, num_gpus: int):
+    def allocate(
+        self, num_gpus: int, *, extra_env: dict[str, str] | None = None
+    ) -> dict[str, str]:
         if num_gpus > self.available:
             raise RuntimeError(
                 f"Requested {num_gpus} GPUs but only {self.available} "
@@ -129,24 +133,41 @@ class PerHostProvisioner(_UpstreamProvisioner):
             )
         gpu_ids = self.device_pool[self.next_gpu : self.next_gpu + num_gpus]
         self.next_gpu += num_gpus
+        return {"CUDA_VISIBLE_DEVICES": ",".join(gpu_ids), **(extra_env or {})}
 
-        def _bootstrap():
-            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
-            # TODO: remove once Monarch/PyTorch fixes concurrent import during
-            # unpickling (mirrors upstream's bootstrap).
-            import torch  # noqa: F401
 
-        return _bootstrap
+def spawn_gpu_procs(num_gpus: int, env: dict[str, str], *, bootstrap=_preimport_torch):
+    """``this_host().spawn_procs`` for one role, launched with ``env`` (the
+    provisioner's CUDA_VISIBLE_DEVICES slice) -- upstream's spawn shape."""
+    return this_host().spawn_procs(
+        per_host={"gpus": num_gpus},
+        bootstrap=bootstrap,
+        bootstrap_command=default_bootstrap_cmd().with_env(env),
+    )
 
 
 def _ensure_cuda_toolchain() -> None:
-    """Point the CUDA toolchain at a >=12 toolkit before spawning actors.
+    """Point CUDA_HOME at a toolkit matching torch's CUDA before spawning actors.
 
-    vLLM's FlashInfer kernels JIT-compile with nvcc; the box's default
-    /usr/bin/nvcc may be <12. Set CUDA_HOME/PATH so the Monarch-spawned
-    generator subprocess inherits a working nvcc.
+    vLLM's FlashInfer sampler JIT-compiles with nvcc, found through CUDA_HOME and
+    then PATH, so the Monarch-spawned generator subprocess inherits whatever is
+    set here. A system /usr/bin/nvcc may be too old, or another CUDA major than
+    the one torch was built for (a cu130 torch cannot use a CUDA 12 toolkit), so
+    prefer an explicit CUDA_HOME, then the newest /usr/local/cuda-<major>*.
+
+    Only direct launches need this. controld sets VLLM_USE_FLASHINFER_SAMPLER=0
+    on every RL island (the runtime-only image has no usable nvcc: the one pip
+    ships under nvidia/cu13 is version-mixed and FlashInfer rejects it), so
+    vLLM's native sampler runs and nothing is compiled.
     """
-    for home in ("/usr/local/cuda-12.8", "/usr/local/cuda-12.3", "/usr/local/cuda-12"):
+    import glob
+
+    import torch
+
+    major = (torch.version.cuda or "").split(".")[0]
+    candidates = [os.environ["CUDA_HOME"]] if os.environ.get("CUDA_HOME") else []
+    candidates += sorted(glob.glob(f"/usr/local/cuda-{major}*"), reverse=True)
+    for home in candidates:
         if os.path.isfile(os.path.join(home, "bin", "nvcc")):
             os.environ["CUDA_HOME"] = home
             os.environ["PATH"] = (
@@ -154,7 +175,10 @@ def _ensure_cuda_toolchain() -> None:
             )
             logger.info("CUDA toolchain set to %s", home)
             return
-    logger.warning("no CUDA >=12 toolkit found; FlashInfer JIT may fail")
+    logger.warning(
+        "no CUDA %s toolkit (nvcc) found; vLLM's FlashInfer sampler cannot JIT -- "
+        "set CUDA_HOME or VLLM_USE_FLASHINFER_SAMPLER=0", major,
+    )
 
 
 async def main() -> None:
@@ -193,13 +217,12 @@ async def main() -> None:
     provisioner = PerHostProvisioner(
         total_gpus=trainer_ws + generator_ws * config.num_generators
     )
-    trainer_mesh = this_host().spawn_procs(
-        per_host={"gpus": trainer_ws}, bootstrap=provisioner.allocate(trainer_ws)
-    )
+    trainer_mesh = spawn_gpu_procs(trainer_ws, provisioner.allocate(trainer_ws))
     generator_meshes = [
-        this_host().spawn_procs(
-            per_host={"gpus": generator_ws},
-            bootstrap=provisioner.allocate(generator_ws),
+        spawn_gpu_procs(
+            generator_ws,
+            provisioner.allocate(generator_ws),
+            bootstrap=_bootstrap_generator,
         )
         for _ in range(config.num_generators)
     ]

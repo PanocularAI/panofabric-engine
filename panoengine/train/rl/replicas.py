@@ -48,7 +48,7 @@ from panoengine.decentralized.relay import (
 from panoengine.decentralized.rollout_queue import (
     RolloutQueuePopClient,
 )
-from torchtitan.experiments.rl import controller as _rl_controller_mod
+from torchtitan.rl import controller as _rl_controller_mod
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ class DiLoCoRLReplica(RLControllerMixin, RLTrainer):
 
     Unlike HeLoCoRLReplica (which drives the parameter-server sync manually at
     the window boundary), this controller runs a flat per-step RL loop: the
-    DiLoCo sync happens automatically inside ``optim_step``, via the hook
+    DiLoCo sync happens automatically inside ``optimizer_step``, via the hook
     registered in DiLoCoManagerTrainer.setup_diloco, synchronized across
     replicas through the torchft Manager/Lighthouse quorum.
     """
@@ -114,8 +114,8 @@ class DiLoCoRLReplica(RLControllerMixin, RLTrainer):
                 )
 
     async def setup_async(self, *, trainer_mesh, generator_meshes):
-        """Spawn DiLoCoManagerTrainer (not the base PolicyTrainer) and enter the
-        DiLoCo context so subsequent ``optim_step`` calls sync automatically."""
+        """Spawn DiLoCoManagerTrainer (not the base TrainerActor) and enter the
+        DiLoCo context so subsequent ``optimizer_step`` calls sync automatically."""
         cfg = self.config
         if not cfg.lighthouse_address:
             raise ValueError(
@@ -125,14 +125,14 @@ class DiLoCoRLReplica(RLControllerMixin, RLTrainer):
         # The inherited Controller.setup_async resolves the trainer actor class
         # from the rl.controller module globals at spawn time; scope-patch that
         # symbol so the base spawns DiLoCoManagerTrainer.
-        orig = _rl_controller_mod.PolicyTrainer
-        _rl_controller_mod.PolicyTrainer = DiLoCoManagerTrainer
+        orig = _rl_controller_mod.TrainerActor
+        _rl_controller_mod.TrainerActor = DiLoCoManagerTrainer
         try:
             await super().setup_async(
                 trainer_mesh=trainer_mesh, generator_meshes=generator_meshes
             )
         finally:
-            _rl_controller_mod.PolicyTrainer = orig
+            _rl_controller_mod.TrainerActor = orig
 
         await self.trainer.setup_diloco.call(
             lighthouse_address=cfg.lighthouse_address,
@@ -174,8 +174,8 @@ class HeLoCoRLReplica(RLControllerMixin, RLTrainer):
     """A single HeLoCo RL replica (worker).
 
     Subclasses the base RLTrainer to reuse its actor setup, rollout
-    collection, episode/advantage building, batching, forward_backward,
-    optim_step, and weight sync; the mixin's train loop runs windows of H
+    collection, episode/advantage building, batching, forward_backward_steps,
+    optimizer_step, and weight sync; the mixin's train loop runs windows of H
     local RL steps, and _window_sync adds the DiLoCo outer step::
 
         pull global theta  (client holds it as theta_0, done in setup_async)
@@ -272,24 +272,24 @@ class HeLoCoRLReplica(RLControllerMixin, RLTrainer):
         if not cfg.server_address:
             raise ValueError("server_address is required (set $DILOCO_SERVER_ADDR)")
 
-        # Spawn HeLoCoPolicyTrainer instead of the base PolicyTrainer. The
+        # Spawn HeLoCoPolicyTrainer instead of the base TrainerActor. The
         # inherited Controller.setup_async resolves the trainer actor class from
         # the rl.controller module globals at spawn time, so scope-patch that
         # symbol for the duration of the base setup.
-        orig = _rl_controller_mod.PolicyTrainer
-        _rl_controller_mod.PolicyTrainer = HeLoCoPolicyTrainer
+        orig = _rl_controller_mod.TrainerActor
+        _rl_controller_mod.TrainerActor = HeLoCoPolicyTrainer
         try:
             await super().setup_async(
                 trainer_mesh=trainer_mesh, generator_meshes=generator_meshes
             )
         finally:
-            _rl_controller_mod.PolicyTrainer = orig
+            _rl_controller_mod.TrainerActor = orig
 
         # Build the torchft client. Parameter names/shapes come from a throwaway
-        # meta model built from the SAME model_spec as the server's global model,
+        # meta model built from the SAME model config as the server's global model,
         # so both agree on name ordering without a runtime handshake.
         with torch.device("meta"):
-            meta_model = cfg.model_spec.model.build()
+            meta_model = cfg.model.build()
         names, shapes, dtypes = param_metadata(meta_model)
         del meta_model
         self.client = HeLoCoRLClient(
@@ -678,10 +678,10 @@ class HeLoCoAsyncInferenceReplica(PureLearnerReplica):
         )
 
         # Build the torchft client from a throwaway meta model built from the
-        # SAME model_spec as the server's global model, so both agree on
+        # SAME model config as the server's global model, so both agree on
         # parameter name ordering without a runtime handshake.
         with torch.device("meta"):
-            meta_model = cfg.model_spec.model.build()
+            meta_model = cfg.model.build()
         names, shapes, dtypes = param_metadata(meta_model)
         del meta_model
         self.client = HeLoCoRLClient(

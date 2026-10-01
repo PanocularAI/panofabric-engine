@@ -340,7 +340,7 @@ class _FakeRollouter:
         return "sample"
 
     async def run_group_rollouts(
-        self, *, generate_fn, sample, group_id, group_size, sampling, renderer
+        self, *, generate_fn, sample, group_id, group_size, sampling
     ):
         self.groups_run.append(group_id)
         return group_id  # stands in for a real RolloutGroup
@@ -426,14 +426,15 @@ def _group(num_tokens=4, reward=0.5):
 
 
 def _packed(min_policy_versions):
-    """A fake TrainingBatch as the packing Batcher would return it under the
-    current pipeline: one microbatch, a valid-token count, and the per-sample
-    generator policy versions the staleness panel reads."""
+    """What the packing Batcher returns for a group under the current pipeline:
+    ``(batch, group_is_trainable)``, the batch being one microbatch, a
+    valid-token count, and the per-sample generator policy versions the
+    staleness panel reads."""
     return SimpleNamespace(
         microbatches=["mb"],
         num_global_valid_tokens=4,
         min_policy_versions=list(min_policy_versions),
-    )
+    ), True
 
 
 def _passthrough_pipeline(r, *, min_policy_versions=(0,)):
@@ -602,8 +603,8 @@ def test_train_end_to_end_pure_learner_on_fakes():
 
         r.trainer = SimpleNamespace(
             sync_log_step=_ep(_noop),
-            forward_backward=_ep(lambda mb, n: _return({"loss": 0.25})),
-            optim_step=_ep(
+            forward_backward_steps=_ep(lambda mbs, n: _return({"loss/mean": 0.25})),
+            optimizer_step=_ep(
                 lambda: _return(SimpleNamespace(policy_version=next(versions)))
             ),
             get_full_state_dict_cpu=_ep(get_full),

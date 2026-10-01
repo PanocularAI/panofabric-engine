@@ -14,8 +14,8 @@ TORCHTITAN_DIR ?= $(FORKS_DIR)/torchtitan
 TORCHFT_DIR    ?= $(FORKS_DIR)/torchft
 TORCHTITAN_URL ?= https://github.com/PanocularAI/torchtitan.git
 TORCHFT_URL    ?= https://github.com/PanocularAI/torchft.git
-TORCHTITAN_REF ?= 057eb4c77e8e0c8683fd85402c13cddecdf4d494
-TORCHFT_REF    ?= edad86ca1c8a95195961e555cf0ab3982bb860f7
+TORCHTITAN_REF ?= 3058f9779f43e887422da6dfe7fb8ca4b1afbccb
+TORCHFT_REF    ?= 716bff9584a9e0613dd07f1837a63a9f2e3583b4
 
 TORCH_SPEC ?= torch
 PYTORCH_BASE_URL ?= https://download.pytorch.org/whl/nightly
@@ -148,14 +148,9 @@ install-torchtt-ft: forks
 	# imports it but declares it in neither its pyproject nor requirements.txt, so
 	# that recipe fails to import on a node without this line. Unpinned deliberately
 	# (the backend's own 4.57 pin predates the 5.x we run locally, matched to vLLM).
+	# (Qwen3.5's GatedDeltaNet kernels now come from attn-gym, a declared torchtitan
+	# dependency, so flash-linear-attention is no longer installed here.)
 	$(UV_PIP_CMD) transformers
-	# flash-linear-attention: the same gap for Qwen3.5. torchtitan's native
-	# models/qwen3_5 imports `fla` at MODULE scope for the GatedDeltaNet kernels but
-	# declares it only in .ci/docker/requirements-vlm.txt, which the requirements.txt
-	# line above does not pull. Without it `--module models.qwen3_5` cannot import,
-	# which is what pushed a customer onto the HF backend (where a hybrid model
-	# silently NaNs instead of failing loudly).
-	$(UV_PIP_CMD) flash-linear-attention
 
 # ------------------------------------------------- RL runtime (PF_RL=1)
 # The decentralized-RL engine needs a stack the training-only env does NOT: vLLM (the
@@ -174,13 +169,19 @@ install-torchtt-ft: forks
 #     flash_attn_interface on Hopper+; pre-Hopper (e.g. L40S/Ada) falls back to FA2.
 #   - math-verify is the dapo_math example rubric's dep; cheap and pure-python, so it
 #     rides here rather than needing model.requirements (whose file is not packaged).
-# Verified resolvable on python 3.13 (this Makefile's PYTHON_VERSION) 2026-08-18.
-RL_TORCHMONARCH_VERSION ?= 0.7.0.dev20260805
-RL_TORCHSTORE_SHA ?= 5a4d5d3f4d653f2ed7cc913a66e49f822dfd6c1d
-RL_RENDERERS_VERSION ?= 0.1.9
+#   - renderers is pinned EXACTLY by torchtitan itself (==0.1.11 at a182e530).
+#   - TORCH_VERSION is the nightly the vllm/torchvision wheels below were built against
+#     (same date); the image build reads it from here. torchtitan at a182e530 needs a
+#     2.15 nightly (torch.distributed.config.pipeline_per_edge_p2p).
+# Resolved together 2026-09-30 from the pytorch cu130 nightly index, the way
+# torchtitan's own RL CI installs them.
+TORCH_VERSION ?= 2.15.0.dev20260928
+RL_TORCHMONARCH_VERSION ?= 0.7.0.dev20260930
+RL_TORCHSTORE_SHA ?= a80f8cae60ed9336b547fded9108f4df8222f0e8
+RL_RENDERERS_VERSION ?= 0.1.11
 RL_FLASH_ATTN_3_VERSION ?= 3.0.0
-RL_VLLM_VERSION ?= 1.0.0.dev20260804
-RL_TORCHVISION_VERSION ?= 0.29.0.dev20260805
+RL_VLLM_VERSION ?= 1.0.0.dev20260928
+RL_TORCHVISION_VERSION ?= 0.30.0.dev20260928
 RL_MATH_VERIFY_VERSION ?= 0.9.0
 
 install-rl: export VIRTUAL_ENV := $(abspath $(VENV))
@@ -201,6 +202,7 @@ install-rl:
 	  --extra-index-url "$$index_url" --index-strategy unsafe-best-match; \
 	$(UV_PIP_CMD) "torchmonarch==$(RL_TORCHMONARCH_VERSION)" \
 	  "renderers==$(RL_RENDERERS_VERSION)" pygtrie portpicker \
+	  opentelemetry-sdk opentelemetry-exporter-otlp-proto-http \
 	  "math-verify==$(RL_MATH_VERIFY_VERSION)"; \
 	$(UV_PIP_CMD) --no-deps \
 	  "torchstore @ https://github.com/meta-pytorch/torchstore/archive/$(RL_TORCHSTORE_SHA).tar.gz"; \

@@ -176,14 +176,14 @@ def _has_weights(assets_path: str | None) -> bool:
     return any(next(d.glob(g), None) is not None for g in _WEIGHT_GLOBS)
 
 
-def build_global_model(model_spec, hf_assets_path: str) -> nn.Module:
+def build_global_model(model_config, hf_assets_path: str) -> nn.Module:
     """Build the authoritative *unsharded fp32 CPU* global model.
 
     Mirrors the base trainer's build path (meta -> to_empty -> init_weights ->
     optional HF load) but WITHOUT parallelism, so the server holds one whole
     replicated copy. The named_parameters() order matches both the orchestrator's
     metadata model and the trainer's get_model_state_dict FQNs (all built from
-    the same model_spec), which is what keeps the wire transfer aligned.
+    the same model config), which is what keeps the wire transfer aligned.
 
     Replicas adopt these weights on their first pull, so this is the shared
     starting point for the whole swarm.
@@ -194,12 +194,13 @@ def build_global_model(model_spec, hf_assets_path: str) -> nn.Module:
     )
 
     with torch.device("meta"):
-        model = model_spec.model.build()
+        model = model_config.build()
     model.to_empty(device="cpu")
     with torch.no_grad():
         model.init_weights(buffer_device=None)
 
-    if model_spec.state_dict_adapter is not None:
+    adapter_cls = type(model).state_dict_adapter_cls
+    if adapter_cls is not None:
         import torch.distributed.checkpoint as dcp
         from torch.distributed.checkpoint.api import CheckpointException
 
@@ -211,9 +212,7 @@ def build_global_model(model_spec, hf_assets_path: str) -> nn.Module:
         # start for from-scratch pretraining; a fine-tune must NOT silently
         # start from random init, hence the distinct log lines.
         if _has_weights(hf_assets_path):
-            adapter = model_spec.state_dict_adapter(
-                model_spec.model, hf_assets_path
-            )
+            adapter = adapter_cls(model_config, hf_assets_path)
             try:
                 storage_reader = adapter.get_hf_storage_reader(hf_assets_path)
                 hf_sd = adapter.to_hf(model.state_dict())
@@ -694,7 +693,7 @@ def main() -> None:
         help="outer-step commits between relay publishes",
     )
     parser.add_argument("--publish_poll_interval_s", type=float, default=1.0)
-    # Config selects the model_spec / hf_assets_path (same registry the
+    # Config selects the model / hf_assets_path (same registry the
     # replicas use), e.g. --module decentralized_rl --config rl_heloco_qwen3_0_6b.
     # --hf_assets_path overrides the preset's default checkpoint dir so the
     # global model loads the exact checkpoint the trainers load (launchers
@@ -708,13 +707,9 @@ def main() -> None:
 
     cfg_args = ["--module", args.module, "--config", args.config]
     if args.hf_assets_path:
-        # Env (not just the CLI overlay): the rl_*_hf presets resolve the
-        # ARCHITECTURE from RL_HF_ASSETS_PATH at config-fn time; the flag
-        # overlay below only retargets where the checkpoint loads from.
-        os.environ["RL_HF_ASSETS_PATH"] = args.hf_assets_path
         cfg_args.append(f"--hf_assets_path={args.hf_assets_path}")
     replica_cfg = ConfigManager().parse_args(cfg_args)
-    model = build_global_model(replica_cfg.model_spec, replica_cfg.hf_assets_path)
+    model = build_global_model(replica_cfg.model, replica_cfg.hf_assets_path)
     param_names, _, _ = param_metadata(model)
 
     server = build_server(

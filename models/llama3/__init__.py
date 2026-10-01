@@ -4,35 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchtitan.distributed.pipeline_parallel import pipeline_llm
-from torchtitan.experiments.torchft.config.job_config import FaultTolerantModelSpec
-from torchtitan.experiments.torchft.diloco import fragment_llm
-from torchtitan.models.llama3 import (
-    llama3_configs,
-    Llama3StateDictAdapter,
-    parallelize_llama,
-)
-from torchtitan.models.utils import validate_converter_order
-from torchtitan.protocols.model import ModelConfigConverter
+# torchtitan's own fault-tolerant llama3: the native model plus the `_fragment`
+# hook DiLoCo splits it with. Re-exported so every recipe is `models.<pkg>`.
+from torchtitan.experiments.torchft.llama3 import model_registry
 
-
-def model_registry(
-    flavor: str,
-    attn_backend: str = "flex",
-    converters: list[ModelConfigConverter.Config] | None = None,
-) -> FaultTolerantModelSpec:
-    config = llama3_configs[flavor](attn_backend=attn_backend)
-    if converters is not None:
-        validate_converter_order(converters)
-        for c in converters:
-            c.build().convert(config)
-    return FaultTolerantModelSpec(
-        name="torchft/llama3",
-        flavor=flavor,
-        model=config,
-        parallelize_fn=parallelize_llama,
-        pipelining_fn=pipeline_llm,
-        post_optimizer_build_fn=None,
-        state_dict_adapter=Llama3StateDictAdapter,
-        fragment_fn=fragment_llm,
-    )
+__all__ = ["model_registry"]

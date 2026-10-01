@@ -49,7 +49,7 @@ CUDA_VERSION="${CUDA_VERSION:-13.0.3}"        # nvidia/cuda base image tag; keep
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 PROTOC_VERSION="${PROTOC_VERSION:-32.0}"
 PYTORCH_BASE_URL="${PYTORCH_BASE_URL:-https://download.pytorch.org/whl/nightly}"
-TORCH_VERSION="${TORCH_VERSION:-}"            # exact nightly pin (e.g. 2.14.0.dev20260804); empty = newest
+TORCH_VERSION="${TORCH_VERSION:-}"            # exact nightly pin; default: the Makefile's TORCH_VERSION
 
 PUSH="${PUSH:-0}"
 EXTRA_BUILD_ARGS=("$@")   # e.g. --no-cache, --progress=plain
@@ -124,6 +124,8 @@ mk_var() {  # <NAME> -> the Makefile's `NAME ?= value`
   [[ -n "$v" ]] || { echo "ERROR: $1 not found in Makefile" >&2; exit 1; }
   echo "$v"
 }
+# The torch nightly must be the one the vllm/torchvision wheels were built against.
+TORCH_VERSION="${TORCH_VERSION:-$(mk_var TORCH_VERSION)}"
 RL_ARGS=(
   --build-arg TORCHVISION_VERSION="$(mk_var RL_TORCHVISION_VERSION)"
   --build-arg VLLM_VERSION="$(mk_var RL_VLLM_VERSION)"

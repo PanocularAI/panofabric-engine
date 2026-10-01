@@ -32,8 +32,10 @@ Training on tool results teaches the model to hallucinate results instead of
 waiting for them, so they stay masked. Each trained span **includes** its
 `<|im_end|>` terminator, or the model never learns to stop a tool call.
 
-torchtitan's own `ChatDataset` cannot express this: it hard-rejects anything but
-`[user, assistant]` and masks a single prompt prefix. `tool_chat.py` renders the
+torchtitan's own `ChatProcessor` cannot express this: its template path
+hard-rejects anything but `[user, assistant]` and masks a single prompt prefix,
+and its `renderers` path never passes `tools`, so the schemas never reach the
+prompt. `tool_chat.py`'s `ToolChatProcessor` renders the
 whole conversation once through the model's own chat template (tool schemas
 included), tokenizes once, and unmasks every span following the template's
 assistant header — derived from the template itself, so no hardcoded token ids.
@@ -92,7 +94,7 @@ Three sources, all through the same loader:
 | source | how |
 |---|---|
 | the packaged `data.json` | the default; travels inside the overlay |
-| a hub dataset, streamed | `sft_tool_qwen_hermes` — `load_dataset_kwargs={"streaming": True}` |
+| a hub dataset, streamed | `sft_tool_qwen_hermes` — torchtitan's `HuggingFaceStreamingSource` |
 | a path on shared storage | `data.dataset_path` in the spec, or in the preset |
 
 `data.json` ships inside the overlay only because it is tiny — the upload cap is
@@ -102,13 +104,16 @@ channel". Treat it as the smoke-test fixture, not the mechanism.
 
 **Streaming** is the normal answer for real data. `sft_tool_qwen_hermes` streams
 `NousResearch/hermes-function-calling-v1`: nothing is downloaded up front, and
-`ChatDataset` shards the stream per node with `split_dataset_by_node`,
-buffer-shuffles it, and re-loops via `set_epoch`. The one thing streaming gives
-up is exact resume — `ChatDataset` can only `.skip()` a map-style dataset, so a
-restart replays the shard from its start instead of the exact sample. For a
-short SFT run that is nothing; for a long one, prefer a map-style local copy.
+`HuggingFaceStreamingSource` shards the stream per DP rank, window-shuffles it,
+re-loops it, and keeps its cursor in the dataloader checkpoint, so a restart
+resumes the stream instead of replaying the shard.
 
-Per-dataset shape lives in the `sample_processor`, which is why it is a Python
+Every source goes through the same Grain pipeline: `ToolChatProcessor` masks each
+trajectory, oversized ones are dropped, and `FirstFitPackingConfig` packs whole
+trajectories into each `num_tokens_per_microbatch_per_dp_rank` microbatch with
+per-document positions, which the `block_causal` mask uses to keep them apart.
+
+Per-dataset shape lives in the `messages_fn`, which is why it is a Python
 callable and can never come from the spec: `conversation_processor` reads the
 packaged file, `sharegpt_processor` maps Hermes' `from`/`value` turns. Hermes
 also shows a trap worth naming — it embeds the `<tools>` block in its own system
@@ -138,17 +143,16 @@ F1, over-call rate on no-tool prompts, end-to-end task success.
 - `add_generation_prompt=False` on the full render is load-bearing.
   `HFBackendTokenizer` defaults it to **True**, which appends a dangling
   `<|im_start|>assistant` the mask then trains the model to emit after every
-  answer. torchtitan's `ChatDataset` has this bug today.
+  answer. torchtitan's `ChatProcessor` still has this bug under
+  `HFBackendTokenizer`.
 - Qwen3-4B has tied word embeddings; FSDP shards `tok_embeddings` and `lm_head`
   into separate groups and rejects a tied weight spanning both. The preset
   reuses the engine's `_untied_flavor`, whose state-dict adapter aliases the
   tied checkpoint into the untied `lm_head` at load.
-- `parallelism.spmd_backend = "partial_dtensor"` is required — the HF
-  transformers backend raises `NotImplementedError` under `spmd_types`. The
-  engine's own `hf_full` / `hf_finetune` presets do not set it.
-- Do **not** set `data.dataset` in the spec. The launcher emits
-  `--dataloader.dataset`, which `ChatDataLoader.Config` has no field for, and
-  tyro aborts the run before the first step.
+- Do **not** set `data.dataset` in the spec: it names a torchtitan `DATASETS`
+  entry, which replaces the preset's whole dataset — `ToolChatProcessor` and its
+  masking included. `data.dataset_path` is fine: it only replaces the source's
+  path.
 - Enabling this required one control-plane change (already applied in
   `panofabric`): a code overlay naming `model.hf_model` now gets that repo's
   weights fetched, and `hf_model` is legal alongside `model.code`. Before it,

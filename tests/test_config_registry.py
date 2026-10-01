@@ -13,7 +13,7 @@
 #   1. the canonical `config_registry` module imports            (catches dead imports)
 #   2. every zero-arg config factory constructs without raising  (catches API drift)
 #   3. the result is a buildable `*.Config`                      (right return type)
-#   4. it carries the fields the drift used to drop (`loss`, `model_spec`)
+#   4. it carries the fields the drift used to drop (`loss`, `model`)
 #   5. the FT topology invariants from the roadmap (§1.1 / §4.0) hold:
 #        - data_parallel_replicate_degree == 1 when fault_tolerance.enable
 #        - sync_steps % num_fragments == 0 for DiLoCo
@@ -135,7 +135,29 @@ def test_config_constructs(model: str, fn_name: str, fn) -> None:
 
     # Fields the drift used to drop entirely.
     assert getattr(cfg, "loss", None) is not None, f"{where}: loss is unset (drift regression)"
-    assert getattr(cfg, "model_spec", None) is not None, f"{where}: model_spec is unset"
+    assert getattr(cfg, "model", None) is not None, f"{where}: model is unset"
+
+
+@pytest.mark.parametrize("model,fn_name,fn", CASES)
+def test_model_builds_on_meta(model: str, fn_name: str, fn) -> None:
+    """The model config survives what the trainer does to it first --
+    ``update_from_config`` then ``build`` -- on the meta device (allocates nothing).
+    Catches a config tree an upstream refactor left unbuildable, which
+    construction alone does not. The HF backend is skipped: its update reads the
+    repo's config.json from the Hub."""
+    if model == "hf_transformers":
+        pytest.skip("needs the HF Hub")
+    import torch
+
+    cfg = fn()
+    if model == "lora":  # LoRA rewrites the model in build(); do the same here
+        from models.lora.config_registry import apply_lora
+
+        apply_lora(cfg)
+    cfg.model.update_from_config(config=cfg)
+    with torch.device("meta"):
+        built = cfg.model.build()
+    assert sum(p.numel() for p in built.parameters()) > 0, f"{model}.{fn_name}: no parameters"
 
 
 @pytest.mark.parametrize("model,fn_name,fn", CASES)

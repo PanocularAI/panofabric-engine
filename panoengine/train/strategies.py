@@ -56,9 +56,9 @@ private ``_StreamingDiLoCoFragment``) and the additive ``manager.py`` /
 
 import sys
 
-from torchtitan.components.optimizer import OptimizersContainer, default_adamw
+from torchtitan.components.optimizer import AdamW, OptimizersContainer
 from torchtitan.experiments.torchft.config.job_config import FaultTolerance
-from torchtitan.experiments.torchft.optimizer import default_ft_adamw
+from torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainer
 
 __all__ = ["semi_sync", "adamw"]
 
@@ -137,7 +137,9 @@ def semi_sync(
 def adamw(lr: float = 8e-4, **kwargs) -> OptimizersContainer.Config:
     """The optimizer every recipe under ``models/`` shares -- FT-aware.
 
-    ``default_ft_adamw`` builds a ``TorchFTOptimizersContainer``, and the FT trainer
+    One catch-all ``AdamW`` (``kwargs`` are ``AdamW.Config`` fields; its defaults are
+    betas (0.9, 0.95), eps 1e-8, weight_decay 0.1), in a ``TorchFTOptimizersContainer``
+    unless the run is centralized. The FT trainer
     picks that container purely from the config TYPE
     (``experiments/torchft/trainer.py``: ``isinstance(config.optimizer,
     TorchFTOptimizersContainer.Config)``). Its ``__init__`` then reads
@@ -154,6 +156,9 @@ def adamw(lr: float = 8e-4, **kwargs) -> OptimizersContainer.Config:
     Standalone (``./run_train.sh`` with no FT flags) keeps the FT optimizer, which
     is what the presets' ``semi_sync()`` block expects.
     """
-    if _FT_DISABLED_FLAG in sys.argv:
-        return default_adamw(lr, **kwargs)
-    return default_ft_adamw(lr, **kwargs)
+    container = (
+        OptimizersContainer
+        if _FT_DISABLED_FLAG in sys.argv
+        else TorchFTOptimizersContainer
+    )
+    return container.Config(optimizers=[AdamW.Config(pattern=r".*", lr=lr, **kwargs)])

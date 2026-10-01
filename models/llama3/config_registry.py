@@ -4,24 +4,28 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.optimizer import LRSchedulersContainer
-from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.validate import Validator
-from torchtitan.config import CommConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config import CommConfig, TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
+from torchtitan.hf_datasets.text_datasets import DATASETS
+from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.observability.metrics import MetricsProcessor
+from torchtitan.observability.profiler import Profiler
+
+from panoengine.train.config import EngineTrainer
 from panoengine.train.strategies import adamw, semi_sync
-from torchtitan.experiments.torchft.trainer import FaultTolerantTrainer
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
-from torchtitan.tools.profiler import Profiler
 
 from . import model_registry
 
 
-def llama3_8b() -> FaultTolerantTrainer.Config:
-    return FaultTolerantTrainer.Config(
-        loss=CrossEntropyLoss.Config(),
+def llama3_8b() -> EngineTrainer.Config:
+    model = model_registry("8B", seq_len=8192)
+    return EngineTrainer.Config(
+        loss=CrossEntropyLoss.Config(global_vocab_size=decoder_vocab_size(model)),
         hf_assets_path="./assets/hf/Llama-3.1-8B",
         dump_folder="./outputs",
         profiler=Profiler.Config(
@@ -35,19 +39,19 @@ def llama3_8b() -> FaultTolerantTrainer.Config:
             save_tb_folder="tb",
             enable_wandb=False,
         ),
-        model_spec=model_registry("8B"),
+        model=model,
         optimizer=adamw(lr=3e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=200,
         ),
         training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=8192,
+            num_tokens_per_microbatch_per_dp_rank=1 * 8192,
+            max_context_length=8192,
             max_norm=1.0,
             steps=1000,
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(
-            dataset="c4",
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4"]),
         ),
         parallelism=ParallelismConfig(
             data_parallel_replicate_degree=1,
@@ -56,8 +60,7 @@ def llama3_8b() -> FaultTolerantTrainer.Config:
             pipeline_parallel_degree=1,
             context_parallel_degree=1,
         ),
-        checkpoint=TorchFTCheckpointManager.Config(
-            enable=False,
+        checkpointer=TorchFTCheckpointManager.Config(
             enable_ft_dataloader_checkpoints=False,
             folder="checkpoint",
             interval=500,
@@ -66,14 +69,13 @@ def llama3_8b() -> FaultTolerantTrainer.Config:
         ),
         activation_checkpoint=SelectiveAC.Config(),
         fault_tolerance=semi_sync(),
-        validator=Validator.Config(
-            enable=False,
-        ),
     )
 
-def llama3_debugmodel() -> FaultTolerantTrainer.Config:
-    return FaultTolerantTrainer.Config(
-        loss=CrossEntropyLoss.Config(),
+
+def llama3_debugmodel() -> EngineTrainer.Config:
+    model = model_registry("debugmodel", seq_len=2048)
+    return EngineTrainer.Config(
+        loss=CrossEntropyLoss.Config(global_vocab_size=decoder_vocab_size(model)),
         # The forks are SIBLINGS now, not submodules (no ./torchtitan here).
         # Only a bare local run uses this; the launcher always passes
         # --hf_assets_path explicitly.
@@ -92,7 +94,7 @@ def llama3_debugmodel() -> FaultTolerantTrainer.Config:
             save_tb_folder="tb",
             enable_wandb=False,
         ),
-        model_spec=model_registry("debugmodel"),
+        model=model,
         optimizer=adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
@@ -101,13 +103,13 @@ def llama3_debugmodel() -> FaultTolerantTrainer.Config:
             min_lr_factor=0.0,
         ),
         training=TrainingConfig(
-            local_batch_size=8,
-            seq_len=2048,
+            num_tokens_per_microbatch_per_dp_rank=8 * 2048,
+            max_context_length=2048,
             max_norm=1.0,
             steps=100,
         ),
-        dataloader=HuggingFaceTextDataLoader.Config(
-            dataset="c4_test",
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
         ),
         parallelism=ParallelismConfig(
             data_parallel_replicate_degree=1,
@@ -116,8 +118,7 @@ def llama3_debugmodel() -> FaultTolerantTrainer.Config:
             pipeline_parallel_degree=1,
             context_parallel_degree=1,
         ),
-        checkpoint=TorchFTCheckpointManager.Config(
-            enable=False,
+        checkpointer=TorchFTCheckpointManager.Config(
             enable_ft_dataloader_checkpoints=False,
             folder="checkpoint",
             interval=10,
@@ -127,9 +128,4 @@ def llama3_debugmodel() -> FaultTolerantTrainer.Config:
         activation_checkpoint=SelectiveAC.Config(),
         comm=CommConfig(train_timeout_seconds=15),
         fault_tolerance=semi_sync(),
-        validator=Validator.Config(
-            enable=False,
-            freq=5,
-            steps=10,
-        ),
     )

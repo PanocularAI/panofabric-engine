@@ -40,6 +40,6 @@ def test_standalone_launch_keeps_the_ft_container():
 def test_lr_and_kwargs_reach_both_paths():
     for extra in ([FLAG], ["--fault_tolerance.enable"]):
         sys.argv[:] = ["torchtitan.train", *extra]
-        group = adamw(lr=1.5e-4, eps=1e-9).param_groups[0]
-        assert group.optimizer_kwargs["lr"] == 1.5e-4
-        assert group.optimizer_kwargs["eps"] == 1e-9
+        opt = adamw(lr=1.5e-4, eps=1e-9).optimizers[0]
+        assert opt.lr == 1.5e-4
+        assert opt.eps == 1e-9

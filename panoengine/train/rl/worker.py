@@ -207,15 +207,22 @@ class AsyncInferenceWorker:
         """Generate ONE rollout group and return ``(group, version)``, where
         version is the checkpoint the group was SPAWNED under -- the send must
         tag it with that, not with whatever the worker holds at send time (a
-        checkpoint may swap while the group is in flight). Mirrors
-        AsyncInferenceReplica._collect_groups_on's generate_fn wiring (same
-        rollouter.run_group_rollouts contract), minus the training-batch
-        plumbing this role has no use for -- the trainer assembles training
-        batches from these groups itself once they land in its buffer.
+        checkpoint may swap while the group is in flight). Mirrors the
+        controller's _make_generate_fn wiring (same rollouter.run_group_rollouts
+        contract), minus the training-batch plumbing this role has no use for --
+        the trainer assembles training batches from these groups itself once
+        they land in its buffer.
 
         round_slowdown_factor (heterogeneous-hardware emulation) stretches the
         group's own duration, keeping its concurrency slot occupied the way a
         slower inference GPU would."""
+
+        # The rollouter ships generate_fn to its CPU rollout-worker process, so
+        # the closure must capture the generator handle, not `self`: pickling
+        # the whole worker (datasets, relay and queue clients) took ~0.8 s of
+        # event-loop time per group, which starved the relay download -- a
+        # 1.5 GB checkpoint took minutes and generation ran 3-4 versions stale.
+        generator = self.generator
 
         async def generate_fn(
             prompt_token_ids,
@@ -224,7 +231,7 @@ class AsyncInferenceWorker:
             routing_session_id=None,
             sampling_config=None,
         ):
-            result = await self.generator.generate.call(
+            result = await generator.generate.call(
                 prompt_token_ids,
                 request_id=request_id,
                 # VLLMGenerator.generate requires this for its intra-mesh DP

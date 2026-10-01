@@ -187,7 +187,14 @@ class RelayServer:
         self._manifests: dict[int, CheckpointManifest] = {}
 
     def latest_version(self) -> int | None:
-        return max(self._manifests) if self._manifests else None
+        """The newest version whose shards have ALL landed. A publish posts its
+        manifest before its shards, so the newest manifest can name shards still
+        in flight (or never coming: a trainer that exits mid-publish); a fetcher
+        handed it gets 404s and re-downloads the shards that did land on every
+        retry."""
+        complete = [v for v, m in self._manifests.items()
+                    if len(self._shards.get(v, {})) == m.num_shards]
+        return max(complete) if complete else None
 
     def _evict_old(self) -> None:
         if len(self._manifests) <= self.retain_last:

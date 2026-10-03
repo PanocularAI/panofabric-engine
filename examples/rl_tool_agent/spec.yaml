@@ -1,0 +1,36 @@
+# RL for a tool-calling agent whose loop is your own code: Qwen3.5-9B on one
+# H100:8 island (trainer TP=4 + four generators), nothing synchronized.
+#
+# Submit with:
+#   panofabric run submit spec.yaml --code models/rl_tool_agent
+#
+# model.hf_model makes the scheduler fetch Qwen3.5-9B's tokenizer AND
+# safetensors into the island's assets dir; the preset starts from them.
+name: rl-tool-agent
+workload:
+  kind: rl
+  sync:
+    # One island training by itself (rl_solo_*): no sync hub, no weights shipped
+    # between processes. For several islands use `method: heloco` -- the same
+    # preset name runs as rl_heloco_*.
+    method: none
+    sync_steps: 10      # steps per window: the validation and logging cadence
+model:
+  module: models.rl_tool_agent
+  preset: rl_solo_tool_agent_qwen3_5_9b
+  hf_model: Qwen/Qwen3.5-9B
+training:
+  steps: 100
+fabric:
+  islands:
+    - count: 1
+      role: trainer
+      resources:
+        accelerators: "H100:8"
+        # Host RAM. Slurm's default is 4 GB per vCPU x 4 vCPUs per GPU = 128 GB
+        # here, tight for four trainer ranks reading a 19 GB checkpoint. 
+        memory: "256+"
+        # cloud ("nebius", "aws/us-east-1") or enrolled backend ("ssh/<pool>",
+        # "slurm/<cluster>[/<partition>]", "k8s/<ctx>"). `panofabric backend list`
+        # prints the exact strings; omit the field to let PanoFabric pick.
+        infra: "nebius"

@@ -264,6 +264,61 @@ def test_dapo_math_decoupled_presets():
     assert worker.generator.sampling.max_tokens == 8192
 
 
+def test_qwen3_5_presets():
+    """Qwen3.5 rides every strategy with upstream's recipe for it (eager, chunked
+    loss, fp32 lm_head), through the engine's text-only model with the verifying
+    adapter, and with ITS renderer: the qwen3 one reads Qwen3.5's XML tool calls
+    as invalid JSON."""
+    from renderers import Qwen35RendererConfig
+    from torchtitan.components.loss import ChunkedLossWrapper
+    from models.qwen3_5 import FaultTolerantQwen35Model
+    from panoengine.train.rl import config_registry as reg
+
+    small = reg.rl_heloco_qwen3_5_0_8b()
+    assert isinstance(small.model, FaultTolerantQwen35Model.Config)
+    assert small.model.vision_encoder is None
+    assert type(small.model.lm_head).__qualname__ == "CastLinear.Config"
+    assert isinstance(small.renderer.renderers_config, Qwen35RendererConfig)
+    assert small.compile is None
+    assert isinstance(small.trainer.loss, ChunkedLossWrapper.Config)
+    assert small.hf_assets_path == _DEFAULT_HF_ASSETS_PATH[("qwen3_5", "0.8B")]
+    # ~108 GB per full checkpoint at 9B: keep two, not torchtitan's ten.
+    assert small.trainer.checkpointer.keep_latest_k == 2
+
+    # 9B colocated = one H100:8 island: trainer TP=4 (4 KV heads cap it) + 4 engines.
+    nine = reg.rl_heloco_qwen3_5_9b()
+    assert nine.trainer.parallelism.tensor_parallel_degree == 4
+    assert nine.model.first_attention.n_kv_heads % 4 == 0
+    assert nine.num_generators == 4
+    assert reg.rl_diloco_qwen3_5_9b().num_generators == 4
+    assert reg.rl_heloco_async_inference_qwen3_5_9b().num_generators == 0
+
+    # The launcher derives every decoupled worker preset by name.
+    for seg in ("rl_heloco_async_inference", "rl_async_inference"):
+        for size in ("0_8b", "9b"):
+            worker = getattr(reg, f"{seg}_worker_qwen3_5_{size}")()
+            assert isinstance(worker.renderer.renderers_config, Qwen35RendererConfig)
+
+
+def test_solo_presets_need_no_coordination():
+    """rl_solo_* is what controld launches for `sync: {method: none}` without
+    generator islands: one island, no lighthouse/parameter-server wiring at all,
+    the same run-bound contract as the other strategies."""
+    from panoengine.train.rl import config_registry as reg
+    from panoengine.train.rl.replicas import SoloRLReplica
+
+    for name in ("rl_solo_qwen3_0_6b", "rl_solo_llama3_8b", "rl_solo_qwen3_5_0_8b"):
+        cfg = getattr(reg, name)()
+        assert isinstance(cfg, SoloRLReplica.Config)
+        assert not hasattr(cfg, "lighthouse_address")
+        assert not hasattr(cfg, "server_address")
+    nine = reg.rl_solo_qwen3_5_9b()
+    assert nine.num_generators == 4
+    assert nine.trainer.parallelism.tensor_parallel_degree == 4
+    with pytest.raises(ValueError, match="exactly one"):
+        reg.rl_solo_qwen3_0_6b(train_seconds=0.0)
+
+
 # === controller.py =========================================================
 
 

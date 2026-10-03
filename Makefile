@@ -170,6 +170,10 @@ install-torchtt-ft: forks
 #   - math-verify is the dapo_math example rubric's dep; cheap and pure-python, so it
 #     rides here rather than needing model.requirements (whose file is not packaged).
 #   - renderers is pinned EXACTLY by torchtitan itself (==0.1.11 at a182e530).
+#   - verifiers runs bring-your-own agent harnesses (torchtitan's verifiers bridge targets
+#     0.3.1). It needs mcp<2 (it imports mcp.server.fastmcp); this vLLM DECLARES mcp>=2 but
+#     only imports it lazily for --tool-server, through APIs mcp 1.x has. So mcp is
+#     overridden to verifiers' range, as in the image.
 #   - TORCH_VERSION is the nightly the vllm/torchvision wheels below were built against
 #     (same date); the image build reads it from here. torchtitan at a182e530 needs a
 #     2.15 nightly (torch.distributed.config.pipeline_per_edge_p2p).
@@ -183,6 +187,7 @@ RL_FLASH_ATTN_3_VERSION ?= 3.0.0
 RL_VLLM_VERSION ?= 1.0.0.dev20260928
 RL_TORCHVISION_VERSION ?= 0.30.0.dev20260928
 RL_MATH_VERIFY_VERSION ?= 0.9.0
+RL_VERIFIERS_VERSION ?= 0.3.1
 
 install-rl: export VIRTUAL_ENV := $(abspath $(VENV))
 install-rl:
@@ -204,6 +209,8 @@ install-rl:
 	  "renderers==$(RL_RENDERERS_VERSION)" pygtrie portpicker \
 	  opentelemetry-sdk opentelemetry-exporter-otlp-proto-http \
 	  "math-verify==$(RL_MATH_VERIFY_VERSION)"; \
+	printf 'mcp>=1.24,<2\n' > "$(VENV)/rl-overrides.txt"; \
+	$(UV_PIP_CMD) "verifiers==$(RL_VERIFIERS_VERSION)" --override "$(VENV)/rl-overrides.txt"; \
 	$(UV_PIP_CMD) --no-deps \
 	  "torchstore @ https://github.com/meta-pytorch/torchstore/archive/$(RL_TORCHSTORE_SHA).tar.gz"; \
 	$(UV_PIP_CMD) "flash-attn-3==$(RL_FLASH_ATTN_3_VERSION)" \

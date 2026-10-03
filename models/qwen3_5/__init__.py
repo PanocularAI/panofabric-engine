@@ -98,6 +98,12 @@ class VerifyingQwen35StateDictAdapter(Qwen35StateDictAdapter):
 
     def from_hf(self, hf_state_dict):
         tt_state_dict = super().from_hf(hf_state_dict)
+        if _is_vllm_side(self.model_config):
+            # The RL generator's copy: torchtitan's vLLM wrapper swaps in layers
+            # that register themselves with vLLM when built, so a second (meta)
+            # build dies on "Duplicate GDN layer name". They add no parameters,
+            # and the load this guard exists for is the trainer's.
+            return tt_state_dict
 
         missing = self._expected_params() - set(tt_state_dict)
         vision = {n for n in missing if n.startswith("vision_encoder.")}
@@ -127,6 +133,16 @@ class VerifyingQwen35StateDictAdapter(Qwen35StateDictAdapter):
             len(tt_state_dict), len(self._expected_params()),
         )
         return tt_state_dict
+
+
+def _is_vllm_side(model_config) -> bool:
+    """Whether ``model_config`` is torchtitan's vLLM-generator rewrite of a
+    Qwen3.5 config (its GatedDeltaNet inner modules are vLLM layers)."""
+    return any(
+        type(getattr(getattr(layer, "delta_net", None), "inner_gated_delta_net", None))
+        .__module__.startswith("torchtitan.rl.")
+        for layer in model_config.layers
+    )
 
 
 def _checkpoint_is_multimodal(hf_assets_path: str | None) -> bool:

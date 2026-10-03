@@ -10,6 +10,8 @@
 # on the shared bases in controller.py (RLTrainer + RLControllerMixin for the
 # windowed strategies; PureLearnerReplica for the decoupled-generation ones):
 #
+#   SoloRLReplica                -- one island training by itself; no
+#                                   coordination at all.
 #   DiLoCoRLReplica              -- synchronous DiLoCo via torchft
 #                                   Manager/Lighthouse quorum.
 #   HeLoCoRLReplica              -- asynchronous DiLoCo through the parameter
@@ -51,6 +53,42 @@ from panoengine.decentralized.rollout_queue import (
 from torchtitan.rl import controller as _rl_controller_mod
 
 logger = logging.getLogger(__name__)
+
+
+class SoloRLReplica(RLControllerMixin, RLTrainer):
+    """One island training by itself.
+
+    The same windowed loop as every other strategy (one-step-ahead
+    generation/training overlap, fixed-set validation, the per-window log and
+    PFMETRICS lines), with every coordination hook left a no-op: no
+    lighthouse, no parameter server, and no whole-model copy through the
+    controller at window boundaries -- at 9B that copy alone is ~36 GB per
+    trainer rank, every window. A window is only the validation/logging
+    cadence here. The base TrainerActor is spawned unchanged.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(RLTrainer.Config):
+        replica_id: int = 0
+        """Only names this island in its log lines."""
+        sync_every: int = 4
+        """Steps per window: how often to validate and log (nothing syncs)."""
+        num_outer_steps: int = 0
+        """Windows to run (step-bound run). Set exactly one of this and
+        train_seconds."""
+        train_seconds: float = 0.0
+        """Wall-clock budget (time-bound run), checked at window boundaries."""
+
+        def __post_init__(self):
+            RLTrainer.Config.__post_init__(self)
+            if self.sync_every < 1:
+                raise ValueError(f"sync_every must be >= 1, got {self.sync_every}")
+            if (self.num_outer_steps > 0) == (self.train_seconds > 0):
+                raise ValueError(
+                    "Set exactly one of num_outer_steps (step-bound run) or "
+                    "train_seconds (time-bound run); got num_outer_steps="
+                    f"{self.num_outer_steps}, train_seconds={self.train_seconds}"
+                )
 
 
 class DiLoCoRLReplica(RLControllerMixin, RLTrainer):

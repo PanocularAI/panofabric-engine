@@ -30,7 +30,7 @@
 import dataclasses
 import os
 
-from renderers import DefaultRendererConfig, Qwen3RendererConfig
+from renderers import DefaultRendererConfig, Qwen35RendererConfig, Qwen3RendererConfig
 
 from torchtitan import rl as _rl_pkg
 from torchtitan.components.checkpointer import CheckpointManager
@@ -43,12 +43,14 @@ from torchtitan.components.optimizer import (
 from torchtitan.components.renderer import from_renderers
 from torchtitan.config import CompileConfig, DebugConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.config.transform import LMHeadCastConverter
 from panoengine.train.rl.controller import RLTrainer
 from panoengine.train.rl.replicas import (
     AsyncInferenceReplica,
     DiLoCoRLReplica,
     HeLoCoAsyncInferenceReplica,
     HeLoCoRLReplica,
+    SoloRLReplica,
 )
 from panoengine.train.rl.worker import AsyncInferenceWorker
 from torchtitan.rl.generator import SamplingConfig, VLLMGenerator
@@ -71,17 +73,41 @@ from torchtitan.models.llama3 import model_registry as _llama3_model_registry
 from torchtitan.models.qwen3 import model_registry as _qwen3_model_registry
 
 
+def _qwen3_5_model_registry(flavor: str, *, seq_len: int, attn_backend: str):
+    """Qwen3.5 through the engine's own ``models.qwen3_5``, not torchtitan's
+    registry: that wrapper drops the vision tower (nothing to train or sync for
+    a text task) and loads through the adapter that reads the published
+    checkpoints' ``model.language_model.*`` keys -- torchtitan's adapter keys a
+    text-only model as ``model.*`` and would load nothing. The lm_head runs in
+    fp32 as in upstream's Qwen3.5 RL presets: GRPO's ratio compares trainer and
+    generator logprobs. Lazy import: the wrapper pulls in the FT trainer stack."""
+    from models.qwen3_5 import model_registry
+
+    return model_registry(
+        flavor,
+        seq_len=seq_len,
+        attn_backend=attn_backend,
+        converters=[LMHeadCastConverter.Config()],
+    )
+
+
 #: Entries share one signature: (flavor, *, seq_len, attn_backend).
 _MODEL_REGISTRY_BY_MODEL = {
     "qwen3": _qwen3_model_registry,
     "llama3": _llama3_model_registry,
+    "qwen3_5": _qwen3_5_model_registry,
 }
 
 #: Chat template per model (the `renderers` package). llama3 keeps the generic
-#: "default" template it has always used here.
+#: "default" template it has always used here. Qwen3.5 needs its own: it emits
+#: XML tool calls (``<function=f><parameter=k>v</parameter></function>``), which
+#: the qwen3 renderer's JSON parser reads as ``invalid_json`` -- every correct
+#: tool call would score as an error. (Upstream's Qwen3.5 RL presets use the
+#: qwen3 renderer, which only works because their task has no tools.)
 _RENDERER_BY_MODEL = {
     "qwen3": lambda: Qwen3RendererConfig(enable_thinking=False),
     "llama3": lambda: DefaultRendererConfig(),
+    "qwen3_5": lambda: Qwen35RendererConfig(enable_thinking=False),
 }
 
 _EXAMPLE_CHECKPOINT_DIR = os.path.join(_rl_pkg.__path__[0], "example_checkpoint")
@@ -95,6 +121,8 @@ _DEFAULT_HF_ASSETS_PATH = {
     ("qwen3", "1.7B"): os.path.join(_EXAMPLE_CHECKPOINT_DIR, "Qwen3-1.7B"),
     ("qwen3", "4B"): os.path.join(_EXAMPLE_CHECKPOINT_DIR, "Qwen3-4B-Base"),
     ("llama3", "8B"): os.path.join(_EXAMPLE_CHECKPOINT_DIR, "Llama-3.1-8B"),
+    ("qwen3_5", "0.8B"): os.path.join(_EXAMPLE_CHECKPOINT_DIR, "Qwen3.5-0.8B"),
+    ("qwen3_5", "9B"): os.path.join(_EXAMPLE_CHECKPOINT_DIR, "Qwen3.5-9B"),
 }
 
 #: Packed training width (tokens per trainer microbatch = 2 x this) and the
@@ -178,6 +206,14 @@ def base_rl_config(
     model_config = _MODEL_REGISTRY_BY_MODEL[model](
         flavor, seq_len=seq_len, attn_backend="varlen"
     )
+    compile_config = CompileConfig(backend="aot_eager")
+    loss = GRPOLoss.Config(global_vocab_size=decoder_vocab_size(model_config))
+    if model == "qwen3_5":
+        # Upstream's Qwen3.5 RL recipe: eager, and the loss chunked over the
+        # sequence -- the fp32 lm_head over a 248K vocab is ~1 GB of logits per
+        # 1K tokens otherwise.
+        compile_config = None
+        loss = ChunkedLossWrapper.Config(num_chunks=8, loss_fn=loss)
     return RLTrainer.Config(
         model=model_config,
         hf_assets_path=resolved_hf_assets_path,
@@ -196,7 +232,7 @@ def base_rl_config(
             batcher=Batcher.Config(),
             validation=ValidationConfig(num_samples=20),
         ),
-        compile=CompileConfig(backend="aot_eager"),
+        compile=compile_config,
         rollouter=rollouter if rollouter is not None else _alphabet_sort_rollouter(),
         renderer=from_renderers(_RENDERER_BY_MODEL[model]()),
         generator_router=InterGeneratorRouter.Config(
@@ -229,8 +265,14 @@ def base_rl_config(
                 initial_load_in_hf=True,
                 interval=10,
                 last_save_model_only=False,
+                # A full checkpoint (fp32 params + AdamW state) is ~12 bytes per
+                # parameter: ~108 GB at 9B. torchtitan's default keeps 10 of
+                # them, which filled a 2 TB node within one long run. The newest
+                # plus one fallback (in case a write is interrupted) is enough
+                # to resume.
+                keep_latest_k=2,
             ),
-            loss=GRPOLoss.Config(global_vocab_size=decoder_vocab_size(model_config)),
+            loss=loss,
         ),
         generator=VLLMGenerator.Config(
             debug=DebugConfig(enable_structured_logging=False),
@@ -280,6 +322,51 @@ def wrap_replica(cls, base: RLTrainer.Config, **kwargs):
             base_fields[f.name] = f.default
     base_fields.update(kwargs)
     return cls.Config(**base_fields)
+
+
+def rl_solo_qwen3_0_6b(
+    hf_assets_path: str | None = None,
+    sync_every: int = 4,
+    train_seconds: float = 3600.0,
+    num_outer_steps: int = 0,
+    *,
+    model: str = "qwen3",
+    flavor: str = "0.6B",
+    trainer_tensor_parallel_degree: int = 1,
+    generator_tensor_parallel_degree: int = 1,
+    seq_len: int = _SEQ_LEN,
+) -> SoloRLReplica.Config:
+    """One island training by itself (2 GPUs at the default TP=1: 1 trainer +
+    1 generator): no lighthouse, no parameter server, nothing synced.
+    ``sync_every`` is only the validation/logging window. Loss is stock GRPO.
+    """
+    return wrap_replica(
+        SoloRLReplica,
+        base_rl_config(
+            hf_assets_path,
+            model=model,
+            flavor=flavor,
+            trainer_tensor_parallel_degree=trainer_tensor_parallel_degree,
+            generator_tensor_parallel_degree=generator_tensor_parallel_degree,
+            seq_len=seq_len,
+        ),
+        sync_every=sync_every,
+        train_seconds=0.0 if num_outer_steps else train_seconds,
+        num_outer_steps=num_outer_steps,
+    )
+
+
+def rl_solo_qwen3_1_7b(**kwargs) -> SoloRLReplica.Config:
+    """1.7B preset; see rl_solo_qwen3_0_6b."""
+    kwargs.setdefault("flavor", "1.7B")
+    return rl_solo_qwen3_0_6b(**kwargs)
+
+
+def rl_solo_llama3_8b(**kwargs) -> SoloRLReplica.Config:
+    """Llama3-8B preset; see rl_solo_qwen3_0_6b."""
+    kwargs.setdefault("model", "llama3")
+    kwargs.setdefault("flavor", "8B")
+    return rl_solo_qwen3_0_6b(**kwargs)
 
 
 def rl_heloco_qwen3_0_6b(
@@ -474,6 +561,32 @@ def rl_heloco_dapo_math_qwen3_4b(**kwargs) -> HeLoCoRLReplica.Config:
     See rl_heloco_dapo_math_qwen3_0_6b."""
     kwargs.setdefault("flavor", "4B")
     return rl_heloco_dapo_math_qwen3_0_6b(**kwargs)
+
+
+def rl_solo_dapo_math_qwen3_0_6b(
+    max_response_tokens: int = 8192,
+    max_total_tokens: int = 10240,
+    **kwargs,
+) -> SoloRLReplica.Config:
+    """DAPO-Math on one island -- the single-node reference recipe itself; see
+    rl_heloco_dapo_math_qwen3_0_6b for the task and recipe, with its rollout
+    lag and least-loaded routing."""
+    cfg = _apply_dapo_math(
+        rl_solo_qwen3_0_6b(seq_len=max_total_tokens, **kwargs),
+        max_response_tokens=max_response_tokens,
+        max_total_tokens=max_total_tokens,
+    )
+    cfg.async_loop.target_offpolicy_steps = 4
+    cfg.async_loop.windowed_fifo_batches = None
+    cfg.generator_router.strategy = LeastLoadedRoutingStrategy.Config()
+    return cfg
+
+
+def rl_solo_dapo_math_qwen3_4b(**kwargs) -> SoloRLReplica.Config:
+    """The reference DAPO-Math model on one island; see
+    rl_solo_dapo_math_qwen3_0_6b."""
+    kwargs.setdefault("flavor", "4B")
+    return rl_solo_dapo_math_qwen3_0_6b(**kwargs)
 
 
 def rl_heloco_async_inference_qwen3_0_6b(
@@ -847,3 +960,140 @@ def rl_heloco_async_inference_worker_dapo_math_qwen3_4b(
     rl_heloco_async_inference_worker_dapo_math_qwen3_0_6b."""
     kwargs.setdefault("flavor", "4B")
     return rl_heloco_async_inference_worker_dapo_math_qwen3_0_6b(**kwargs)
+
+
+# === Qwen3.5 (hybrid GatedDeltaNet + full attention) =========================
+#
+# Same strategies, model "qwen3_5". Generation goes through torchtitan's vLLM
+# GatedDeltaNet layer (rl/model/gdn.py: a paged conv + SSM state cache), so
+# these need no speculative decoding and no VLLM_SSM_CONV_STATE_LAYOUT=DS.
+# 0.8B is the cheap end-to-end check (one GPU per role). 9B is sized for an
+# H100:8 island: the fp32 trainer state alone is ~144 GB, so the trainer runs
+# TP=4 (~36 GB/GPU; Qwen3.5-9B's 4 KV heads cap TP at 4) next to four TP=1
+# generators. The decoupled kinds' trainer TP comes from the island's GPU count
+# (controld), so only its default is set here.
+
+_QWEN3_5_9B_TRAINER_TP = 4
+
+
+def rl_solo_qwen3_5_0_8b(**kwargs) -> SoloRLReplica.Config:
+    """Qwen3.5-0.8B on one island; see rl_solo_qwen3_0_6b."""
+    kwargs.setdefault("model", "qwen3_5")
+    kwargs.setdefault("flavor", "0.8B")
+    return rl_solo_qwen3_0_6b(**kwargs)
+
+
+def rl_solo_qwen3_5_9b(**kwargs) -> SoloRLReplica.Config:
+    """Qwen3.5-9B on one H100:8 island (trainer TP=4 + four generators), with
+    no parameter server; see rl_solo_qwen3_0_6b."""
+    kwargs.setdefault("model", "qwen3_5")
+    kwargs.setdefault("flavor", "9B")
+    kwargs.setdefault("trainer_tensor_parallel_degree", _QWEN3_5_9B_TRAINER_TP)
+    cfg = rl_solo_qwen3_0_6b(**kwargs)
+    cfg.num_generators = 4
+    return cfg
+
+
+def rl_heloco_qwen3_5_0_8b(**kwargs) -> HeLoCoRLReplica.Config:
+    """Qwen3.5-0.8B on the heloco stack; see rl_heloco_qwen3_0_6b."""
+    kwargs.setdefault("model", "qwen3_5")
+    kwargs.setdefault("flavor", "0.8B")
+    return rl_heloco_qwen3_0_6b(**kwargs)
+
+
+def rl_heloco_qwen3_5_9b(**kwargs) -> HeLoCoRLReplica.Config:
+    """Qwen3.5-9B on the heloco stack, one H100:8 island per replica (trainer
+    TP=4 + four generators); see rl_heloco_qwen3_0_6b."""
+    kwargs.setdefault("model", "qwen3_5")
+    kwargs.setdefault("flavor", "9B")
+    kwargs.setdefault("trainer_tensor_parallel_degree", _QWEN3_5_9B_TRAINER_TP)
+    cfg = rl_heloco_qwen3_0_6b(**kwargs)
+    cfg.num_generators = 4
+    return cfg
+
+
+def rl_heloco_async_inference_qwen3_5_0_8b(
+    **kwargs,
+) -> HeLoCoAsyncInferenceReplica.Config:
+    """Qwen3.5-0.8B pure learner; see rl_heloco_async_inference_qwen3_0_6b."""
+    kwargs.setdefault("model", "qwen3_5")
+    kwargs.setdefault("flavor", "0.8B")
+    return rl_heloco_async_inference_qwen3_0_6b(**kwargs)
+
+
+def rl_heloco_async_inference_qwen3_5_9b(
+    **kwargs,
+) -> HeLoCoAsyncInferenceReplica.Config:
+    """Qwen3.5-9B pure learner (TP=4 by default; on a launch the trainer
+    island's GPU count sets it); see rl_heloco_async_inference_qwen3_0_6b."""
+    kwargs.setdefault("model", "qwen3_5")
+    kwargs.setdefault("flavor", "9B")
+    kwargs.setdefault("trainer_tensor_parallel_degree", _QWEN3_5_9B_TRAINER_TP)
+    return rl_heloco_async_inference_qwen3_0_6b(**kwargs)
+
+
+def rl_heloco_async_inference_worker_qwen3_5_0_8b(
+    **kwargs,
+) -> AsyncInferenceWorker.Config:
+    """Qwen3.5-0.8B generator worker; see
+    rl_heloco_async_inference_worker_qwen3_0_6b."""
+    kwargs.setdefault("model", "qwen3_5")
+    kwargs.setdefault("flavor", "0.8B")
+    return rl_heloco_async_inference_worker_qwen3_0_6b(**kwargs)
+
+
+def rl_heloco_async_inference_worker_qwen3_5_9b(
+    **kwargs,
+) -> AsyncInferenceWorker.Config:
+    """Qwen3.5-9B generator worker (TP=1 fits the bf16 weights on one GPU);
+    see rl_heloco_async_inference_worker_qwen3_0_6b."""
+    kwargs.setdefault("model", "qwen3_5")
+    kwargs.setdefault("flavor", "9B")
+    return rl_heloco_async_inference_worker_qwen3_0_6b(**kwargs)
+
+
+def rl_diloco_qwen3_5_0_8b(**kwargs) -> DiLoCoRLReplica.Config:
+    """Qwen3.5-0.8B on the diloco stack; see rl_diloco_qwen3_0_6b."""
+    kwargs.setdefault("model", "qwen3_5")
+    kwargs.setdefault("flavor", "0.8B")
+    return rl_diloco_qwen3_0_6b(**kwargs)
+
+
+def rl_diloco_qwen3_5_9b(**kwargs) -> DiLoCoRLReplica.Config:
+    """Qwen3.5-9B on the diloco stack, laid out like rl_heloco_qwen3_5_9b."""
+    kwargs.setdefault("model", "qwen3_5")
+    kwargs.setdefault("flavor", "9B")
+    kwargs.setdefault("trainer_tensor_parallel_degree", _QWEN3_5_9B_TRAINER_TP)
+    cfg = rl_diloco_qwen3_0_6b(**kwargs)
+    cfg.num_generators = 4
+    return cfg
+
+
+def rl_async_inference_qwen3_5_0_8b(**kwargs) -> AsyncInferenceReplica.Config:
+    """Qwen3.5-0.8B relay-swarm trainer; see rl_async_inference_qwen3_0_6b."""
+    kwargs.setdefault("model", "qwen3_5")
+    kwargs.setdefault("flavor", "0.8B")
+    return rl_async_inference_qwen3_0_6b(**kwargs)
+
+
+def rl_async_inference_qwen3_5_9b(**kwargs) -> AsyncInferenceReplica.Config:
+    """Qwen3.5-9B relay-swarm trainer (TP=4 default, as
+    rl_heloco_async_inference_qwen3_5_9b); see rl_async_inference_qwen3_0_6b."""
+    kwargs.setdefault("model", "qwen3_5")
+    kwargs.setdefault("flavor", "9B")
+    kwargs.setdefault("trainer_tensor_parallel_degree", _QWEN3_5_9B_TRAINER_TP)
+    return rl_async_inference_qwen3_0_6b(**kwargs)
+
+
+def rl_async_inference_worker_qwen3_5_0_8b(**kwargs) -> AsyncInferenceWorker.Config:
+    """Qwen3.5-0.8B relay-swarm worker; see rl_async_inference_worker_qwen3_0_6b."""
+    kwargs.setdefault("model", "qwen3_5")
+    kwargs.setdefault("flavor", "0.8B")
+    return rl_async_inference_worker_qwen3_0_6b(**kwargs)
+
+
+def rl_async_inference_worker_qwen3_5_9b(**kwargs) -> AsyncInferenceWorker.Config:
+    """Qwen3.5-9B relay-swarm worker; see rl_async_inference_worker_qwen3_0_6b."""
+    kwargs.setdefault("model", "qwen3_5")
+    kwargs.setdefault("flavor", "9B")
+    return rl_async_inference_worker_qwen3_0_6b(**kwargs)

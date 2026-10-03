@@ -94,6 +94,27 @@ def test_dropped_decoder_weight_is_caught():
         adapter.from_hf(broken)
 
 
+def test_generator_side_load_skips_the_meta_rebuild():
+    """The RL generator's config has vLLM GatedDeltaNet layers, which register
+    themselves with vLLM when built: the guard's meta rebuild would die on
+    "Duplicate GDN layer name". It must not rebuild there (those layers add no
+    parameters, and the load the guard protects is the trainer's)."""
+    pytest.importorskip("vllm")
+    from torchtitan.rl.model.vllm_wrapper import _replace_vllm_layer_configs
+
+    from models.qwen3_5 import VerifyingQwen35StateDictAdapter, _is_vllm_side
+    from models.qwen3_5.config_registry import qwen35_debugmodel
+
+    config = qwen35_debugmodel().model
+    assert not _is_vllm_side(config)
+    vllm_config = _replace_vllm_layer_configs(config)
+    assert _is_vllm_side(vllm_config)
+    _, hf = _adapter_and_roundtrip()
+    adapter = VerifyingQwen35StateDictAdapter(vllm_config, hf_assets_path=None)
+    assert adapter.from_hf(dict(hf))
+    assert adapter._expected is None  # never built
+
+
 def test_missing_vision_weights_only_warn(caplog):
     """On a MULTIMODAL build, an absent tower warns rather than raises.
 

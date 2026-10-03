@@ -40,6 +40,17 @@ from torchtitan.rl.distributed.actors.trainer import TrainerActor
 logger = logging.getLogger(__name__)
 
 
+def _replies_with_full_copy() -> bool:
+    """Whether this trainer rank returns the gathered state dict.
+
+    Only rank 0's reply is ever read (every caller takes
+    ``_get_rank_0_value``), so the other ranks run each unshard collective and
+    keep nothing: a full fp32 copy per rank costs one whole model of host RAM
+    per rank, twice over (the tensors and the serialized reply). At 9B with
+    TP=2 that was ~150 GB of a ~500 GB window-sync peak."""
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
 class DiLoCoManagerTrainer(TrainerActor):
     """Trainer that syncs across replicas via torchft ``local_sgd.DiLoCo``.
 
@@ -195,6 +206,7 @@ class HeLoCoPolicyTrainer(TrainerActor):
         # so keys match the uncompiled meta-model names the server/client are
         # built from (see param_metadata).
         wanted = None if names is None else set(names)
+        keep = _replies_with_full_copy()
         sd = {}
         for name, param in self.model.named_parameters():
             canonical = canonical_fqn(name)
@@ -203,7 +215,8 @@ class HeLoCoPolicyTrainer(TrainerActor):
             tensor = param.detach()
             if isinstance(tensor, DTensor):
                 tensor = tensor.full_tensor()
-            sd[canonical] = tensor.to(device="cpu", dtype=torch.float32)
+            if keep:
+                sd[canonical] = tensor.to(device="cpu", dtype=torch.float32)
         return sd
 
     @concurrent_endpoint
@@ -286,12 +299,14 @@ class SnapshotPolicyTrainer(TrainerActor):
         trips on FusedQKVLinear's synthetic keys during FQN resolution — so unshard
         each DTensor with ``full_tensor()`` directly (relay shards are torch.save'd,
         so full CPU tensors are required)."""
+        keep = _replies_with_full_copy()
         sd = {}
         for name, tensor in self.model.state_dict().items():
             tensor = tensor.detach()
             if isinstance(tensor, DTensor):
                 tensor = tensor.full_tensor()
-            sd[name] = tensor.to(device="cpu", dtype=torch.float32)
+            if keep:
+                sd[name] = tensor.to(device="cpu", dtype=torch.float32)
         return sd
 
     @concurrent_endpoint

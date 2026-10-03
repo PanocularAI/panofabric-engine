@@ -212,6 +212,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 #   - math-verify is the dapo_math example's rubric dep. It SHOULD ride
 #     model.requirements, but torchtitan's setuptools config has no package-data entry so
 #     the file is absent from the installed wheel; baking it keeps RL runs unblocked.
+#   - verifiers runs bring-your-own agent harnesses (panoengine.train.rl.harness, on
+#     torchtitan's rl/examples/verifiers bridge). 0.3.1 is the version that bridge
+#     targets; it needs mcp<2 (its taskset package imports mcp.server.fastmcp, gone in
+#     2.x) while this vLLM nightly DECLARES mcp>=2. vLLM only imports mcp lazily for
+#     --tool-server, through APIs mcp 1.x has, so the override takes verifiers' side.
 # Bump these together with TORCH_VERSION in the Makefile, and re-run the alphabet_sort
 # smoke test.
 ARG TORCHMONARCH_VERSION
@@ -219,11 +224,14 @@ ARG TORCHSTORE_SHA
 ARG RENDERERS_VERSION
 ARG FLASH_ATTN_3_VERSION
 ARG MATH_VERIFY_VERSION
+ARG VERIFIERS_VERSION
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --python ${VIRTUAL_ENV}/bin/python \
+    printf 'mcp>=1.24,<2\n' > /tmp/rl-overrides.txt \
+    && uv pip install --python ${VIRTUAL_ENV}/bin/python \
       "torchmonarch==${TORCHMONARCH_VERSION}" \
       "renderers==${RENDERERS_VERSION}" \
       "math-verify==${MATH_VERIFY_VERSION}" \
+      "verifiers==${VERIFIERS_VERSION}" --override /tmp/rl-overrides.txt \
       pygtrie portpicker opentelemetry-sdk opentelemetry-exporter-otlp-proto-http \
     && uv pip install --python ${VIRTUAL_ENV}/bin/python --no-deps \
       "torchstore @ https://github.com/meta-pytorch/torchstore/archive/${TORCHSTORE_SHA}.tar.gz" \
@@ -246,7 +254,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN python -c "import torch, torchtitan, torchft, vllm, panoengine.serve; print('torch', torch.__version__)" \
  && python -c "import torchstore, renderers, flash_attn_interface, math_verify; \
 from monarch.actor import ProcMesh; from monarch.spmd import setup_torch_elastic_env_async; \
-import panoengine.train.rl.train; print('rl stack ok')"
+import panoengine.train.rl.train, panoengine.train.rl.harness; print('rl stack ok')"
 
 ARG ENGINE_SHA=unknown
 ARG TORCHTITAN_SHA=unknown

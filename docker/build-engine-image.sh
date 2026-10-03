@@ -134,6 +134,7 @@ RL_ARGS=(
   --build-arg RENDERERS_VERSION="$(mk_var RL_RENDERERS_VERSION)"
   --build-arg FLASH_ATTN_3_VERSION="$(mk_var RL_FLASH_ATTN_3_VERSION)"
   --build-arg MATH_VERIFY_VERSION="$(mk_var RL_MATH_VERIFY_VERSION)"
+  --build-arg VERIFIERS_VERSION="$(mk_var RL_VERIFIERS_VERSION)"
 )
 
 # ---- build -----------------------------------------------------------------

@@ -3,7 +3,9 @@
 controld picks the strategy segment from the spec (one island with nothing to
 sync -> ``rl_solo_*``, colocated heloco -> ``rl_heloco_*``, decoupled heloco ->
 ``rl_heloco_async_inference_*`` plus the ``_worker_`` preset on the generator
-islands), so define every variant your specs use.
+islands). ``register_task`` at the bottom defines every variant, from
+``rl_solo_tool_agent_qwen3_5_0_8b`` to
+``rl_heloco_async_inference_worker_tool_agent_qwen3_5_9b``.
 """
 
 from panoengine.train.rl import config_registry as engine
@@ -23,33 +25,4 @@ def _with_task(cfg):
     return cfg
 
 
-def rl_solo_tool_agent_qwen3_5_0_8b():
-    return _with_task(engine.rl_solo_qwen3_5_0_8b(seq_len=SEQ_LEN))
-
-
-def rl_solo_tool_agent_qwen3_5_9b():
-    return _with_task(engine.rl_solo_qwen3_5_9b(seq_len=SEQ_LEN))
-
-
-def rl_heloco_tool_agent_qwen3_5_0_8b():
-    return _with_task(engine.rl_heloco_qwen3_5_0_8b(seq_len=SEQ_LEN))
-
-
-def rl_heloco_tool_agent_qwen3_5_9b():
-    return _with_task(engine.rl_heloco_qwen3_5_9b(seq_len=SEQ_LEN))
-
-
-def rl_heloco_async_inference_tool_agent_qwen3_5_0_8b():
-    return _with_task(engine.rl_heloco_async_inference_qwen3_5_0_8b(seq_len=SEQ_LEN))
-
-
-def rl_heloco_async_inference_tool_agent_qwen3_5_9b():
-    return _with_task(engine.rl_heloco_async_inference_qwen3_5_9b(seq_len=SEQ_LEN))
-
-
-def rl_heloco_async_inference_worker_tool_agent_qwen3_5_0_8b():
-    return _with_task(engine.rl_heloco_async_inference_worker_qwen3_5_0_8b(seq_len=SEQ_LEN))
-
-
-def rl_heloco_async_inference_worker_tool_agent_qwen3_5_9b():
-    return _with_task(engine.rl_heloco_async_inference_worker_qwen3_5_9b(seq_len=SEQ_LEN))
+engine.register_task(globals(), "tool_agent", _with_task, model="qwen3_5", seq_len=SEQ_LEN)

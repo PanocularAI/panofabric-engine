@@ -60,12 +60,13 @@ and tool result). Raise it with the turn count, and the generator's
 ## Strategies
 
 `config_registry.py` defines the single-island (`rl_solo_*`), colocated multi-island
-(`rl_heloco_*`) and decoupled (`rl_heloco_async_inference_*` + `_worker_`)
-variants. controld derives the strategy segment from the spec: `sync: {method:
-none}` on one island runs `rl_solo_*` (what `spec.yaml` uses — no sync hub; at 9B it
-measured ~46 GB of host RAM against heloco's ~400-500 GB, with 5-10x shorter
-windows), `method: heloco` runs `rl_heloco_*`, and adding `role: generator`
-islands runs the decoupled pair, all from the same `preset:` value.
+(`rl_heloco_*`) and decoupled (`rl_async_inference_*` / `rl_heloco_async_inference_*`,
+each + `_worker_`) variants. controld derives the strategy segment from the spec:
+`sync: {method: none}` on one island runs `rl_solo_*` (what `spec.yaml` uses — no
+sync hub; at 9B it measured ~46 GB of host RAM against heloco's ~400-500 GB, with
+5-10x shorter windows), `method: heloco` runs `rl_heloco_*`, and adding `role:
+generator` islands runs the decoupled pair (`rl_async_inference_*` under `method:
+none`, all from the same `preset:` value.
 
 ## Run it
 

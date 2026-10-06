@@ -23,10 +23,11 @@ training:
   steps: 100
 fabric:
   islands:
+    # No `role`: with no `role: generator` islands, this island generates for
+    # itself -- the preset splits its GPUs between the trainer and vLLM.
     - count: 1
-      role: trainer
       resources:
-        accelerators: "H100:8"
+        accelerators: "H100:8"   # split: trainer TP=4 + four TP=1 generators
         # Host RAM. Slurm's default is 4 GB per vCPU x 4 vCPUs per GPU = 128 GB
         # here, tight for four trainer ranks reading a 19 GB checkpoint. 
         memory: "256+"

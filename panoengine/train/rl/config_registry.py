@@ -8,26 +8,24 @@
 # ``base_rl_config`` + ``wrap_replica`` are the shared building blocks: a plain
 # RLTrainer.Config with the common loss/data choices, and a helper that
 # copies it into one of the coordinator Configs (each a strict superset of
-# RLTrainer.Config) plus the coordinator-specific extras. The ``rl_*``
-# functions below are the full-size entry points, one per strategy x model
-# (each with a "_0_6b" and, where a checkpoint is available, a larger preset).
+# RLTrainer.Config) plus the coordinator-specific extras. The ``rl_*`` entry
+# points are generated at the bottom of this file, one per strategy x model
+# (x task) -- see "Presets" there.
 #
 # Adding a new RL model: add it to ``_MODEL_REGISTRY_BY_MODEL`` and
-# ``_RENDERER_NAME_BY_MODEL`` below (and, if it should have a default
-# checkpoint, ``_DEFAULT_HF_ASSETS_PATH``) -- no changes needed anywhere else
-# in this package. GPU count is not fixed either: trainer/generator
-# tensor_parallel_degree are real parameters here (default 1), and
-# num_replicas / GPUS_PER_REPLICA (launch script arg) flow through
-# independently -- nothing below assumes a specific machine's GPU count, only
-# its own defaults do.
+# ``_RENDERER_BY_MODEL`` below, and its checkpoint to ``_DEFAULT_HF_ASSETS_PATH``
+# (which is also what gives it named presets). GPU count is not fixed either:
+# trainer/generator tensor_parallel_degree are real parameters here (default
+# 1), and num_replicas / GPUS_PER_REPLICA (launch script arg) flow through
+# independently.
 #
 # ConfigManager calls the ``--config`` function with NO arguments (CLI flags
 # then overlay onto the resulting dataclass's fields), so a size/flavor/model
-# switch needs its own named entry point to be reachable from the CLI --
-# passing ``model="llama3"`` to ``rl_heloco_qwen3_0_6b`` only works from
-# Python (as the ``rl_heloco_llama3_8b`` wrapper below does).
+# switch needs its own named entry point to be reachable from the CLI.
 
 import dataclasses
+import functools
+import inspect
 import os
 
 from renderers import DefaultRendererConfig, Qwen35RendererConfig, Qwen3RendererConfig
@@ -324,106 +322,57 @@ def wrap_replica(cls, base: RLTrainer.Config, **kwargs):
     return cls.Config(**base_fields)
 
 
-def rl_solo_qwen3_0_6b(
-    hf_assets_path: str | None = None,
-    sync_every: int = 4,
-    train_seconds: float = 3600.0,
-    num_outer_steps: int = 0,
-    *,
-    model: str = "qwen3",
-    flavor: str = "0.6B",
-    trainer_tensor_parallel_degree: int = 1,
-    generator_tensor_parallel_degree: int = 1,
-    seq_len: int = _SEQ_LEN,
-) -> SoloRLReplica.Config:
-    """One island training by itself (2 GPUs at the default TP=1: 1 trainer +
-    1 generator): no lighthouse, no parameter server, nothing synced.
-    ``sync_every`` is only the validation/logging window. Loss is stock GRPO.
-    """
-    return wrap_replica(
-        SoloRLReplica,
-        base_rl_config(
-            hf_assets_path,
-            model=model,
-            flavor=flavor,
-            trainer_tensor_parallel_degree=trainer_tensor_parallel_degree,
-            generator_tensor_parallel_degree=generator_tensor_parallel_degree,
-            seq_len=seq_len,
-        ),
-        sync_every=sync_every,
-        train_seconds=0.0 if num_outer_steps else train_seconds,
-        num_outer_steps=num_outer_steps,
-    )
+# === Presets =================================================================
+#
+# A preset is named ``<strategy>[_dapo_math]_<model>_<size>``, e.g.
+# rl_heloco_qwen3_5_9b or rl_heloco_async_inference_worker_dapo_math_qwen3_4b.
+# The names are the API (specs pin them, controld getattr()s them, derives the
+# generator preset by inserting "_worker" after the strategy segment, and reads
+# the size off the suffix), so they are all defined -- but generated from the
+# tables below rather than written out per strategy x model x task. One preset
+# exists per strategy and per _DEFAULT_HF_ASSETS_PATH entry.
+#
+# A preset takes keyword overrides from Python (ConfigManager passes none): any
+# base_rl_config argument (seq_len, hf_assets_path, flavor, ...) or any field
+# of the strategy's Config (sync_every, num_outer_steps, group_size, ...).
 
+#: Strategy segment -> (Config class, role, values that differ from that
+#: Config's own defaults). The classes' docstrings describe each strategy.
+#: "colocated": every island runs its own trainer + generators (2 GPUs at the
+#: default TP=1). "learner": a pure-learner trainer (no local vLLM) fed by a
+#: remote worker pool through the rollout queue. "worker": that pool's
+#: generator process, no trainer actor at all.
+_STRATEGIES = {
+    "rl_solo": (SoloRLReplica, "colocated", {}),
+    "rl_diloco": (DiLoCoRLReplica, "colocated", {}),
+    "rl_heloco": (HeLoCoRLReplica, "colocated", {"should_quantize": True}),
+    "rl_async_inference": (AsyncInferenceReplica, "learner", {}),
+    "rl_heloco_async_inference": (
+        HeLoCoAsyncInferenceReplica,
+        "learner",
+        {"should_quantize": True},
+    ),
+    "rl_async_inference_worker": (AsyncInferenceWorker, "worker", {}),
+    # Bigger rounds, so a small pool fills several trainers' windows quickly.
+    "rl_heloco_async_inference_worker": (
+        AsyncInferenceWorker,
+        "worker",
+        {"groups_per_round": 8},
+    ),
+}
 
-def rl_solo_qwen3_1_7b(**kwargs) -> SoloRLReplica.Config:
-    """1.7B preset; see rl_solo_qwen3_0_6b."""
-    kwargs.setdefault("flavor", "1.7B")
-    return rl_solo_qwen3_0_6b(**kwargs)
+#: Per-(model, flavor) layout. Qwen3.5-9B is sized for an H100:8 island: the
+#: fp32 trainer state alone is ~144 GB, so the trainer runs TP=4 (~36 GB/GPU;
+#: its 4 KV heads cap TP at 4) next to four TP=1 generators. num_generators
+#: only applies to colocated islands; a decoupled launch sets the trainer's TP
+#: from the island's GPU count (controld), so this is only its default.
+_LAYOUT = {
+    ("qwen3_5", "9B"): {"trainer_tensor_parallel_degree": 4, "num_generators": 4},
+}
 
-
-def rl_solo_llama3_8b(**kwargs) -> SoloRLReplica.Config:
-    """Llama3-8B preset; see rl_solo_qwen3_0_6b."""
-    kwargs.setdefault("model", "llama3")
-    kwargs.setdefault("flavor", "8B")
-    return rl_solo_qwen3_0_6b(**kwargs)
-
-
-def rl_heloco_qwen3_0_6b(
-    hf_assets_path: str | None = None,
-    sync_every: int = 4,
-    train_seconds: float = 3600.0,
-    num_outer_steps: int = 0,
-    should_quantize: bool = True,
-    *,
-    model: str = "qwen3",
-    flavor: str = "0.6B",
-    trainer_tensor_parallel_degree: int = 1,
-    generator_tensor_parallel_degree: int = 1,
-    seq_len: int = _SEQ_LEN,
-) -> HeLoCoRLReplica.Config:
-    """Async multi-worker GRPO (2 GPUs/worker at the default TP=1: 1 generator
-    + 1 trainer GPU each, so two workers fit on a 4-GPU node alongside the CPU
-    parameter server -- raise the tensor_parallel_degree params for a model
-    that needs more than one GPU per role; the launch script's
-    GPUS_PER_REPLICA must then grow to match).
-
-    N workers each run a full RL loop and sync pseudo-gradients through the CPU
-    parameter server (HeLoCo outer optimizer) with no barrier. Loss is stock GRPO.
-    """
-    return wrap_replica(
-        HeLoCoRLReplica,
-        base_rl_config(
-            hf_assets_path,
-            model=model,
-            flavor=flavor,
-            trainer_tensor_parallel_degree=trainer_tensor_parallel_degree,
-            generator_tensor_parallel_degree=generator_tensor_parallel_degree,
-            seq_len=seq_len,
-        ),
-        sync_every=sync_every,
-        train_seconds=0.0 if num_outer_steps else train_seconds,
-        num_outer_steps=num_outer_steps,
-        should_quantize=should_quantize,
-    )
-
-
-def rl_heloco_qwen3_1_7b(**kwargs) -> HeLoCoRLReplica.Config:
-    """1.7B preset; see rl_heloco_qwen3_0_6b for the strategy docstring
-    (same 2-GPUs/worker layout -- 1.7B still fits comfortably at TP=1)."""
-    kwargs.setdefault("flavor", "1.7B")
-    return rl_heloco_qwen3_0_6b(**kwargs)
-
-
-def rl_heloco_llama3_8b(**kwargs) -> HeLoCoRLReplica.Config:
-    """Llama3-8B preset -- a second model family, proving the
-    _MODEL_REGISTRY_BY_MODEL extension point works end to end with no other
-    changes. No RL checkpoint ships for llama3; download one to
-    example_checkpoint/Llama-3.1-8B first, or pass hf_assets_path explicitly.
-    See rl_heloco_qwen3_0_6b for the strategy docstring."""
-    kwargs.setdefault("model", "llama3")
-    kwargs.setdefault("flavor", "8B")
-    return rl_heloco_qwen3_0_6b(**kwargs)
+#: DAPO-Math budgets: 8K response inside a 10K packed context.
+_DAPO_MATH_SEQ_LEN = 10240
+_DAPO_MATH_MAX_RESPONSE_TOKENS = 8192
 
 
 def _dapo_math_rollouter(max_total_tokens: int) -> Rollouter.Config:
@@ -456,41 +405,42 @@ def _dapo_math_rollouter(max_total_tokens: int) -> Rollouter.Config:
     )
 
 
-def _apply_dapo_math(cfg, *, max_response_tokens: int, max_total_tokens: int):
+def _apply_dapo_math(cfg: RLTrainer.Config, *, colocated: bool) -> None:
     """Overlay the single-node DAPO-Math reference recipe
     (torchtitan/experiments/rl/examples/dapo_math/config_registry.py, the
-    ``rl_dapo_qwen3_*_math_*`` presets) onto a decentralized_rl replica config,
-    in place.
+    ``rl_dapo_qwen3_*_math_*`` presets) onto a base_rl_config, in place, so
+    ``rl_heloco_dapo_math_qwen3_4b`` is upstream's ``rl_dapo_qwen3_4b_math_8k``
+    run on N replicas with no override pile.
 
     Everything the reference sets that is not a single-node topology choice is
     here: the task (DAPO-Math-17k train / AIME 2025 validation, math-verify
     reward), thinking on, temperature/top-p 1.0, the 8K response / 10K packing
-    budgets, DAPO clip [0.2, 0.28] under a chunked loss, the 8 prompts x 16
-    samples train step at up to 4 steps of lag, and the 1e-6 CONSTANT LR with
-    betas (0.9, 0.98). A caller that wants a different loop overrides these
-    fields from the CLI as usual -- the point is that the DEFAULTS are
-    upstream's, so "run the reference recipe" needs no override pile.
+    budgets, DAPO clip [0.2, 0.28] (arXiv:2503.14476) under a chunked loss,
+    the 8 prompts x 16 samples train step at up to 4 steps of lag, and the 1e-6
+    CONSTANT LR with betas (0.9, 0.98).
 
     Not carried over: ``num_generators`` and the trainer's tensor-parallel
     degree (topology, owned by the launcher and the island's GPU count), and
     the reference's fp32-lm-head converter / vLLM cudagraph capture (memory and
     warmup tradeoffs that are not the recipe).
+
+    Needs math-verify on every island that scores rollouts (and the hub).
     """
-    cfg.rollouter = _dapo_math_rollouter(max_total_tokens)
+    seq_len = cfg.trainer.training.max_context_length
+    cfg.rollouter = _dapo_math_rollouter(seq_len)
     cfg.renderer = from_renderers(Qwen3RendererConfig(enable_thinking=True))
     cfg.generator.sampling.temperature = 1.0
     cfg.generator.sampling.top_p = 1.0
-    cfg.generator.sampling.max_tokens = max_response_tokens
-    # The caller built the model with seq_len=max_total_tokens (its context
-    # bound); the packed width is ONE sequence per rank, and at this length that
-    # is not a tuning preference: measured on an H200, a 4B trainer peaks at
-    # 112 GiB at one 10K sequence and OOMs a 140 GiB card at two (there is no
-    # activation checkpointing in this config). base_rl_config's 2x is sized for
+    cfg.generator.sampling.max_tokens = _DAPO_MATH_MAX_RESPONSE_TOKENS
+    # The packed width is ONE sequence per rank, and at this length that is not
+    # a tuning preference: measured on an H200, a 4B trainer peaks at 112 GiB at
+    # one 10K sequence and OOMs a 140 GiB card at two (there is no activation
+    # checkpointing in this config). base_rl_config's 2x is sized for
     # alphabet-sort's 2048-token budget, not a 10K one.
-    cfg.trainer.training.num_tokens_per_microbatch_per_dp_rank = max_total_tokens
-    cfg.trainer.training.max_context_length = max_total_tokens
+    cfg.trainer.training.num_tokens_per_microbatch_per_dp_rank = seq_len
     cfg.async_loop.validation.num_samples = 30  # all of AIME 2025
     # The reference train step: 8 prompt groups x 16 samples = 128 rollouts.
+    # A worker preset takes this as its group_size (see _build).
     cfg.async_loop.num_prompts_per_train_step = 8
     cfg.async_loop.num_samples_per_prompt = 16
     cfg.trainer.loss = ChunkedLossWrapper.Config(
@@ -507,37 +457,10 @@ def _apply_dapo_math(cfg, *, max_response_tokens: int, max_total_tokens: int):
     cfg.trainer.lr_scheduler = LRSchedulersContainer.Config(
         warmup_steps=0, min_lr_factor=1.0
     )
-    return cfg
-
-
-def rl_heloco_dapo_math_qwen3_0_6b(
-    max_response_tokens: int = 8192,
-    max_total_tokens: int = 10240,
-    **kwargs,
-) -> HeLoCoRLReplica.Config:
-    """DAPO-Math on the heloco stack: single-turn math prompts (DAPO-Math-17k
-    filtered for training, all 30 AIME 2025 problems for validation) scored by
-    a binary Math-Verify reward, trained with the DAPO clip-higher loss
-    (arXiv:2503.14476) instead of stock GRPO. Everything else -- the async
-    multi-worker loop, the CPU parameter server, quantized pushes -- is
-    rl_heloco_qwen3_0_6b (see its docstring for the strategy layout).
-
-    Defaults ARE the single-node reference recipe (see _apply_dapo_math), so
-    this is upstream's ``rl_dapo_qwen3_4b_math_8k`` run on N replicas rather
-    than one node -- no override pile needed to reproduce it.
-
-    Extra dependency: math-verify (examples/dapo_math/requirements.txt) --
-    NOT baked into the engine image; declare it on the run so the islands and
-    the parameter-server hub install it at provisioning.
-    """
-    cfg = _apply_dapo_math(
-        rl_heloco_qwen3_0_6b(seq_len=max_total_tokens, **kwargs),
-        max_response_tokens=max_response_tokens,
-        max_total_tokens=max_total_tokens,
-    )
-    # Local generation only (the pure-learner variant has no generators, and
-    # no router to point at them).
-    #
+    if not colocated:
+        # A pure learner consumes the shared queue, where lag is bounded by
+        # max_staleness, and has no local generator pool to route between.
+        return
     # The reference's rollout lag. base_rl_config pins 0 -- fully on-policy,
     # which caps in-flight work at ONE train step's worth (128 sequences) and
     # leaves a replica's generators idle waiting for each publish. At 4 the cap
@@ -552,548 +475,77 @@ def rl_heloco_dapo_math_qwen3_0_6b(
     # Generators finish at different times under an 8K budget; round-robin
     # hands work to a generator that is still busy.
     cfg.generator_router.strategy = LeastLoadedRoutingStrategy.Config()
-    return cfg
 
 
-def rl_heloco_dapo_math_qwen3_4b(**kwargs) -> HeLoCoRLReplica.Config:
-    """The reference DAPO-Math model (Qwen3-4B-Base); needs the checkpoint
-    downloaded into _DEFAULT_HF_ASSETS_PATH's dir (or hf_assets_path passed).
-    See rl_heloco_dapo_math_qwen3_0_6b."""
-    kwargs.setdefault("flavor", "4B")
-    return rl_heloco_dapo_math_qwen3_0_6b(**kwargs)
+_BASE_RL_CONFIG_ARGS = frozenset(inspect.signature(base_rl_config).parameters)
 
 
-def rl_solo_dapo_math_qwen3_0_6b(
-    max_response_tokens: int = 8192,
-    max_total_tokens: int = 10240,
-    **kwargs,
-) -> SoloRLReplica.Config:
-    """DAPO-Math on one island -- the single-node reference recipe itself; see
-    rl_heloco_dapo_math_qwen3_0_6b for the task and recipe, with its rollout
-    lag and least-loaded routing."""
-    cfg = _apply_dapo_math(
-        rl_solo_qwen3_0_6b(seq_len=max_total_tokens, **kwargs),
-        max_response_tokens=max_response_tokens,
-        max_total_tokens=max_total_tokens,
-    )
-    cfg.async_loop.target_offpolicy_steps = 4
-    cfg.async_loop.windowed_fifo_batches = None
-    cfg.generator_router.strategy = LeastLoadedRoutingStrategy.Config()
-    return cfg
-
-
-def rl_solo_dapo_math_qwen3_4b(**kwargs) -> SoloRLReplica.Config:
-    """The reference DAPO-Math model on one island; see
-    rl_solo_dapo_math_qwen3_0_6b."""
-    kwargs.setdefault("flavor", "4B")
-    return rl_solo_dapo_math_qwen3_0_6b(**kwargs)
-
-
-def rl_heloco_async_inference_qwen3_0_6b(
-    hf_assets_path: str | None = None,
-    sync_every: int = 4,
-    train_seconds: float = 3600.0,
-    num_outer_steps: int = 0,
-    should_quantize: bool = True,
-    max_staleness: int = 4,
-    rollout_queue_address: str = "",
-    *,
-    model: str = "qwen3",
-    flavor: str = "0.6B",
-    trainer_tensor_parallel_degree: int = 1,
-    generator_tensor_parallel_degree: int = 1,
-    seq_len: int = _SEQ_LEN,
-) -> HeLoCoAsyncInferenceReplica.Config:
-    """Decoupled generation (arXiv:2505.07291) scaled to
-    MULTIPLE trainers: N PURE-LEARNER HeLoCo trainer replicas (1 GPU each at
-    the default TP=1 -- no local generation, no vLLM on the trainer) plus a
-    separate pool of rl_heloco_async_inference_worker_* generator processes on
-    their own machines that free-run rollouts into a hub-hosted shared queue.
-    Each trainer pops rollouts from that queue, trains, and pushes its
-    pseudo-gradient to the HeLoCo parameter server (no barrier); any trainer
-    may consume any worker's rollouts. The hub
-    (panoengine.decentralized.parameter_server)
-    publishes the CURRENT global theta (the consensus weights, not any one
-    trainer's copy) to a relay process for the generator pool to pull. Start
-    the coordination plane first: the relay,
-    then the rollout_queue, then the server (with --relay_addr).
-    rollout_queue_address is required (usually $ROLLOUT_QUEUE_ADDR, the same
-    queue workers' rollout_queue_address points at). Loss is stock GRPO.
-    """
-    return wrap_replica(
-        HeLoCoAsyncInferenceReplica,
-        base_rl_config(
-            hf_assets_path,
-            model=model,
-            flavor=flavor,
-            trainer_tensor_parallel_degree=trainer_tensor_parallel_degree,
-            generator_tensor_parallel_degree=generator_tensor_parallel_degree,
-            seq_len=seq_len,
-        ),
-        sync_every=sync_every,
-        train_seconds=0.0 if num_outer_steps else train_seconds,
-        num_outer_steps=num_outer_steps,
-        should_quantize=should_quantize,
-        max_staleness=max_staleness,
-        rollout_queue_address=rollout_queue_address,
-        # Pure learner: no local vLLM (Controller.Config defaults to 1, but
-        # generation is fully decoupled onto the remote worker pool).
-        num_generators=0,
-    )
-
-
-def rl_heloco_async_inference_qwen3_1_7b(
-    **kwargs,
-) -> HeLoCoAsyncInferenceReplica.Config:
-    """1.7B preset; see rl_heloco_async_inference_qwen3_0_6b for the strategy
-    docstring."""
-    kwargs.setdefault("flavor", "1.7B")
-    return rl_heloco_async_inference_qwen3_0_6b(**kwargs)
-
-
-def rl_heloco_async_inference_llama3_8b(**kwargs) -> HeLoCoAsyncInferenceReplica.Config:
-    """Llama3-8B preset -- a second model family, proving the
-    _MODEL_REGISTRY_BY_MODEL extension point works end to end with no other
-    changes. See rl_heloco_async_inference_qwen3_0_6b for the strategy
-    docstring."""
-    kwargs.setdefault("model", "llama3")
-    kwargs.setdefault("flavor", "8B")
-    return rl_heloco_async_inference_qwen3_0_6b(**kwargs)
-
-
-def rl_heloco_async_inference_dapo_math_qwen3_0_6b(
-    max_response_tokens: int = 8192,
-    max_total_tokens: int = 10240,
-    **kwargs,
-) -> HeLoCoAsyncInferenceReplica.Config:
-    """DAPO-Math on the decoupled heloco stack: the task and recipe of
-    rl_heloco_dapo_math_qwen3_0_6b (see _apply_dapo_math) on the pure-learner
-    topology of rl_heloco_async_inference_qwen3_0_6b (see its docstring for the
-    relay / rollout-queue / parameter-server layout).
-
-    The generator side of the recipe reaches the swarm through the matching
-    rl_heloco_async_inference_worker_dapo_math_* preset, not this one: a pure
-    learner runs no local vLLM, so the sampling knobs set here are inert and
-    only the trainer-side ones (batch width, loss, optimizer, group size)
-    take effect. Both must move together -- the worker's ``group_size`` is
-    this config's ``async_loop.num_samples_per_prompt``.
-
-    Extra dependency: math-verify, on the trainers AND the worker islands.
-    """
-    # No max_offpolicy_steps / router overlay here (unlike the non-decoupled
-    # preset): a pure learner consumes the shared queue, where lag is bounded
-    # by max_staleness, and it has no local generator pool to route between.
-    return _apply_dapo_math(
-        rl_heloco_async_inference_qwen3_0_6b(seq_len=max_total_tokens, **kwargs),
-        max_response_tokens=max_response_tokens,
-        max_total_tokens=max_total_tokens,
-    )
-
-
-def rl_heloco_async_inference_dapo_math_qwen3_4b(
-    **kwargs,
-) -> HeLoCoAsyncInferenceReplica.Config:
-    """The reference DAPO-Math model (Qwen3-4B-Base) on the decoupled stack;
-    see rl_heloco_dapo_math_qwen3_4b for the checkpoint requirement."""
-    kwargs.setdefault("flavor", "4B")
-    return rl_heloco_async_inference_dapo_math_qwen3_0_6b(**kwargs)
-
-
-def rl_diloco_qwen3_0_6b(
-    hf_assets_path: str | None = None,
-    sync_every: int = 4,
-    train_seconds: float = 3600.0,
-    num_outer_steps: int = 0,
-    num_replicas: int = 2,
-    *,
-    model: str = "qwen3",
-    flavor: str = "0.6B",
-    trainer_tensor_parallel_degree: int = 1,
-    generator_tensor_parallel_degree: int = 1,
-) -> DiLoCoRLReplica.Config:
-    """Synchronous DiLoCo GRPO (2 GPUs/worker at the default TP=1: 1 generator
-    + 1 trainer GPU each, so two workers fit on a 4-GPU node -- raise the
-    tensor_parallel_degree params for a model that needs more than one GPU per
-    role; the launch script's GPUS_PER_REPLICA must then grow to match).
-
-    N workers coordinate through a torchft Lighthouse/Manager quorum and sync
-    averaged pseudo-gradients + an outer Nesterov-SGD step every sync_every
-    steps (stock DiLoCo, no parameter server). Loss is stock GRPO.
-    """
-    return wrap_replica(
-        DiLoCoRLReplica,
-        base_rl_config(
-            hf_assets_path,
-            model=model,
-            flavor=flavor,
-            trainer_tensor_parallel_degree=trainer_tensor_parallel_degree,
-            generator_tensor_parallel_degree=generator_tensor_parallel_degree,
-        ),
-        sync_every=sync_every,
-        train_seconds=0.0 if num_outer_steps else train_seconds,
-        num_outer_steps=num_outer_steps,
-        num_replicas=num_replicas,
-    )
-
-
-def rl_diloco_qwen3_1_7b(**kwargs) -> DiLoCoRLReplica.Config:
-    """1.7B preset; see rl_diloco_qwen3_0_6b for the strategy docstring."""
-    kwargs.setdefault("flavor", "1.7B")
-    return rl_diloco_qwen3_0_6b(**kwargs)
-
-
-def rl_diloco_llama3_8b(**kwargs) -> DiLoCoRLReplica.Config:
-    """Llama3-8B preset; see rl_heloco_llama3_8b for the extension-point
-    note and rl_diloco_qwen3_0_6b for the strategy docstring."""
-    kwargs.setdefault("model", "llama3")
-    kwargs.setdefault("flavor", "8B")
-    return rl_diloco_qwen3_0_6b(**kwargs)
-
-
-def rl_async_inference_qwen3_0_6b(
-    hf_assets_path: str | None = None,
-    sync_every: int = 4,
-    train_seconds: float = 3600.0,
-    num_outer_steps: int = 0,
-    max_staleness: int = 4,
-    relay_addresses: str = "",
-    rollout_queue_address: str = "",
-    num_shards: int = 4,
-    publish_every: int = 1,
-    *,
-    model: str = "qwen3",
-    flavor: str = "0.6B",
-    trainer_tensor_parallel_degree: int = 1,
-    generator_tensor_parallel_degree: int = 1,
-) -> AsyncInferenceReplica.Config:
-    """Trainer role: ONE pure-learner trainer (1 GPU, no local vLLM) fed 
-    entirely by a pool of remote generator workers
-    (rl_async_inference_worker_*) on their own machines. The trainer pops
-    rollouts from the standalone queue process at rollout_queue_address under
-    a max_staleness bound, trains, and shards + publishes its weights to
-    relay_addresses every publish_every windows (SHARDCAST-style) -- plus an
-    initial publish at startup so the workers can bootstrap. Both addresses
-    are required -- start the servers first:
-    ``python -m panoengine.train.rl.relay`` and
-    ``python -m panoengine.train.rl.rollout_queue``.
-    Workers push rollouts to the same queue
-    ($ASYNC_INFERENCE_ROLLOUT_QUEUE_ADDR) and pull weights from the relay
-    ($ASYNC_INFERENCE_RELAY_ADDRS).
-    """
-    return wrap_replica(
-        AsyncInferenceReplica,
-        base_rl_config(
-            hf_assets_path,
-            model=model,
-            flavor=flavor,
-            trainer_tensor_parallel_degree=trainer_tensor_parallel_degree,
-            generator_tensor_parallel_degree=generator_tensor_parallel_degree,
-        ),
-        sync_every=sync_every,
-        train_seconds=0.0 if num_outer_steps else train_seconds,
-        num_outer_steps=num_outer_steps,
-        max_staleness=max_staleness,
-        relay_addresses=relay_addresses,
-        rollout_queue_address=rollout_queue_address,
-        num_shards=num_shards,
-        publish_every=publish_every,
-        # Pure learner: no local vLLM (Controller.Config defaults to 1, but
-        # generation is fully decoupled onto the remote worker pool).
-        num_generators=0,
-    )
-
-
-def rl_async_inference_qwen3_1_7b(**kwargs) -> AsyncInferenceReplica.Config:
-    """1.7B preset; see rl_async_inference_qwen3_0_6b for the strategy docstring."""
-    kwargs.setdefault("flavor", "1.7B")
-    return rl_async_inference_qwen3_0_6b(**kwargs)
-
-
-def rl_async_inference_llama3_8b(**kwargs) -> AsyncInferenceReplica.Config:
-    """Llama3-8B preset -- a second model family, proving the
-    _MODEL_REGISTRY_BY_MODEL extension point works end to end with no other
-    changes. See rl_async_inference_qwen3_0_6b for the strategy docstring."""
-    kwargs.setdefault("model", "llama3")
-    kwargs.setdefault("flavor", "8B")
-    return rl_async_inference_qwen3_0_6b(**kwargs)
-
-
-def rl_async_inference_worker_qwen3_0_6b(
-    hf_assets_path: str | None = None,
-    relay_addresses: str = "",
-    rollout_queue_address: str = "",
-    worker_id: int = 0,
-    group_size: int = 8,
-    groups_per_round: int = 2,
-    poll_interval_s: float = 2.0,
-    num_rounds: int = 0,
-    *,
-    model: str = "qwen3",
-    flavor: str = "0.6B",
-    generator_tensor_parallel_degree: int = 1,
-) -> AsyncInferenceWorker.Config:
-    """Inference-worker role of the async-inference relay swarm: no trainer
-    fields apply here (this role has no trainer actor -- see
-    async_inference/worker.py), so this copies only what a generator needs
-    out of base_rl_config() rather than going through wrap_replica (which
-    assumes an RLTrainer.Config-shaped target). relay_addresses (weights in)
-    and rollout_queue_address (rollouts out, the standalone queue process both
-    this worker and the trainer talk to) are both required.
-    """
+def _build(strategy: str, model: str, flavor: str, task: str | None, **kwargs):
+    """Build one preset: base_rl_config, the task overlay, then the strategy's
+    Config. ``kwargs`` win over every table default."""
+    cls, role, overrides = _STRATEGIES[strategy]
+    kwargs = {"model": model, "flavor": flavor, **overrides, **kwargs}
+    kwargs = {**_LAYOUT.get((kwargs["model"], kwargs["flavor"]), {}), **kwargs}
+    if task == "dapo_math":
+        kwargs.setdefault("seq_len", _DAPO_MATH_SEQ_LEN)
+    if role != "colocated":
+        kwargs.pop("num_generators", None)  # no local generators in this role
     base = base_rl_config(
-        hf_assets_path=hf_assets_path,
-        model=model,
-        flavor=flavor,
-        generator_tensor_parallel_degree=generator_tensor_parallel_degree,
+        **{k: kwargs.pop(k) for k in _BASE_RL_CONFIG_ARGS & kwargs.keys()}
     )
-    return AsyncInferenceWorker.Config(
-        model=base.model,
-        hf_assets_path=hf_assets_path or base.hf_assets_path,
-        generator=base.generator,
-        rollouter=base.rollouter,
-        renderer=base.renderer,
-        group_size=group_size,
-        groups_per_round=groups_per_round,
-        relay_addresses=relay_addresses,
-        rollout_queue_address=rollout_queue_address,
-        worker_id=worker_id,
-        poll_interval_s=poll_interval_s,
-        num_rounds=num_rounds,
-    )
+    if task == "dapo_math":
+        _apply_dapo_math(base, colocated=role == "colocated")
+    if role == "worker":
+        # A worker emits whole GRPO groups; a trainer expecting N siblings
+        # cannot use groups of any other size.
+        kwargs.setdefault("group_size", base.async_loop.num_samples_per_prompt)
+        return AsyncInferenceWorker.Config(
+            model=base.model,
+            hf_assets_path=base.hf_assets_path,
+            generator=base.generator,
+            rollouter=base.rollouter,
+            renderer=base.renderer,
+            **kwargs,
+        )
+    # Run-bound by wall clock unless a step count is given (exactly one is set).
+    kwargs.setdefault("train_seconds", 0.0 if kwargs.get("num_outer_steps") else 3600.0)
+    return wrap_replica(cls, base, **kwargs)
 
 
-def rl_async_inference_worker_qwen3_1_7b(**kwargs) -> AsyncInferenceWorker.Config:
-    """1.7B preset; see rl_async_inference_worker_qwen3_0_6b for the strategy
-    docstring."""
-    kwargs.setdefault("flavor", "1.7B")
-    return rl_async_inference_worker_qwen3_0_6b(**kwargs)
+def _register(namespace: dict, strategy, model, flavor, task, build, apply=None):
+    """Define the preset ``<strategy>[_<task>]_<model>_<size>`` in
+    ``namespace``: ``build(**kwargs)``, then ``apply`` if given."""
+    size = flavor.lower().replace(".", "_")
+    name = "_".join(filter(None, (strategy, task, model, size)))
+
+    def preset(**kwargs):
+        cfg = build(**kwargs)
+        return apply(cfg) if apply else cfg
+
+    preset.__name__ = preset.__qualname__ = name
+    preset.__module__ = namespace["__name__"]
+    preset.__doc__ = f"{strategy} on {model} {flavor}" + (f" ({task})" if task else "")
+    namespace[name] = preset
 
 
-def rl_heloco_async_inference_worker_qwen3_0_6b(
-    hf_assets_path: str | None = None,
-    relay_addresses: str = "",
-    rollout_queue_address: str = "",
-    worker_id: int = 0,
-    group_size: int = 8,
-    groups_per_round: int = 8,
-    poll_interval_s: float = 2.0,
-    num_rounds: int = 0,
-    *,
-    model: str = "qwen3",
-    flavor: str = "0.6B",
-    generator_tensor_parallel_degree: int = 1,
-    seq_len: int = _SEQ_LEN,
-) -> AsyncInferenceWorker.Config:
-    """Inference-worker (generator) role of the heloco_async_inference swarm:
-    the exact same AsyncInferenceWorker process as rl_async_inference_worker_*
-    (all workers free-run -- generate continuously at their current weights,
-    upgrading opportunistically -- which is the definition of a decoupled
-    async generator). These workers are the trainers' SOLE rollout source (no
-    trainer here runs any local generation), and there can be many of them
-    feeding many trainers through the one hub. Point relay_addresses
-    (weights in) at the relay process and rollout_queue_address (rollouts out)
-    at the shared queue process ($ROLLOUT_QUEUE_ADDR). ``groups_per_round`` defaults
-    higher than the base preset so a small generator pool fills a trainer's
-    per-window token target in a few rounds.
-    """
-    base = base_rl_config(
-        hf_assets_path=hf_assets_path,
-        model=model,
-        flavor=flavor,
-        generator_tensor_parallel_degree=generator_tensor_parallel_degree,
-        seq_len=seq_len,
-    )
-    return AsyncInferenceWorker.Config(
-        model=base.model,
-        hf_assets_path=hf_assets_path or base.hf_assets_path,
-        generator=base.generator,
-        rollouter=base.rollouter,
-        renderer=base.renderer,
-        group_size=group_size,
-        groups_per_round=groups_per_round,
-        relay_addresses=relay_addresses,
-        rollout_queue_address=rollout_queue_address,
-        worker_id=worker_id,
-        poll_interval_s=poll_interval_s,
-        num_rounds=num_rounds,
-    )
+def register_task(namespace: dict, task: str, apply, *, model: str, **kwargs) -> None:
+    """For a code overlay: define ``<strategy>_<task>_<model>_<size>`` in
+    ``namespace`` (the overlay's ``globals()``) for every strategy and every
+    checkpoint of ``model`` -- the engine preset built with ``kwargs`` (e.g.
+    ``seq_len``), then passed through ``apply``, which returns the config.
+    ``apply`` gets trainer and worker Configs alike, so it should only set what
+    both carry (rollouter, renderer, generator)."""
+    for strategy in _STRATEGIES:
+        for m, flavor in _DEFAULT_HF_ASSETS_PATH:
+            if m == model:
+                build = functools.partial(_build, strategy, m, flavor, None, **kwargs)
+                _register(namespace, strategy, m, flavor, task, build, apply)
 
 
-def rl_heloco_async_inference_worker_qwen3_1_7b(
-    **kwargs,
-) -> AsyncInferenceWorker.Config:
-    """1.7B preset; see rl_heloco_async_inference_worker_qwen3_0_6b."""
-    kwargs.setdefault("flavor", "1.7B")
-    return rl_heloco_async_inference_worker_qwen3_0_6b(**kwargs)
-
-
-def rl_heloco_async_inference_worker_dapo_math_qwen3_0_6b(
-    max_response_tokens: int = 8192,
-    max_total_tokens: int = 10240,
-    **kwargs,
-) -> AsyncInferenceWorker.Config:
-    """Generator role for the DAPO-Math swarm: the worker of
-    rl_heloco_async_inference_worker_qwen3_0_6b (see it for the role) running
-    the DAPO-Math task with the reference sampling settings -- thinking on,
-    temperature/top-p 1.0, 8K response budget.
-
-    ``group_size`` is 16 to match the trainer preset's
-    ``async_loop.num_samples_per_prompt``: a worker emits whole GRPO groups and
-    a trainer that expects 16 siblings cannot use groups of 8.
-
-    Extra dependency: math-verify.
-    """
-    kwargs.setdefault("group_size", 16)
-    cfg = rl_heloco_async_inference_worker_qwen3_0_6b(seq_len=max_total_tokens, **kwargs)
-    cfg.rollouter = _dapo_math_rollouter(max_total_tokens)
-    cfg.renderer = from_renderers(Qwen3RendererConfig(enable_thinking=True))
-    cfg.generator.sampling.temperature = 1.0
-    cfg.generator.sampling.top_p = 1.0
-    cfg.generator.sampling.max_tokens = max_response_tokens
-    return cfg
-
-
-def rl_heloco_async_inference_worker_dapo_math_qwen3_4b(
-    **kwargs,
-) -> AsyncInferenceWorker.Config:
-    """4B DAPO-Math worker; see
-    rl_heloco_async_inference_worker_dapo_math_qwen3_0_6b."""
-    kwargs.setdefault("flavor", "4B")
-    return rl_heloco_async_inference_worker_dapo_math_qwen3_0_6b(**kwargs)
-
-
-# === Qwen3.5 (hybrid GatedDeltaNet + full attention) =========================
-#
-# Same strategies, model "qwen3_5". Generation goes through torchtitan's vLLM
-# GatedDeltaNet layer (rl/model/gdn.py: a paged conv + SSM state cache), so
-# these need no speculative decoding and no VLLM_SSM_CONV_STATE_LAYOUT=DS.
-# 0.8B is the cheap end-to-end check (one GPU per role). 9B is sized for an
-# H100:8 island: the fp32 trainer state alone is ~144 GB, so the trainer runs
-# TP=4 (~36 GB/GPU; Qwen3.5-9B's 4 KV heads cap TP at 4) next to four TP=1
-# generators. The decoupled kinds' trainer TP comes from the island's GPU count
-# (controld), so only its default is set here.
-
-_QWEN3_5_9B_TRAINER_TP = 4
-
-
-def rl_solo_qwen3_5_0_8b(**kwargs) -> SoloRLReplica.Config:
-    """Qwen3.5-0.8B on one island; see rl_solo_qwen3_0_6b."""
-    kwargs.setdefault("model", "qwen3_5")
-    kwargs.setdefault("flavor", "0.8B")
-    return rl_solo_qwen3_0_6b(**kwargs)
-
-
-def rl_solo_qwen3_5_9b(**kwargs) -> SoloRLReplica.Config:
-    """Qwen3.5-9B on one H100:8 island (trainer TP=4 + four generators), with
-    no parameter server; see rl_solo_qwen3_0_6b."""
-    kwargs.setdefault("model", "qwen3_5")
-    kwargs.setdefault("flavor", "9B")
-    kwargs.setdefault("trainer_tensor_parallel_degree", _QWEN3_5_9B_TRAINER_TP)
-    cfg = rl_solo_qwen3_0_6b(**kwargs)
-    cfg.num_generators = 4
-    return cfg
-
-
-def rl_heloco_qwen3_5_0_8b(**kwargs) -> HeLoCoRLReplica.Config:
-    """Qwen3.5-0.8B on the heloco stack; see rl_heloco_qwen3_0_6b."""
-    kwargs.setdefault("model", "qwen3_5")
-    kwargs.setdefault("flavor", "0.8B")
-    return rl_heloco_qwen3_0_6b(**kwargs)
-
-
-def rl_heloco_qwen3_5_9b(**kwargs) -> HeLoCoRLReplica.Config:
-    """Qwen3.5-9B on the heloco stack, one H100:8 island per replica (trainer
-    TP=4 + four generators); see rl_heloco_qwen3_0_6b."""
-    kwargs.setdefault("model", "qwen3_5")
-    kwargs.setdefault("flavor", "9B")
-    kwargs.setdefault("trainer_tensor_parallel_degree", _QWEN3_5_9B_TRAINER_TP)
-    cfg = rl_heloco_qwen3_0_6b(**kwargs)
-    cfg.num_generators = 4
-    return cfg
-
-
-def rl_heloco_async_inference_qwen3_5_0_8b(
-    **kwargs,
-) -> HeLoCoAsyncInferenceReplica.Config:
-    """Qwen3.5-0.8B pure learner; see rl_heloco_async_inference_qwen3_0_6b."""
-    kwargs.setdefault("model", "qwen3_5")
-    kwargs.setdefault("flavor", "0.8B")
-    return rl_heloco_async_inference_qwen3_0_6b(**kwargs)
-
-
-def rl_heloco_async_inference_qwen3_5_9b(
-    **kwargs,
-) -> HeLoCoAsyncInferenceReplica.Config:
-    """Qwen3.5-9B pure learner (TP=4 by default; on a launch the trainer
-    island's GPU count sets it); see rl_heloco_async_inference_qwen3_0_6b."""
-    kwargs.setdefault("model", "qwen3_5")
-    kwargs.setdefault("flavor", "9B")
-    kwargs.setdefault("trainer_tensor_parallel_degree", _QWEN3_5_9B_TRAINER_TP)
-    return rl_heloco_async_inference_qwen3_0_6b(**kwargs)
-
-
-def rl_heloco_async_inference_worker_qwen3_5_0_8b(
-    **kwargs,
-) -> AsyncInferenceWorker.Config:
-    """Qwen3.5-0.8B generator worker; see
-    rl_heloco_async_inference_worker_qwen3_0_6b."""
-    kwargs.setdefault("model", "qwen3_5")
-    kwargs.setdefault("flavor", "0.8B")
-    return rl_heloco_async_inference_worker_qwen3_0_6b(**kwargs)
-
-
-def rl_heloco_async_inference_worker_qwen3_5_9b(
-    **kwargs,
-) -> AsyncInferenceWorker.Config:
-    """Qwen3.5-9B generator worker (TP=1 fits the bf16 weights on one GPU);
-    see rl_heloco_async_inference_worker_qwen3_0_6b."""
-    kwargs.setdefault("model", "qwen3_5")
-    kwargs.setdefault("flavor", "9B")
-    return rl_heloco_async_inference_worker_qwen3_0_6b(**kwargs)
-
-
-def rl_diloco_qwen3_5_0_8b(**kwargs) -> DiLoCoRLReplica.Config:
-    """Qwen3.5-0.8B on the diloco stack; see rl_diloco_qwen3_0_6b."""
-    kwargs.setdefault("model", "qwen3_5")
-    kwargs.setdefault("flavor", "0.8B")
-    return rl_diloco_qwen3_0_6b(**kwargs)
-
-
-def rl_diloco_qwen3_5_9b(**kwargs) -> DiLoCoRLReplica.Config:
-    """Qwen3.5-9B on the diloco stack, laid out like rl_heloco_qwen3_5_9b."""
-    kwargs.setdefault("model", "qwen3_5")
-    kwargs.setdefault("flavor", "9B")
-    kwargs.setdefault("trainer_tensor_parallel_degree", _QWEN3_5_9B_TRAINER_TP)
-    cfg = rl_diloco_qwen3_0_6b(**kwargs)
-    cfg.num_generators = 4
-    return cfg
-
-
-def rl_async_inference_qwen3_5_0_8b(**kwargs) -> AsyncInferenceReplica.Config:
-    """Qwen3.5-0.8B relay-swarm trainer; see rl_async_inference_qwen3_0_6b."""
-    kwargs.setdefault("model", "qwen3_5")
-    kwargs.setdefault("flavor", "0.8B")
-    return rl_async_inference_qwen3_0_6b(**kwargs)
-
-
-def rl_async_inference_qwen3_5_9b(**kwargs) -> AsyncInferenceReplica.Config:
-    """Qwen3.5-9B relay-swarm trainer (TP=4 default, as
-    rl_heloco_async_inference_qwen3_5_9b); see rl_async_inference_qwen3_0_6b."""
-    kwargs.setdefault("model", "qwen3_5")
-    kwargs.setdefault("flavor", "9B")
-    kwargs.setdefault("trainer_tensor_parallel_degree", _QWEN3_5_9B_TRAINER_TP)
-    return rl_async_inference_qwen3_0_6b(**kwargs)
-
-
-def rl_async_inference_worker_qwen3_5_0_8b(**kwargs) -> AsyncInferenceWorker.Config:
-    """Qwen3.5-0.8B relay-swarm worker; see rl_async_inference_worker_qwen3_0_6b."""
-    kwargs.setdefault("model", "qwen3_5")
-    kwargs.setdefault("flavor", "0.8B")
-    return rl_async_inference_worker_qwen3_0_6b(**kwargs)
-
-
-def rl_async_inference_worker_qwen3_5_9b(**kwargs) -> AsyncInferenceWorker.Config:
-    """Qwen3.5-9B relay-swarm worker; see rl_async_inference_worker_qwen3_0_6b."""
-    kwargs.setdefault("model", "qwen3_5")
-    kwargs.setdefault("flavor", "9B")
-    return rl_async_inference_worker_qwen3_0_6b(**kwargs)
+for _strategy in _STRATEGIES:
+    for _model, _flavor in _DEFAULT_HF_ASSETS_PATH:
+        _args = (_strategy, _model, _flavor)
+        _register(globals(), *_args, None, functools.partial(_build, *_args, None))
+        if _model == "qwen3":  # the recipe pins the Qwen3 (thinking) renderer
+            _build_dapo = functools.partial(_build, *_args, "dapo_math")
+            _register(globals(), *_args, "dapo_math", _build_dapo)

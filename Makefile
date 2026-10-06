@@ -17,7 +17,11 @@ TORCHFT_URL    ?= https://github.com/PanocularAI/torchft.git
 TORCHTITAN_REF ?= 3058f9779f43e887422da6dfe7fb8ca4b1afbccb
 TORCHFT_REF    ?= 716bff9584a9e0613dd07f1837a63a9f2e3583b4
 
-TORCH_SPEC ?= torch
+# RL builds pin torch to the nightly vLLM was built against (TORCH_VERSION, below).
+# Unpinned, install-torch pulls the NEWEST nightly and install-rl then downgrades it to
+# vLLM's pin: a wasted ~2.5 GB download and thousands of deleted/re-created files on the
+# shared FS, every env build.
+TORCH_SPEC ?= $(if $(filter 1,$(PF_RL)),torch==$(TORCH_VERSION),torch)
 PYTORCH_BASE_URL ?= https://download.pytorch.org/whl/nightly
 
 PROTOC_VERSION ?= 32.0
@@ -226,6 +230,13 @@ install-rl:
 # consumer). `--no-deps .` skips the redundant git engine pull (panofabric-engine's only
 # deps are torchtitan/torchft, installed locally from the sibling clones next).
 build-into: export VIRTUAL_ENV := $(abspath $(VENV))
+# Copy, not uv's default hardlinks from its cache: the cache is ONE shared dir
+# (~/.cache/uv), so every cached env shared each file's inode with it and with every
+# other env (link counts of 6-8 seen live). On BeeGFS, opening such files while
+# concurrent builds added links to them failed with ENOENT on files that exist --
+# killing generator islands at import (transformers, torch, sympy files). Copies cost
+# ~7 GB of real disk per cached env, once per fingerprint.
+build-into: export UV_LINK_MODE := copy
 build-into: setup-env
 	$(UV) venv $(VENV) --relocatable --python $(PYTHON_VERSION)
 	$(UV_PIP_CMD) --no-deps .

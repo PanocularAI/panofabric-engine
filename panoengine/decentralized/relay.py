@@ -345,15 +345,10 @@ async def _handle_get_shard(request: web.Request) -> web.Response:
     if path is None:
         return web.Response(status=404, text=f"no shard {idx} for version {version}")
     # sendfile straight from the spool: no multi-GB copy through Python.
-    resp = web.FileResponse(path)
-    t0 = time.perf_counter()
-    await resp.prepare(request)
-    dt = time.perf_counter() - t0
-    size = resp.content_length or 0
-    logger.info("sent v%d shard %d to %s: %.2f GB in %.1fs (%.0f MB/s)",
-                version, idx, request.remote, size / 1e9, dt,
-                size / 1e6 / max(dt, 1e-9))
-    return resp
+    # Returned unprepared: aiohttp prepares it, and a FileResponse prepared
+    # here first asserts on that second prepare. Download rates are logged by
+    # the fetching RelayClient instead.
+    return web.FileResponse(path)
 
 
 async def run_relay_server(
@@ -521,7 +516,13 @@ class RelayClient:
         except (aiohttp.ClientError, asyncio.TimeoutError):
             self._record_failure(url)
             return None
-        self._record_success(url, total_bytes, time.monotonic() - t0)
+        dt = time.monotonic() - t0
+        self._record_success(url, total_bytes, dt)
+        logger.info(
+            "fetched checkpoint v%d from %s: %d shards, %.2f GB in %.1fs (%.0f MB/s)",
+            manifest.version, url, manifest.num_shards, total_bytes / 1e9, dt,
+            total_bytes / 1e6 / max(dt, 1e-9),
+        )
         return shard_bytes
 
     async def fetch_latest(self, min_version: int = 0) -> tuple[int, dict] | None:

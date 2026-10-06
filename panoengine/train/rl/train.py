@@ -68,6 +68,31 @@ _ELASTIC_PORT_BASE = 29800
 _mesh_counter = itertools.count()
 
 
+def _host_gpu_index(visible: str) -> int:
+    """The host-wide index of the first GPU in ``visible`` (CUDA_VISIBLE_DEVICES).
+
+    Slurm with device cgroups renumbers each job's GPUs from 0, so two 1-GPU
+    jobs on one node both read "0" — and collided on the same port (EADDRINUSE,
+    four L40S:1 generator islands packed onto one node). SLURM_STEP_GPUS /
+    SLURM_JOB_GPUS hold the job's physical indices, so a renumbered index maps
+    back through them. Visible numbers that cannot be indices into that list, or
+    that ARE the whole list, are already physical (no device cgroups) and kept.
+    Off Slurm neither variable is set and ``visible`` is returned as is.
+
+    Residual ambiguity: several replicas splitting ONE Slurm job on a node
+    without device cgroups, whose slice numbers overlap the job's physical ones.
+    No launcher packs replicas into one Slurm job today.
+    """
+    vis = [int(v) for v in visible.split(",")]
+    job = os.environ.get("SLURM_STEP_GPUS") or os.environ.get("SLURM_JOB_GPUS")
+    try:
+        gpus = [int(g) for g in job.split(",")] if job else []
+    except ValueError:  # an unexpected format: keep the visible number
+        gpus = []
+    renumbered = bool(gpus) and max(vis) < len(gpus) and set(vis) != set(gpus)
+    return gpus[vis[0]] if renumbered else vis[0]
+
+
 async def setup_mesh_elastic_env(mesh: ProcMesh) -> None:
     """``setup_torch_elastic_env_async`` with a deterministic, host-unique port.
 
@@ -78,15 +103,19 @@ async def setup_mesh_elastic_env(mesh: ProcMesh) -> None:
 
     Launchers partition a host's replicas by disjoint, contiguous
     CUDA_VISIBLE_DEVICES ranges, and a replica spawns at most one mesh per
-    GPU it owns, so (first visible device + this process's mesh counter) is
-    unique across every mesh on the host. Without CUDA_VISIBLE_DEVICES there
+    GPU it owns, so (host-wide index of the first visible device + this
+    process's mesh counter) is unique across every mesh on the host — across
+    Slurm jobs sharing a node too (_host_gpu_index). Without CUDA_VISIBLE_DEVICES there
     is no partition (sole tenant / remote host meshes) — keep Monarch's pick.
     """
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if not visible:
         await setup_torch_elastic_env_async(mesh)
         return
-    port = _ELASTIC_PORT_BASE + int(visible.split(",")[0]) + next(_mesh_counter)
+    gpu = _host_gpu_index(visible)
+    port = _ELASTIC_PORT_BASE + gpu + next(_mesh_counter)
+    logger.info("elastic env: port %d (host GPU %d, CUDA_VISIBLE_DEVICES=%s)",
+                port, gpu, visible)
     await setup_torch_elastic_env_async(
         mesh, master_addr=socket.gethostname(), master_port=port
     )

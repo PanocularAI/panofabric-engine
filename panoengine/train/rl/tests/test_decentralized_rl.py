@@ -38,7 +38,7 @@ from panoengine.train.rl.replicas import (
     DiLoCoRLReplica,
     HeLoCoRLReplica,
 )
-from panoengine.train.rl.train import PerHostProvisioner
+from panoengine.train.rl.train import _host_gpu_index, PerHostProvisioner
 
 #: The CPU-light guard runs a child interpreter. It used to rely on cwd=<torchtitan
 #: repo root> to make the packages importable; from here that path no longer exists,
@@ -640,6 +640,36 @@ def test_provisioner_slices_pool_and_rejects_over_allocation(monkeypatch):
     prov.allocate(1)
     with pytest.raises(RuntimeError, match="CUDA_VISIBLE_DEVICES exposes"):
         prov.allocate(2)
+
+
+@pytest.mark.parametrize("visible, slurm_gpus, expected", [
+    ("0", None, 0),            # off Slurm: CUDA_VISIBLE_DEVICES as is
+    ("2,3", None, 2),          # off Slurm, a launcher's slice
+    ("0", "5", 5),             # a 1-GPU job on a shared node, renumbered from 0
+    ("0", "0", 0),             # ...the job that holds physical GPU 0
+    ("0,1", "4,5", 4),         # a 2-GPU job, renumbered
+    ("2,3", "4,5,6,7", 6),     # replicas slicing one job: slice 2 is physical 6
+    ("1", "1,2", 2),           # ...with slice numbers overlapping the physical ones
+    ("5", "5", 5),             # no device cgroups: already physical
+    ("1,2", "1,2", 1),         # ...the whole job, physical
+    ("0", "0-3", 0),           # an unexpected format: keep the visible number
+])
+def test_host_gpu_index_is_unique_across_slurm_jobs(monkeypatch, visible,
+                                                    slurm_gpus, expected):
+    # Four L40S:1 generator jobs packed onto one node all read
+    # CUDA_VISIBLE_DEVICES=0 and collided on one elastic port (EADDRINUSE).
+    monkeypatch.delenv("SLURM_STEP_GPUS", raising=False)
+    if slurm_gpus is None:
+        monkeypatch.delenv("SLURM_JOB_GPUS", raising=False)
+    else:
+        monkeypatch.setenv("SLURM_JOB_GPUS", slurm_gpus)
+    assert _host_gpu_index(visible) == expected
+
+
+def test_host_gpu_index_prefers_the_step_gpus(monkeypatch):
+    monkeypatch.setenv("SLURM_JOB_GPUS", "4,5,6,7")
+    monkeypatch.setenv("SLURM_STEP_GPUS", "6")
+    assert _host_gpu_index("0") == 6
 
 
 # === __init__.py ============================================================

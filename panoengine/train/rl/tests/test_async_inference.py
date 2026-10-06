@@ -143,6 +143,36 @@ def test_relay_server_publish_and_fetch_round_trip():
     asyncio.run(scenario())
 
 
+def test_relay_spools_shards_to_disk_and_evicts_them(tmp_path):
+    """Shards live on disk, not in the relay's memory: a 9B checkpoint is ~18 GB
+    per version and the in-memory store OOM-killed a 16 GB hub mid-publish. A
+    shard bigger than one upload chunk must stream in intact, be served back
+    byte-for-byte, and leave disk when its version is evicted."""
+    async def scenario():
+        relay = RelayServer(retain_last=1, spool_dir=str(tmp_path))
+        server = TestServer(relay.app())
+        await server.start_server()
+        base_url = str(server.make_url("")).rstrip("/")
+        try:
+            client = RelayClient([base_url])
+            sd = {"big": torch.arange(3_000_000, dtype=torch.float32)}  # ~12 MB > 4 MB chunk
+            shards = shard_state_dict(sd, num_shards=1)
+            await client.publish(1, shards, build_manifest(1, shards))
+            assert (tmp_path / "1" / "0").read_bytes() == shards[0]
+            assert not list((tmp_path / "1").glob(".*.part"))   # no temp left behind
+
+            version, restored = await client.fetch_latest()
+            assert version == 1 and torch.equal(restored["big"], sd["big"])
+
+            await client.publish(2, shards, build_manifest(2, shards))
+            assert not (tmp_path / "1").exists()   # evicted from disk, not just the index
+            assert relay.latest_version() == 2
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
 def test_relay_advertises_only_complete_versions():
     """A manifest whose shards are still landing is not "latest": a fetcher
     would 404 on the missing shards and re-download the rest on every retry."""
@@ -694,13 +724,13 @@ def test_relay_publish_survives_a_transfer_slower_than_the_old_total():
             # total=None is what matters: each shard takes longer than the
             # whole budget would have allowed, but neither stalls.
             client = RelayClient([base_url], timeout_s=5.0, stall_timeout_s=5.0)
-            slow = relay.publish_shard
+            slow = relay.publish_shard_file
 
-            def slow_put(version, idx, data):
+            def slow_put(version, idx, tmp):
                 time.sleep(0.15)
-                return slow(version, idx, data)
+                return slow(version, idx, tmp)
 
-            relay.publish_shard = slow_put
+            relay.publish_shard_file = slow_put
             await client.publish(11, shards, manifest)
             assert relay.latest_version() == 11
             assert relay.get_shard(11, 0) == shards[0]

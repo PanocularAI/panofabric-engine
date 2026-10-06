@@ -12,8 +12,8 @@
 #   - RelayServer: a CDN-like CPU relay node sitting between one trainer and
 #     many inference workers, so the trainer never serves every worker's
 #     weight pulls itself and workers never need the trainer's address
-#     directly. Stores shards + a per-version manifest and keeps only the
-#     last ``retain_last`` versions (disk/memory limits, matching the paper).
+#     directly. Stores shards ON DISK (manifests in memory) and keeps only
+#     the last ``retain_last`` versions (matching the paper).
 #   - RelayClient: the publisher/fetcher counterpart. Tracks a per-relay
 #     success_rate/bandwidth EMA and picks a relay *probabilistically
 #     weighted by success_rate x bandwidth* rather than always the fastest --
@@ -30,9 +30,14 @@ import asyncio
 import hashlib
 import io
 import logging
+import os
 import random
+import shutil
+import tempfile
 import time
+import weakref
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import aiohttp
 import torch
@@ -42,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 _EMA_ALPHA = 0.3
 _RELAY_KEY = web.AppKey("relay")
+_UPLOAD_CHUNK = 4 << 20
 
 
 # --------------------------------------------------------------------- #
@@ -173,18 +179,35 @@ def reassemble_state_dict(
 
 
 class RelayServer:
-    """In-memory shard/manifest store for one relay node.
+    """Shard/manifest store for one relay node: shards on disk under
+    ``spool_dir``, manifests in memory.
+
+    Disk, not RAM, because the store holds whole checkpoints: ~18 GB per
+    version for a 9B model in bf16, ``retain_last`` versions of them. The
+    in-memory store this replaced grew to 13.3 GB on a 16 GB hub and was
+    OOM-killed mid-publish (run 817f7f419fab); the trainer only saw "Server
+    disconnected". Uploads stream into a temp file renamed into place, so a
+    shard is visible only once complete; downloads go out with sendfile.
 
     Not thread-safe by locking (aiohttp's default single-threaded event loop
     serializes handler bodies between awaits, which is enough here since
     nothing awaits mid-mutation) but IS safe under normal aiohttp concurrency
-    for that reason.
+    for that reason. ``spool_dir=None`` uses a private temp dir, removed with
+    the server.
     """
 
-    def __init__(self, retain_last: int = 5):
+    def __init__(self, retain_last: int = 5, spool_dir: str | None = None):
         self.retain_last = retain_last
-        self._shards: dict[int, dict[int, bytes]] = {}
+        if spool_dir is None:
+            spool_dir = tempfile.mkdtemp(prefix="pf-relay-")
+            weakref.finalize(self, shutil.rmtree, spool_dir, True)
+        self.spool_dir = Path(spool_dir)
+        self.spool_dir.mkdir(parents=True, exist_ok=True)
+        self._landed: dict[int, set[int]] = {}
         self._manifests: dict[int, CheckpointManifest] = {}
+
+    def _version_dir(self, version: int) -> Path:
+        return self.spool_dir / str(version)
 
     def latest_version(self) -> int | None:
         """The newest version whose shards have ALL landed. A publish posts its
@@ -193,7 +216,7 @@ class RelayServer:
         handed it gets 404s and re-downloads the shards that did land on every
         retry."""
         complete = [v for v, m in self._manifests.items()
-                    if len(self._shards.get(v, {})) == m.num_shards]
+                    if len(self._landed.get(v, ())) == m.num_shards]
         return max(complete) if complete else None
 
     def _evict_old(self) -> None:
@@ -203,23 +226,51 @@ class RelayServer:
         for version in list(self._manifests):
             if version not in keep:
                 del self._manifests[version]
-                self._shards.pop(version, None)
+                self._landed.pop(version, None)
+                # A download already streaming one of these files keeps its
+                # open fd, so unlinking never cuts a transfer short.
+                shutil.rmtree(self._version_dir(version), ignore_errors=True)
 
     def publish_manifest(self, version: int, manifest: CheckpointManifest) -> None:
         self._manifests[version] = manifest
-        self._shards.setdefault(version, {})
+        self._landed.setdefault(version, set())
+        self._version_dir(version).mkdir(exist_ok=True)
         self._evict_old()
 
-    def publish_shard(self, version: int, idx: int, data: bytes) -> None:
+    def new_shard_file(self, version: int, idx: int) -> Path:
+        """A temp file in ``version``'s spool dir to stream shard ``idx`` into;
+        publish_shard_file then commits it."""
         if version not in self._manifests:
             raise KeyError(f"no manifest published for version {version}")
-        self._shards[version][idx] = data
+        fd, tmp = tempfile.mkstemp(dir=self._version_dir(version),
+                                   prefix=f".{idx}.", suffix=".part")
+        os.close(fd)
+        return Path(tmp)
+
+    def publish_shard_file(self, version: int, idx: int, tmp: Path) -> None:
+        """Commit a fully written temp file as shard ``idx`` of ``version``."""
+        if version not in self._manifests:  # evicted while it uploaded
+            tmp.unlink(missing_ok=True)
+            raise KeyError(f"no manifest published for version {version}")
+        os.replace(tmp, self._version_dir(version) / str(idx))
+        self._landed[version].add(idx)
+
+    def publish_shard(self, version: int, idx: int, data: bytes) -> None:
+        tmp = self.new_shard_file(version, idx)
+        tmp.write_bytes(data)
+        self.publish_shard_file(version, idx, tmp)
 
     def get_manifest(self, version: int) -> CheckpointManifest | None:
         return self._manifests.get(version)
 
+    def shard_path(self, version: int, idx: int) -> Path | None:
+        if idx not in self._landed.get(version, ()):
+            return None
+        return self._version_dir(version) / str(idx)
+
     def get_shard(self, version: int, idx: int) -> bytes | None:
-        return self._shards.get(version, {}).get(idx)
+        path = self.shard_path(version, idx)
+        return path.read_bytes() if path is not None else None
 
     def app(self) -> web.Application:
         # client_max_size=0 disables aiohttp's default 1MB body cap: a
@@ -253,11 +304,28 @@ async def _handle_publish_shard(request: web.Request) -> web.Response:
     relay: RelayServer = request.app[_RELAY_KEY]
     version = int(request.match_info["version"])
     idx = int(request.match_info["idx"])
-    data = await request.read()
     try:
-        relay.publish_shard(version, idx, data)
+        tmp = relay.new_shard_file(version, idx)
     except KeyError as exc:
         return web.Response(status=404, text=str(exc))
+    # Streamed to disk, never buffered whole: one shard of a 9B checkpoint is
+    # ~4.5 GB. Writes go to a thread so a slow disk never stalls the loop that
+    # is also serving downloads.
+    t0, size = time.perf_counter(), 0
+    try:
+        with open(tmp, "wb") as f:
+            async for chunk in request.content.iter_chunked(_UPLOAD_CHUNK):
+                await asyncio.to_thread(f.write, chunk)
+                size += len(chunk)
+        relay.publish_shard_file(version, idx, tmp)
+    except KeyError as exc:
+        return web.Response(status=404, text=str(exc))
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    dt = time.perf_counter() - t0
+    logger.info("stored v%d shard %d: %.2f GB in %.1fs (%.0f MB/s)",
+                version, idx, size / 1e9, dt, size / 1e6 / max(dt, 1e-9))
     return web.Response(status=204)
 
 
@@ -273,23 +341,34 @@ async def _handle_get_shard(request: web.Request) -> web.Response:
     relay: RelayServer = request.app[_RELAY_KEY]
     version = int(request.match_info["version"])
     idx = int(request.match_info["idx"])
-    data = relay.get_shard(version, idx)
-    if data is None:
+    path = relay.shard_path(version, idx)
+    if path is None:
         return web.Response(status=404, text=f"no shard {idx} for version {version}")
-    return web.Response(body=data, content_type="application/octet-stream")
+    # sendfile straight from the spool: no multi-GB copy through Python.
+    resp = web.FileResponse(path)
+    t0 = time.perf_counter()
+    await resp.prepare(request)
+    dt = time.perf_counter() - t0
+    size = resp.content_length or 0
+    logger.info("sent v%d shard %d to %s: %.2f GB in %.1fs (%.0f MB/s)",
+                version, idx, request.remote, size / 1e9, dt,
+                size / 1e6 / max(dt, 1e-9))
+    return resp
 
 
 async def run_relay_server(
-    host: str = "0.0.0.0", port: int = 8765, retain_last: int = 5
+    host: str = "0.0.0.0", port: int = 8765, retain_last: int = 5,
+    spool_dir: str | None = None,
 ):
     """Start a relay server; returns the ``web.AppRunner`` (caller keeps it
     alive and calls ``.cleanup()`` to stop)."""
-    relay = RelayServer(retain_last=retain_last)
+    relay = RelayServer(retain_last=retain_last, spool_dir=spool_dir)
     runner = web.AppRunner(relay.app())
     await runner.setup()
     await web.TCPSite(runner, host, port).start()
     logger.info(
-        "relay server listening on %s:%d (retain_last=%d)", host, port, retain_last
+        "relay server listening on %s:%d (retain_last=%d, spool_dir=%s)",
+        host, port, retain_last, relay.spool_dir,
     )
     return runner
 
@@ -485,8 +564,10 @@ class RelayClient:
 # --------------------------------------------------------------------- #
 
 
-async def _serve(host: str, port: int, retain_last: int) -> None:
-    runner = await run_relay_server(host=host, port=port, retain_last=retain_last)
+async def _serve(host: str, port: int, retain_last: int,
+                 spool_dir: str | None) -> None:
+    runner = await run_relay_server(host=host, port=port, retain_last=retain_last,
+                                    spool_dir=spool_dir)
     print(f"ASYNC_INFERENCE_RELAY_ADDR=http://{host}:{port}", flush=True)
     logger.info("relay server serving; ctrl-c to stop")
     try:
@@ -509,10 +590,17 @@ def main() -> None:
         default=5,
         help="checkpoint versions kept before eviction (SHARDCAST's number)",
     )
+    parser.add_argument(
+        "--spool_dir",
+        type=str,
+        default=None,
+        help="where shards are stored (needs retain_last x checkpoint size of "
+        "disk); default: a temp dir removed on exit",
+    )
     args = parser.parse_args()
 
     try:
-        asyncio.run(_serve(args.host, args.port, args.retain_last))
+        asyncio.run(_serve(args.host, args.port, args.retain_last, args.spool_dir))
     except KeyboardInterrupt:
         logger.info("relay server shutting down")
 

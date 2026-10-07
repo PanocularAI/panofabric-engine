@@ -14,6 +14,7 @@ import os
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import itertools
 import pickle
@@ -28,6 +29,7 @@ from aiohttp.test_utils import TestServer
 import panoengine.decentralized.relay as relay_mod
 import panoengine.train.rl.worker as worker_mod
 from panoengine.decentralized.relay import (
+    BackgroundPublisher,
     build_manifest,
     reassemble_state_dict,
     RelayClient,
@@ -461,85 +463,97 @@ class _FakeRelayClient:
         return self._results.pop(0) if self._results else None
 
 
-def make_async_inference_replica(*, publish_every=1):
-    """A pure-learner AsyncInferenceReplica with only the window-sync/publish
-    state, skipping RLTrainer.__init__ (no actors, no generators)."""
+def make_async_inference_replica():
+    """A pure-learner AsyncInferenceReplica with only the publish state,
+    skipping RLTrainer.__init__ (no actors, no generators). Its fake trainer
+    acts like SnapshotPolicyTrainer.publish_to_relay: it starts an upload when
+    the previous one finished (``r.upload_done``) and reports finished ones."""
     r = object.__new__(AsyncInferenceReplica)
-    r.config = SimpleNamespace(publish_every=publish_every, num_shards=2)
-    r._relay_client = _FakeRelayClient()
-    r._checkpoint_version = 0
-    r._window_count = 0
-    sd = _state_dict()
+    r.config = SimpleNamespace(replica_id=0, num_shards=2)
+    r._relay_urls = ["http://relay"]
+    r._latest_published = r._window_published = 0
+    r._policy_version = 0
+    r.offered, r.started, r.upload_done = [], [], True
+    pending = []
 
-    r.requested_dtypes = []
+    async def publish_to_relay(*, version, relay_urls, num_shards):
+        r.offered.append(version)
+        reports = []
+        if r.upload_done and pending:
+            reports = [{"version": pending.pop(), "num_shards": num_shards,
+                        "bytes": 10**9, "seconds": 1.0}]
+        if not r.upload_done or pending:
+            return {0: {"started": False, "reports": reports}}
+        r.started.append(version)
+        pending.append(version)
+        r.upload_done = False
+        return {0: {"started": True, "reports": reports}}
 
-    async def fake_get_full_state_dict_cpu(dtype=torch.float32):
-        r.requested_dtypes.append(dtype)
-        return {0: sd}  # {rank: value}, so inherited _get_rank_0_value (.get(0)) works
-
-    r.trainer = SimpleNamespace(
-        get_full_state_dict_cpu=_ep(fake_get_full_state_dict_cpu)
-    )
+    r.trainer = SimpleNamespace(publish_to_relay=_ep(publish_to_relay))
     r._buffer = asyncio.Queue()
     r._num_dropped = 0
-    r._publish_task = None
     return r
 
 
-def test_window_sync_publishes_only_on_boundary_in_background():
-    """Boundary windows START a background publish (the window never blocks on
-    sharding/POSTing GBs); non-boundary windows don't. The published tensors
-    go over the wire as bf16."""
+def test_publishes_after_any_step_whose_previous_upload_finished():
+    """No cadence: every step offers its weights (as version step + 1), and the
+    trainer starts an upload only once the previous one is done; the window
+    boundary just reports what got published."""
 
     async def scenario():
-        r = make_async_inference_replica(publish_every=2)
-
-        stats1 = await r._window_sync(t0=0.0)
-        assert stats1.startswith("buffer: depth=0 dropped=0")  # base stats line
-        assert "relay" not in stats1  # window 1: not a boundary
-        assert r._publish_task is None and r._relay_client.published == []
-
-        stats2 = await r._window_sync(t0=0.0)
-        assert "relay: publish started (background)" in stats2
-        await r._publish_task  # drain the background publish
-        assert len(r._relay_client.published) == 1
-        version, num_shards, manifest = r._relay_client.published[0]
-        assert version == 1 and num_shards == 2 and manifest.version == 1
-        # Cast on the trainer GPU, not after a full-precision copy home.
-        assert r.requested_dtypes == [torch.bfloat16]
-
-        stats3 = await r._window_sync(t0=0.0)
-        assert "relay" not in stats3
-        assert len(r._relay_client.published) == 1  # still just one publish
+        r = make_async_inference_replica()
+        for step in range(1, 6):
+            r._policy_version = step
+            if step == 3:
+                r.upload_done = True  # v2's upload finishes during step 3
+            await r._after_inner_step(0.0)
+        assert r.offered == [2, 3, 4, 5, 6]
+        assert r.started == [2, 4]  # 3 found v2 still uploading; 5, 6 found v4
+        stats = await r._window_sync(t0=0.0)
+        assert stats == ("buffer: depth=0 dropped=0 | relay: 1 published, latest v2")
+        assert (await r._window_sync(t0=0.0)).endswith("relay: 0 published, latest v2")
 
     asyncio.run(scenario())
 
 
-def test_window_sync_skips_publish_while_previous_in_flight():
-    """A boundary that lands while the previous publish is still uploading
-    must SKIP (workers just keep the last version a bit longer) -- never
-    queue a second concurrent publish or block the window."""
+def test_background_publisher_uploads_off_the_caller_and_reports(tmp_path):
+    """The trainer-side half: stage() copies into reused host buffers, start()
+    returns at once and uploads on a thread, a second stage() while that runs
+    is refused, and outcomes -- including a dead relay -- come back as reports
+    instead of exceptions on the thread."""
 
     async def scenario():
-        r = make_async_inference_replica(publish_every=1)
-        release = asyncio.Event()
-        real_publish = r._relay_client.publish
+        relay, server, base_url = await _start_relay(retain_last=2)
+        try:
+            pub = BackgroundPublisher()
+            sd = _state_dict()
+            for name, t in sd.items():
+                pub.stage(name, t)
+            gate = threading.Event()
+            real_upload = pub._upload
+            pub._upload = lambda *a: (gate.wait(5), real_upload(*a))
+            pub.start(7, [base_url], 2)
+            assert pub.busy()
+            with pytest.raises(RuntimeError, match="previous upload"):
+                pub.stage("layer.bias", sd["layer.bias"])
+            gate.set()
+            await asyncio.to_thread(pub.join)
+            [report] = pub.take_reports()
+            assert report["version"] == 7 and report["num_shards"] == 2
+            version, restored = await RelayClient([base_url]).fetch_latest()
+            assert version == 7
+            assert all(torch.equal(restored[k], sd[k]) for k in sd)
 
-        async def slow_publish(version, shard_bytes, manifest):
-            await release.wait()
-            await real_publish(version, shard_bytes, manifest)
-
-        r._relay_client.publish = slow_publish
-
-        stats1 = await r._window_sync(t0=0.0)
-        assert "relay: publish started (background)" in stats1
-        stats2 = await r._window_sync(t0=0.0)  # previous still in flight
-        assert "relay: publish skipped (previous in flight)" in stats2
-
-        release.set()
-        await r._publish_task
-        assert len(r._relay_client.published) == 1
-        assert r._checkpoint_version == 1  # the skipped boundary minted no version
+            buf = pub._buffers["layer.weight"]
+            pub.stage("layer.weight", sd["layer.weight"] + 1)  # reused, not regrown
+            assert pub._buffers["layer.weight"] is buf
+            pub._upload = real_upload
+            pub.start(8, ["http://127.0.0.1:9"], 1)  # nothing listens there
+            await asyncio.to_thread(pub.join)
+            [report] = pub.take_reports()
+            assert report["version"] == 8 and "error" in report
+        finally:
+            await server.close()
 
     asyncio.run(scenario())
 
@@ -676,7 +690,7 @@ async def _return(value):
     return value
 
 
-def make_replica(*, max_staleness=4, checkpoint_version=10):
+def make_replica(*, max_staleness=4, policy_version=9):
     """A pure-learner AsyncInferenceReplica with only the consumer state,
     skipping RLTrainer.__init__ (no actors, no generators)."""
     r = object.__new__(AsyncInferenceReplica)
@@ -693,7 +707,7 @@ def make_replica(*, max_staleness=4, checkpoint_version=10):
     )
     r._buffer = asyncio.Queue(maxsize=8)
     r._num_dropped = 0
-    r._checkpoint_version = checkpoint_version  # the staleness reference
+    r._policy_version = policy_version  # reference = policy_version + 1
     return r
 
 
@@ -736,21 +750,21 @@ def test_buffer_get_fails_fast_on_rollout_stall():
     asyncio.run(scenario())
 
 
-def test_batch_staleness_is_measured_against_the_checkpoint_reference():
-    """Regression: the logged staleness must live in the SAME version space as
-    the max_staleness consume gate (relay/hub checkpoint versions), NOT the
-    trainer's local optim-step counter -- episodes carry worker-stamped
-    checkpoint versions, and subtracting those from a per-step policy_version
-    grew without bound (~+7/window) while the actual gate never fired."""
-    r = make_replica(checkpoint_version=10)
-    # Local optim-step counter (first arg) must be ignored entirely.
-    assert r._batch_staleness(999, [8, 9, 10]) == 2  # 10 - min(8,9,10)
+def test_batch_staleness_is_steps_since_the_generating_weights():
+    """The logged staleness must live in the SAME space as the max_staleness
+    consume gate. Versions are trainer steps (the weights after step k publish
+    as v{k+1}), so after step 9 the reference is v10 and a batch whose oldest
+    sample came from v8 is 2 steps stale -- whatever the pre-optim counter
+    the mixin passes in (once a per-publish counter, which grew without bound
+    against per-step policy versions)."""
+    r = make_replica(policy_version=9)
+    assert r._batch_staleness(999, [8, 9, 10]) == 2  # (9 + 1) - min(8,9,10)
     assert r._batch_staleness(999, []) == 0
 
 
-def test_collect_and_build_drops_groups_stale_against_checkpoint_version():
+def test_collect_and_build_drops_groups_more_steps_stale_than_the_bound():
     async def scenario():
-        r = make_replica(max_staleness=4, checkpoint_version=10)
+        r = make_replica(max_staleness=4, policy_version=9)
         r.trainer = SimpleNamespace(sync_log_step=_ep(lambda step: _noop()))
         r.trainer_dp_degree = 1
         _passthrough_pipeline(r, min_policy_versions=[8])
@@ -802,21 +816,22 @@ def test_train_end_to_end_pure_learner_on_fakes():
             max_staleness=4,
             queue_poll_interval_s=0,
             rollout_stall_timeout_s=0,
-            publish_every=999,  # never fires mid-run (initial publish covered elsewhere)
             num_shards=2,
         )
         r._policy_version = 0
-        r._checkpoint_version = 1  # bootstrapped by the (mocked) initial publish
-        r._window_count = 0
         r._num_dropped = 0
-        # Rollouts arrive tagged v1; staleness reference is v1 -> nothing dropped.
+        r._relay_urls = ["http://relay"]
+        r._latest_published = r._window_published = 0
+        # Rollouts arrive tagged v1 (the initial weights); 4 steps later they
+        # are 4 steps stale, still within max_staleness=4 -> nothing dropped.
         r._queue_client = _InfiniteQueueClient(version=1)
-        r._relay_client = _FakeRelayClient()
 
         versions = itertools.count(1)
+        offered = []
 
-        async def get_full():
-            return {0: {"w": 0}}
+        async def publish_to_relay(*, version, relay_urls, num_shards):
+            offered.append(version)
+            return {"started": True, "reports": []}
 
         r.trainer = SimpleNamespace(
             sync_log_step=_ep(_noop),
@@ -824,7 +839,7 @@ def test_train_end_to_end_pure_learner_on_fakes():
             optimizer_step=_ep(
                 lambda: _return(SimpleNamespace(policy_version=next(versions)))
             ),
-            get_full_state_dict_cpu=_ep(get_full),
+            publish_to_relay=_ep(publish_to_relay),
         )
         r._get_rank_0_value = lambda x: x
         r.trainer_dp_degree = 1
@@ -838,6 +853,7 @@ def test_train_end_to_end_pure_learner_on_fakes():
         await asyncio.wait_for(r.train(), 15)
 
         assert r._policy_version == 4  # 2 windows x sync_every=2 optim steps
+        assert offered == [2, 3, 4, 5]  # each step offered its weights as step + 1
         assert r._remote_consumer_task.done()  # cleaned up
         # Never spawned a generator: the attribute was never set, and nothing
         # touched it (else AttributeError would have failed train()).

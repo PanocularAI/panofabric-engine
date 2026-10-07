@@ -42,11 +42,6 @@ from panoengine.decentralized.parameter_server import (
     HeLoCoRLClient,
     param_metadata,
 )
-from panoengine.decentralized.relay import (
-    build_manifest,
-    RelayClient,
-    shard_state_dict,
-)
 from panoengine.decentralized.rollout_queue import (
     RolloutQueuePopClient,
 )
@@ -479,13 +474,16 @@ class AsyncInferenceReplica(PureLearnerReplica):
         ``_consume_remote_rollouts`` into the staleness-bounded buffer);
       - relay publishing of THIS trainer's own weights (its weights are the
         policy -- there is a single trainer, no parameter server): an initial
-        publish at setup so the workers can bootstrap, then a publish every
-        ``publish_every`` windows.
+        publish at setup so the workers can bootstrap, then a new publish
+        after every optimizer step at which the previous upload has finished.
+        There is no cadence to tune: the trainer pauses only for the
+        device->host copy (SnapshotPolicyTrainer.publish_to_relay), so the
+        upload's own duration paces the publishes.
 
-    Staleness is bounded against ``self._checkpoint_version`` (the latest
-    version this trainer published): workers stamp each rollout batch with the
-    checkpoint version they loaded off the relay, so the two live in the same
-    version space.
+    Versions are trainer steps: the weights after optimizer step k are
+    published as version k + 1 (workers treat 0 as "nothing loaded yet"), so
+    the staleness of a rollout is how many optimizer steps the trainer took
+    since the weights that generated it.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -502,8 +500,10 @@ class AsyncInferenceReplica(PureLearnerReplica):
         num_shards: int = 4
         """Shards per published checkpoint (SHARDCAST-style checkpoint-
         transfer sharding; unrelated to model/optimizer sharding)."""
-        publish_every: int = 1
-        """Windows between relay publishes (1 = publish every window)."""
+        max_staleness: int = 50
+        """Oldest rollout the trainer still trains on, in TRAINER STEPS: one
+        generated with the weights after step k is (current step - k) steps
+        stale."""
         rollout_queue_address: str = ""
         """Base URL of the standalone rollout-queue process (rollout_queue)
         this trainer pops from, e.g. "http://localhost:8767". Required --
@@ -515,24 +515,18 @@ class AsyncInferenceReplica(PureLearnerReplica):
             PureLearnerReplica.Config.__post_init__(self)
             if self.num_shards < 1:
                 raise ValueError(f"num_shards must be >= 1, got {self.num_shards}")
-            if self.publish_every < 1:
-                raise ValueError(
-                    f"publish_every must be >= 1, got {self.publish_every}"
-                )
 
     def __init__(self, config: "AsyncInferenceReplica.Config"):
         super().__init__(config)
-        self._relay_client: RelayClient | None = None
-        self._checkpoint_version = 0
-        self._window_count = 0
-        self._publish_task: asyncio.Task | None = None
+        self._relay_urls: list[str] = []
         self._queue_client: RolloutQueuePopClient | None = None
+        self._latest_published = 0
+        self._window_published = 0
 
     async def setup_async(self, *, trainer_mesh, generator_meshes):
         """Spawn only the SnapshotPolicyTrainer actor (one learner GPU), build
-        the relay client and the rollout-queue pop client, and publish the
-        initial checkpoint so the worker pool can bootstrap before the first
-        window."""
+        the rollout-queue pop client, and publish the initial checkpoint so the
+        worker pool can bootstrap before the first window."""
         cfg = self.config
         if not cfg.relay_addresses:
             raise ValueError(
@@ -542,9 +536,9 @@ class AsyncInferenceReplica(PureLearnerReplica):
             raise ValueError(
                 "rollout_queue_address is required (set $ROLLOUT_QUEUE_ADDR)"
             )
-        self._relay_client = RelayClient(
-            [url.strip() for url in cfg.relay_addresses.split(",") if url.strip()]
-        )
+        self._relay_urls = [
+            url.strip() for url in cfg.relay_addresses.split(",") if url.strip()
+        ]
         self._queue_client = RolloutQueuePopClient(cfg.rollout_queue_address)
 
         await self._spawn_trainer_only(
@@ -553,12 +547,13 @@ class AsyncInferenceReplica(PureLearnerReplica):
             policy_trainer_cls=SnapshotPolicyTrainer,
         )
 
-        # Publish the initial (HF-initialized) weights so the remote workers
-        # have a checkpoint to load and start generating from before the first
-        # window -- otherwise the trainer would starve at window 0 (nothing to
-        # consume) waiting for rollouts the workers can't produce yet.
-        note = await self._publish_checkpoint()
-        logger.info("[replica %d] %s (initial)", cfg.replica_id, note)
+        # Publish the initial (HF-initialized) weights and WAIT for them: the
+        # remote workers have nothing to generate from until they land, so
+        # the trainer would only starve at window 0 otherwise.
+        await self._publish()
+        reports = self._get_rank_0_value(await self.trainer.wait_relay_publish.call())
+        if any("error" in r for r in self._log_publishes(reports or [])):
+            raise RuntimeError("the initial relay publish failed; see the warning above")
 
     # ------------------------------------------------------------------ #
     # PureLearnerReplica hooks: rollout source + staleness reference.
@@ -570,86 +565,64 @@ class AsyncInferenceReplica(PureLearnerReplica):
         return await self._queue_client.pop()
 
     def _staleness_reference(self) -> int:
-        return self._checkpoint_version
+        """The version the trainer's CURRENT weights would publish as (see the
+        class docstring), so reference minus a rollout's version is steps."""
+        return self._policy_version + 1
 
     # ------------------------------------------------------------------ #
     # Relay publish.
     # ------------------------------------------------------------------ #
 
-    async def _publish_checkpoint(self) -> str:
-        # bf16 over the wire: halves every publish and every worker download.
-        # Safe because relay checkpoints are a dead end -- workers use them
-        # only as the generation behavior policy (the engine runs bf16 anyway)
-        # and never train on or push back these weights, so unlike the
-        # trainer<->server DiLoCo channel the cast can't compound. The IS-
-        # corrected loss stays consistent: the recorded behavior logprobs come
-        # from the bf16 model that actually generated. Cast on the trainer GPU,
-        # before the device->host copy, so the copy, the reply, and its
-        # deserialization here are all half size.
-        reply = await self.trainer.get_full_state_dict_cpu.call(
-            dtype=torch.bfloat16
+    async def _publish(self) -> None:
+        """Offer the current weights to the relay tier. The trainer starts an
+        upload unless its previous one is still running, and reports the
+        uploads that finished since the last offer."""
+        status = self._get_rank_0_value(
+            await self.trainer.publish_to_relay.call(
+                version=self._policy_version + 1,
+                relay_urls=self._relay_urls,
+                num_shards=self.config.num_shards,
+            )
         )
-        self._checkpoint_version += 1
-        version = self._checkpoint_version
+        self._log_publishes(status["reports"])
 
-        def prepare():
-            # Deserializing the reply (it unpickles lazily, on .get), sharding,
-            # and hashing ~GBs all hold the GIL for seconds: on the event loop
-            # they stalled the next window's steps ~25 s per publish (run
-            # a8acf96f4daa). The cast is a no-op on the trainer's bf16 reply.
-            theta = self._get_rank_0_value(reply)
-            theta = {k: v.to(dtype=torch.bfloat16) for k, v in theta.items()}
-            shards = shard_state_dict(theta, self.config.num_shards)
-            return shards, build_manifest(version, shards)
+    def _log_publishes(self, reports: list[dict]) -> list[dict]:
+        rid = self.config.replica_id
+        for r in reports:
+            if "error" in r:
+                logger.warning(
+                    "[replica %d] relay publish of v%d failed: %s",
+                    rid, r["version"], r["error"],
+                )
+                continue
+            self._latest_published = max(self._latest_published, r["version"])
+            self._window_published += 1
+            logger.info(
+                "[replica %d] relay: published v%d (%d shards, %.2f GB in %.1fs)",
+                rid, r["version"], r["num_shards"], r["bytes"] / 1e9, r["seconds"],
+            )
+        return reports
 
-        shards, manifest = await asyncio.to_thread(prepare)
-        await self._relay_client.publish(version, shards, manifest)
-        total_bytes = sum(manifest.shard_sizes)
-        return (
-            f"relay: published v{self._checkpoint_version} "
-            f"({manifest.num_shards} shards, {total_bytes}B)"
-        )
+    async def _after_inner_step(self, iter_t0: float) -> None:
+        del iter_t0
+        await self._publish()
 
     # ------------------------------------------------------------------ #
-    # Coordination boundary.
+    # Window boundary: logging only (no coordination).
     # ------------------------------------------------------------------ #
 
     async def _window_sync(self, t0: float) -> str:
-        """Window boundary: publish the new weights to the relay tier on
-        publish_every boundaries so the worker pool advances to the next
-        policy version. The publish runs as a BACKGROUND task -- snapshotting,
-        sharding, and POSTing ~GBs must not stall the next window (the actor
-        mailbox serializes the snapshot against optim steps, so the background
-        task still reads a consistent theta). If the previous publish is
-        somehow still in flight, this boundary's publish is skipped -- workers
-        just keep the last version a little longer, which max_staleness
-        already tolerates. No generator refresh and no producer pausing --
-        there is no local generation."""
+        """Nothing to synchronize -- the publishes ride the inner steps -- so
+        the window boundary only reports the buffer and this window's
+        publishes."""
         del t0
-        stats = f"buffer: depth={self._buffer.qsize()} dropped={self._num_dropped}"
+        stats = (
+            f"buffer: depth={self._buffer.qsize()} dropped={self._num_dropped} | "
+            f"relay: {self._window_published} published, latest v{self._latest_published}"
+        )
         self._num_dropped = 0
-        self._window_count += 1
-        if self._window_count % self.config.publish_every == 0:
-            prev = self._publish_task
-            if prev is not None and not prev.done():
-                stats = f"{stats} | relay: publish skipped (previous in flight)"
-            else:
-                if prev is not None and (exc := prev.exception()) is not None:
-                    logger.warning(
-                        "[replica %d] previous relay publish failed: %s",
-                        self.config.replica_id,
-                        exc,
-                    )
-                self._publish_task = asyncio.create_task(self._publish_checkpoint())
-                stats = f"{stats} | relay: publish started (background)"
+        self._window_published = 0
         return stats
-
-    async def close(self):
-        task = self._publish_task
-        if task is not None and not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        await super().close()
 
 
 class HeLoCoAsyncInferenceReplica(PureLearnerReplica):

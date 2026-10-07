@@ -20,6 +20,7 @@
 # to share code (native fused param names for the server wire vs split
 # state_dict keys for the generator load path).
 
+import asyncio
 import logging
 from datetime import timedelta
 
@@ -33,6 +34,7 @@ from torchft.local_sgd import DiLoCo
 from torchft.manager import Manager
 from torchft.process_group import ProcessGroupGloo
 
+from panoengine.decentralized.relay import BackgroundPublisher
 from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.rl.distributed.actors.trainer import TrainerActor
@@ -276,21 +278,28 @@ class HeLoCoPolicyTrainer(TrainerActor):
 class SnapshotPolicyTrainer(TrainerActor):
     """Trainer + full-parameter snapshot/restore endpoints.
 
-    Used by AsyncInferenceReplica to read the whole model out for relay
-    publishing (see replicas.py's AsyncInferenceReplica.setup_async). The base
+    Used by AsyncInferenceReplica, which asks it after every optimizer step to
+    publish its weights to the relay tier (see publish_to_relay). The base
     forward_backward_steps/optimizer_step are reused unchanged (stock token-level
-    GRPO loss); only the full-state-dict exchange endpoints are added::
+    GRPO loss); only the weight-exchange endpoints are added::
 
-        theta = trainer.get_full_state_dict_cpu()   # native names, CPU, fp32
+        trainer.publish_to_relay(version, relay_urls, num_shards)
         trainer.load_full_state_dict_cpu(theta)      # theta -> model
     """
 
     @concurrent_endpoint
-    async def get_full_state_dict_cpu(
-        self, dtype: torch.dtype = torch.float32
-    ) -> dict[str, torch.Tensor]:
-        """Return the full unsharded model state dict as ``dtype`` (default
-        fp32) CPU tensors, cast on the GPU before the device->host copy.
+    async def publish_to_relay(
+        self, version: int, relay_urls: list[str], num_shards: int
+    ) -> dict | None:
+        """Start publishing the current weights as relay checkpoint
+        ``version``, unless this trainer's previous upload is still running.
+
+        The only training pause is the gather plus the device->host copy into
+        reused host buffers (~0.5 s at 9B); sharding, hashing and the upload run
+        on a thread (BackgroundPublisher). Rank 0 decides "still busy?" and
+        broadcasts it, so every rank either joins the gathers or skips them.
+        Returns rank 0's ``{"started": bool, "reports": [...]}`` -- the uploads
+        that finished since the last call -- and None on the other ranks.
 
         Uses ``self.model.state_dict()`` — the SAME source ``push_model_state_dict``
         stages for the generators — so the relay-published weights carry the exact
@@ -300,24 +309,52 @@ class SnapshotPolicyTrainer(TrainerActor):
         would instead emit the fused key and the worker would load mismatched
         attention weights. DCP ``get_model_state_dict`` can't be used here — it
         trips on FusedQKVLinear's synthetic keys during FQN resolution — so unshard
-        each DTensor with ``full_tensor()`` directly (relay shards are torch.save'd,
-        so full CPU tensors are required)."""
+        each DTensor with ``full_tensor()`` directly.
+
+        bf16 over the wire: halves every publish and every worker download.
+        Safe because relay checkpoints are a dead end -- workers use them only
+        as the generation behavior policy (the engine runs bf16 anyway) and
+        never train on or push back these weights, so unlike the trainer<->server
+        DiLoCo channel the cast can't compound. The IS-corrected loss stays
+        consistent: the recorded behavior logprobs come from the bf16 model that
+        actually generated. Cast before the gather, so it moves half the bytes."""
         keep = _replies_with_full_copy()
-        sd = {}
+        if getattr(self, "_relay_publisher", None) is None:
+            self._relay_publisher = BackgroundPublisher()
+        publisher = self._relay_publisher
+        busy = torch.tensor(int(keep and publisher.busy()), device="cuda")
+        if dist.is_initialized():
+            dist.broadcast(busy, src=0)
+        if busy.item():
+            return {"started": False, "reports": publisher.take_reports()} if keep else None
         for name, tensor in self.model.state_dict().items():
-            tensor = tensor.detach()
+            tensor = tensor.detach().to(torch.bfloat16)
             if isinstance(tensor, DTensor):
                 tensor = tensor.full_tensor()
             if keep:
-                sd[name] = tensor.to(dtype=dtype).cpu()
-        return sd
+                publisher.stage(name, tensor)
+        if not keep:
+            return None
+        publisher.start(version, relay_urls, num_shards)
+        return {"started": True, "reports": publisher.take_reports()}
+
+    @concurrent_endpoint
+    async def wait_relay_publish(self) -> list[dict] | None:
+        """Wait for the in-flight upload to finish; rank 0 returns the reports
+        not yet taken. For the initial publish, which the workers need before
+        they can generate anything."""
+        publisher = getattr(self, "_relay_publisher", None)
+        if publisher is None or not _replies_with_full_copy():
+            return None
+        await asyncio.to_thread(publisher.join)
+        return publisher.take_reports()
 
     @concurrent_endpoint
     async def load_full_state_dict_cpu(
         self, global_sd: dict[str, torch.Tensor]
     ) -> None:
         """Load a full state dict (state_dict()-keyed, fp32, CPU) back into the
-        FSDP/TP model — the inverse of ``get_full_state_dict_cpu``.
+        FSDP/TP model — the inverse of a full state_dict() gather.
 
         Distributes each incoming full tensor onto the placement of the model's
         current state_dict entry, then loads via the model's own

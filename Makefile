@@ -14,7 +14,7 @@ TORCHTITAN_DIR ?= $(FORKS_DIR)/torchtitan
 TORCHFT_DIR    ?= $(FORKS_DIR)/torchft
 TORCHTITAN_URL ?= https://github.com/PanocularAI/torchtitan.git
 TORCHFT_URL    ?= https://github.com/PanocularAI/torchft.git
-TORCHTITAN_REF ?= 3058f9779f43e887422da6dfe7fb8ca4b1afbccb
+TORCHTITAN_REF ?= 0483d9ff3a939a206c6e66c79e0ceae56efadfa7
 TORCHFT_REF    ?= 716bff9584a9e0613dd07f1837a63a9f2e3583b4
 
 # RL builds pin torch to the nightly vLLM was built against (TORCH_VERSION, below).

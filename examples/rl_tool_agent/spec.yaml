@@ -14,13 +14,14 @@ workload:
     # between processes. For several islands use `method: heloco` -- the same
     # preset name runs as rl_heloco_*.
     method: none
-    sync_steps: 10      # steps per window: the validation and logging cadence
 model:
   module: models.rl_tool_agent
   preset: rl_solo_tool_agent_qwen3_5_9b
   hf_model: Qwen/Qwen3.5-9B
 training:
   steps: 100
+metrics:
+  log_freq: 10          # steps per window: the validation and logging cadence
 fabric:
   islands:
     # No `role`: with no `role: generator` islands, this island generates for

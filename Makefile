@@ -237,8 +237,22 @@ build-into: export VIRTUAL_ENV := $(abspath $(VENV))
 # killing generator islands at import (transformers, torch, sympy files). Copies cost
 # ~7 GB of real disk per cached env, once per fingerprint.
 build-into: export UV_LINK_MODE := copy
+# The shared interpreter (ensure's UV_PYTHON_INSTALL_DIR) is installed ONCE, under a
+# mkdir lock: uv's own lock is flock(), which BeeGFS keeps per node. On a fresh cache,
+# gpu08 and gpu09 both installed CPython 3.13.16 at once and one swapped the files out
+# from under the other's builds. The venv then may not download one of its own.
 build-into: setup-env
-	$(UV) venv $(VENV) --relocatable --python $(PYTHON_VERSION)
+	@if [ -n "$${UV_PYTHON_INSTALL_DIR:-}" ]; then \
+	  lock="$$UV_PYTHON_INSTALL_DIR.lock"; \
+	  until mkdir "$$lock" 2>/dev/null; do \
+	    if [ -n "$$(find "$$lock" -maxdepth 0 -mmin +15 2>/dev/null)" ]; then \
+	      echo "[build-into] clearing a stale Python-install lock"; rmdir "$$lock" 2>/dev/null; \
+	    else sleep 5; fi; \
+	  done; \
+	  "$(UV)" python install $(PYTHON_VERSION); rc=$$?; rmdir "$$lock"; exit $$rc; \
+	fi
+	env $${UV_PYTHON_INSTALL_DIR:+UV_PYTHON_DOWNLOADS=never} \
+	  $(UV) venv $(VENV) --relocatable --python $(PYTHON_VERSION)
 	$(UV_PIP_CMD) --no-deps .
 	$(MAKE) install-torch VENV=$(VENV)
 	$(MAKE) install-torchtt-ft VENV=$(VENV)

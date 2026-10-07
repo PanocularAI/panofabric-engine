@@ -48,6 +48,12 @@ logger = logging.getLogger(__name__)
 _EMA_ALPHA = 0.3
 _RELAY_KEY = web.AppKey("relay")
 _UPLOAD_CHUNK = 4 << 20
+# Site cache (RelayClient.site_cache_dir): how often a fetcher re-checks shards
+# another fetcher is downloading, how often a downloader refreshes its claim, and
+# how long an unrefreshed claim is trusted before another fetcher takes it over.
+_SITE_POLL_S = 2.0
+_SITE_HEARTBEAT_S = 10.0
+_SITE_CLAIM_STALE_S = 120.0
 
 
 # --------------------------------------------------------------------- #
@@ -389,10 +395,18 @@ class RelayClient:
         rng: random.Random | None = None,
         timeout_s: float = 30.0,
         stall_timeout_s: float = 120.0,
+        site_cache_dir: str | None = None,
     ):
+        """``site_cache_dir``: a directory shared with the other fetchers on this
+        site (a cluster's shared filesystem). Fetchers then split each version's
+        shards between them -- every shard crosses the link to the relay ONCE per
+        site -- and read the rest from there (_fetch_shards_via_site). Four
+        generators behind one Slurm login node pulled 4 x 18 GB per 9B version
+        through its ~1 Gbps link: ~10 min a version. None: download directly."""
         if not relay_urls:
             raise ValueError("relay_urls must be non-empty")
         self.relay_urls = list(relay_urls)
+        self._site_cache = Path(site_cache_dir) if site_cache_dir else None
         self._rng = rng or random.Random()
         # A checkpoint transfer is multi-GB, so `total` is the wrong bound: it
         # caps the whole manifest+shards exchange regardless of progress. At
@@ -525,6 +539,151 @@ class RelayClient:
         )
         return shard_bytes
 
+    # ----------------------------------------------------------------- #
+    # Site cache: split each version's shards across a site's fetchers.
+    # ----------------------------------------------------------------- #
+
+    def _site_version_dir(self, url: str, manifest: CheckpointManifest) -> Path:
+        # Keyed by the manifest's checksums, not just the version: versions restart
+        # at 1 every run, and a standing hub reuses its URL across runs.
+        relay = hashlib.sha256(url.encode()).hexdigest()[:12]
+        tag = hashlib.sha256("|".join(manifest.shard_checksums).encode()).hexdigest()[:12]
+        return self._site_cache / relay / f"v{manifest.version}-{tag}"
+
+    @staticmethod
+    async def _read_cached_shard(
+        path: Path, idx: int, manifest: CheckpointManifest
+    ) -> bytes | None:
+        """A complete shard another fetcher left, verified; a bad one is removed so
+        it gets downloaded again."""
+        try:
+            data = await asyncio.to_thread(path.read_bytes)
+        except FileNotFoundError:
+            return None
+        try:
+            await asyncio.to_thread(verify_shard, idx, data, manifest)
+        except ShardIntegrityError:
+            logger.warning("site cache: %s fails its checksum; re-fetching", path)
+            path.unlink(missing_ok=True)
+            return None
+        return data
+
+    @staticmethod
+    def _try_claim(claim: Path) -> bool:
+        # O_EXCL create, not flock: flock is not dependable on BeeGFS.
+        try:
+            fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return False
+        os.write(fd, f"{os.uname().nodename}:{os.getpid()}".encode())
+        os.close(fd)
+        return True
+
+    @staticmethod
+    def _steal_if_stale(claim: Path, final: Path) -> None:
+        """Drop a claim whose holder stopped refreshing it (killed mid-download)."""
+        try:
+            age = time.time() - claim.stat().st_mtime
+        except FileNotFoundError:
+            return
+        if age > _SITE_CLAIM_STALE_S and not final.exists():
+            logger.warning("site cache: claim %s idle %.0fs; taking the shard over",
+                           claim, age)
+            claim.unlink(missing_ok=True)
+
+    async def _download_to_site(
+        self, session: aiohttp.ClientSession, url: str, manifest: CheckpointManifest,
+        idx: int, final: Path, claim: Path,
+    ) -> bytearray | None:
+        """Download a claimed shard into the site cache: streamed to a temp file,
+        verified, renamed into place -- so the cache never holds a bad shard."""
+        tmp = final.with_name(f".{idx}.{os.getpid()}.part")
+        buf = bytearray()
+        beat = time.monotonic()
+        try:
+            async with session.get(f"{url}/shard/{manifest.version}/{idx}") as resp:
+                if resp.status != 200:
+                    return None
+                with open(tmp, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(_UPLOAD_CHUNK):
+                        buf += chunk
+                        await asyncio.to_thread(f.write, chunk)
+                        if time.monotonic() - beat > _SITE_HEARTBEAT_S:
+                            os.utime(claim, None)
+                            beat = time.monotonic()
+            await asyncio.to_thread(verify_shard, idx, buf, manifest)
+            os.replace(tmp, final)
+            return buf
+        except (aiohttp.ClientError, asyncio.TimeoutError, ShardIntegrityError, OSError):
+            return None
+        finally:
+            tmp.unlink(missing_ok=True)
+            claim.unlink(missing_ok=True)
+
+    @staticmethod
+    def _prune_site_cache(current: Path) -> None:
+        """Keep this version and the newest other one (a slower fetcher may still
+        be reading it); drop the rest, including other runs' versions."""
+        others = sorted((d for d in current.parent.iterdir()
+                         if d.is_dir() and d != current),
+                        key=lambda d: d.stat().st_mtime, reverse=True)
+        for old in others[1:]:
+            shutil.rmtree(old, ignore_errors=True)
+
+    async def _fetch_shards_via_site(
+        self, session: aiohttp.ClientSession, url: str, manifest: CheckpointManifest
+    ) -> list[bytes] | None:
+        """Every fetcher on the site walks the shards: it reads the ones already in
+        the cache, downloads the ones it can claim, and waits for the ones another
+        fetcher holds. Fetchers that start together each claim a different shard,
+        so the relay link carries each shard once instead of once per fetcher."""
+        vdir = self._site_version_dir(url, manifest)
+        vdir.mkdir(parents=True, exist_ok=True)
+        shards: dict[int, bytes] = {}
+        downloaded: list[int] = []
+        downloaded_bytes = 0
+        t0 = time.monotonic()
+        while len(shards) < manifest.num_shards:
+            progressed = False
+            for idx in range(manifest.num_shards):
+                if idx in shards:
+                    continue
+                final, claim = vdir / str(idx), vdir / f".claim-{idx}"
+                data = await self._read_cached_shard(final, idx, manifest)
+                if data is None and self._try_claim(claim):
+                    if final.exists():   # finished between our read and our claim
+                        claim.unlink(missing_ok=True)
+                        continue
+                    data = await self._download_to_site(
+                        session, url, manifest, idx, final, claim)
+                    if data is None:
+                        self._record_failure(url)
+                        return None
+                    downloaded.append(idx)
+                    downloaded_bytes += len(data)
+                elif data is None:
+                    self._steal_if_stale(claim, final)
+                    continue
+                shards[idx] = data
+                progressed = True
+            if not progressed:
+                await asyncio.sleep(_SITE_POLL_S)
+        dt = time.monotonic() - t0
+        if downloaded_bytes:
+            self._record_success(url, downloaded_bytes, dt)
+        total = sum(len(d) for d in shards.values())
+        logger.info(
+            "fetched checkpoint v%d via site cache: downloaded shards %s from %s "
+            "(%.2f GB), read %d from the cache; %.2f GB in %.1fs",
+            manifest.version, downloaded, url, downloaded_bytes / 1e9,
+            manifest.num_shards - len(downloaded), total / 1e9, dt,
+        )
+        try:
+            self._prune_site_cache(vdir)
+        except OSError:
+            pass
+        return [shards[i] for i in range(manifest.num_shards)]
+
     async def fetch_latest(self, min_version: int = 0) -> tuple[int, dict] | None:
         """Try relays (probabilistically ordered, without replacement) for a
         checkpoint newer than ``min_version``, verifying checksums; a
@@ -542,7 +701,9 @@ class RelayClient:
                 manifest = await self._fetch_manifest(session, url, min_version)
                 if manifest is None:
                     continue
-                shard_bytes = await self._fetch_shards(session, url, manifest)
+                fetch = (self._fetch_shards_via_site if self._site_cache is not None
+                         else self._fetch_shards)
+                shard_bytes = await fetch(session, url, manifest)
                 if shard_bytes is None:
                     continue
                 try:

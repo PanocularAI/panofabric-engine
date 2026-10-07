@@ -173,6 +173,123 @@ def test_relay_spools_shards_to_disk_and_evicts_them(tmp_path):
     asyncio.run(scenario())
 
 
+def _site_sd():
+    return {f"w{i}": torch.full((64,), float(i)) for i in range(4)}
+
+
+async def _publish(relay_url, version, sd, num_shards=4):
+    shards = shard_state_dict(sd, num_shards=num_shards)
+    await RelayClient([relay_url]).publish(version, shards, build_manifest(version, shards))
+    return shards
+
+
+def _count_shard_gets(relay, monkeypatch):
+    """Count GETs per (version, shard) the relay serves."""
+    counts = {}
+    real = relay.shard_path
+
+    def counting(version, idx):
+        counts[(version, idx)] = counts.get((version, idx), 0) + 1
+        return real(version, idx)
+
+    monkeypatch.setattr(relay, "shard_path", counting)
+    return counts
+
+
+def test_site_cache_fetches_each_shard_once_per_site(tmp_path, monkeypatch):
+    """Fetchers sharing a site cache split a version's shards between them: the
+    relay serves each shard ONCE, not once per fetcher (four generators behind
+    one Slurm login node pulled 4 x 18 GB per version through ~1 Gbps)."""
+    import panoengine.decentralized.relay as relay_mod
+    monkeypatch.setattr(relay_mod, "_SITE_POLL_S", 0.01)
+
+    async def scenario():
+        relay, server, base_url = await _start_relay()
+        try:
+            sd = _site_sd()
+            await _publish(base_url, 1, sd)
+            counts = _count_shard_gets(relay, monkeypatch)
+            clients = [RelayClient([base_url], site_cache_dir=str(tmp_path))
+                       for _ in range(4)]
+            results = await asyncio.gather(*(c.fetch_latest() for c in clients))
+            for version, restored in results:
+                assert version == 1
+                assert all(torch.equal(restored[k], sd[k]) for k in sd)
+            assert counts == {(1, i): 1 for i in range(4)}
+            vdir = next((tmp_path).glob("*/v1-*"))
+            assert sorted(p.name for p in vdir.iterdir()) == ["0", "1", "2", "3"]
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_site_cache_recovers_from_stale_claims_and_bad_shards(tmp_path, monkeypatch):
+    """A claim whose holder died is taken over once idle past the timeout, and a
+    cached shard that fails its checksum is fetched again rather than trusted."""
+    import os
+    import panoengine.decentralized.relay as relay_mod
+    monkeypatch.setattr(relay_mod, "_SITE_POLL_S", 0.01)
+
+    async def scenario():
+        relay, server, base_url = await _start_relay()
+        try:
+            sd = _site_sd()
+            shards = await _publish(base_url, 1, sd)
+            client = RelayClient([base_url], site_cache_dir=str(tmp_path))
+            manifest = build_manifest(1, shards)
+            vdir = client._site_version_dir(base_url, manifest)
+            vdir.mkdir(parents=True)
+            (vdir / ".claim-0").write_text("dead-host:1")        # holder died
+            old = time.time() - relay_mod._SITE_CLAIM_STALE_S - 1
+            os.utime(vdir / ".claim-0", (old, old))
+            (vdir / "1").write_bytes(b"corrupted")               # bad cached shard
+
+            version, restored = await client.fetch_latest()
+            assert version == 1 and all(torch.equal(restored[k], sd[k]) for k in sd)
+            assert (vdir / "0").read_bytes() == shards[0]
+            assert (vdir / "1").read_bytes() == shards[1]
+            assert not list(vdir.glob(".claim-*")) and not list(vdir.glob("*.part"))
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_site_cache_keeps_only_the_two_newest_versions(tmp_path):
+    async def scenario():
+        relay, server, base_url = await _start_relay()
+        try:
+            client = RelayClient([base_url], site_cache_dir=str(tmp_path))
+            for version in (1, 2, 3):
+                await _publish(base_url, version, _site_sd())
+                assert (await client.fetch_latest())[0] == version
+                time.sleep(0.01)   # distinct mtimes for the newest-first prune
+            names = sorted(p.name.split("-")[0] for p in tmp_path.glob("*/v*"))
+            assert names == ["v2", "v3"]
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_worker_site_cache_dir(monkeypatch):
+    """Generators share shards where `make ensure` finds a shared cache root,
+    and download directly elsewhere."""
+    monkeypatch.delenv("PF_RELAY_SITE_CACHE", raising=False)
+    monkeypatch.delenv("PF_ENV_CACHE_DIR", raising=False)
+    monkeypatch.setenv("HOME", "/home/u/.sky_clusters/sym-r1-i1-abc")   # a Slurm job
+    assert worker_mod._site_relay_cache() == "/home/u/.panofabric-cache/relay"
+    monkeypatch.setenv("PF_ENV_CACHE_DIR", "/scratch/u/pf-cache")
+    assert worker_mod._site_relay_cache() == "/scratch/u/pf-cache/relay"
+    monkeypatch.setenv("PF_RELAY_SITE_CACHE", "0")
+    assert worker_mod._site_relay_cache() is None
+    monkeypatch.delenv("PF_RELAY_SITE_CACHE")
+    monkeypatch.delenv("PF_ENV_CACHE_DIR")
+    monkeypatch.setenv("HOME", "/root")                                  # a cloud VM
+    assert worker_mod._site_relay_cache() is None
+
+
 def test_relay_advertises_only_complete_versions():
     """A manifest whose shards are still landing is not "latest": a fetcher
     would 404 on the missing shards and re-download the rest on every retry."""

@@ -60,6 +60,20 @@ from torchtitan.rl.train import (
 logger = logging.getLogger(__name__)
 
 
+def _site_relay_cache() -> str | None:
+    """Where this site's generators share relay shards (RelayClient.site_cache_dir):
+    the shared cache root `make ensure` uses -- $PF_ENV_CACHE_DIR, else the real
+    home behind a Slurm job's HOME. None (download
+    directly) on hosts without one, e.g. a cloud VM; PF_RELAY_SITE_CACHE=0 opts out."""
+    if os.environ.get("PF_RELAY_SITE_CACHE") == "0":
+        return None
+    root = os.environ.get("PF_ENV_CACHE_DIR")
+    home = os.path.expanduser("~")
+    if not root and "/.sky_clusters/" in home:
+        root = home.split("/.sky_clusters/")[0] + "/.panofabric-cache"
+    return os.path.join(root, "relay") if root else None
+
+
 class AsyncInferenceWorker:
     """Inference-only node in the async-inference relay swarm (see module
     docstring for the trainer-less design and rollout-feedback scope
@@ -134,7 +148,8 @@ class AsyncInferenceWorker:
     def __init__(self, config: "AsyncInferenceWorker.Config"):
         self.config = config
         self._relay_client = RelayClient(
-            [u.strip() for u in config.relay_addresses.split(",") if u.strip()]
+            [u.strip() for u in config.relay_addresses.split(",") if u.strip()],
+            site_cache_dir=_site_relay_cache(),
         )
         self._rollout_queue_client = RolloutQueuePushClient(
             config.rollout_queue_address

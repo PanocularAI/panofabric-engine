@@ -352,7 +352,14 @@ _STRATEGIES = {
         "learner",
         {"should_quantize": True},
     ),
-    "rl_async_inference_worker": (AsyncInferenceWorker, "worker", {}),
+    # 4 groups (32 sequences) in flight: at the default 2, four L40S workers
+    # made ~31 groups/min against a 9B H200:2 trainer's ~44 with their KV
+    # cache 8% full (run a8acf96f4daa) -- generation was latency-bound.
+    "rl_async_inference_worker": (
+        AsyncInferenceWorker,
+        "worker",
+        {"groups_per_round": 4},
+    ),
     # Bigger rounds, so a small pool fills several trainers' windows quickly.
     "rl_heloco_async_inference_worker": (
         AsyncInferenceWorker,

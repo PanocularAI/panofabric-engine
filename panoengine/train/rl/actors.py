@@ -286,8 +286,11 @@ class SnapshotPolicyTrainer(TrainerActor):
     """
 
     @concurrent_endpoint
-    async def get_full_state_dict_cpu(self) -> dict[str, torch.Tensor]:
-        """Return the full unsharded model state dict as fp32 CPU tensors.
+    async def get_full_state_dict_cpu(
+        self, dtype: torch.dtype = torch.float32
+    ) -> dict[str, torch.Tensor]:
+        """Return the full unsharded model state dict as ``dtype`` (default
+        fp32) CPU tensors, cast on the GPU before the device->host copy.
 
         Uses ``self.model.state_dict()`` — the SAME source ``push_model_state_dict``
         stages for the generators — so the relay-published weights carry the exact
@@ -306,7 +309,7 @@ class SnapshotPolicyTrainer(TrainerActor):
             if isinstance(tensor, DTensor):
                 tensor = tensor.full_tensor()
             if keep:
-                sd[name] = tensor.to(device="cpu", dtype=torch.float32)
+                sd[name] = tensor.to(dtype=dtype).cpu()
         return sd
 
     @concurrent_endpoint

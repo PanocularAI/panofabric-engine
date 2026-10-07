@@ -33,6 +33,8 @@ import logging
 import os
 import random
 import shutil
+import signal
+import socket
 import tempfile
 import time
 import weakref
@@ -184,36 +186,101 @@ def reassemble_state_dict(
 # --------------------------------------------------------------------- #
 
 
-class RelayServer:
-    """Shard/manifest store for one relay node: shards on disk under
-    ``spool_dir``, manifests in memory.
+_RAM_SPOOL = Path("/dev/shm")
+#: A version is spooled in RAM only while RAM has this many times its size
+#: free, so the retained versions never squeeze the host or its cgroup.
+_RAM_HEADROOM = 4
 
-    Disk, not RAM, because the store holds whole checkpoints: ~18 GB per
-    version for a 9B model in bf16, ``retain_last`` versions of them. The
+
+def _ram_room() -> int:
+    """Bytes a RAM-backed spool may take: the least of the tmpfs's free space,
+    the host's available memory, and this cgroup's memory headroom (tmpfs
+    pages count against the cgroup limit). 0 when there is no /dev/shm."""
+    try:
+        room = [shutil.disk_usage(_RAM_SPOOL).free]
+        with open("/proc/meminfo") as f:
+            room += [int(line.split()[1]) * 1024 for line in f
+                     if line.startswith("MemAvailable:")]
+        limit = Path("/sys/fs/cgroup/memory.max")
+        if limit.exists() and (cap := limit.read_text().strip()) != "max":
+            used = Path("/sys/fs/cgroup/memory.current").read_text()
+            room.append(int(cap) - int(used))
+    except (OSError, ValueError):
+        return 0
+    return min(room)
+
+
+def _sweep_dead_spools(base: Path) -> None:
+    """Remove spools left by relays that died without cleanup (SIGKILL, OOM):
+    one in RAM pins up to ``retain_last`` checkpoints of memory until reboot.
+    Judges only spools this host's relays wrote (``.owner`` = "host pid"), so
+    a relay in another PID namespace sharing the dir is never touched."""
+    host = socket.gethostname()
+    for spool in base.glob("pf-relay-*"):
+        try:
+            owner_host, pid = (spool / ".owner").read_text().split()
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            if owner_host == host:
+                shutil.rmtree(spool, ignore_errors=True)
+        except (OSError, ValueError):
+            pass  # alive under another user, or not a spool of ours
+
+
+class RelayServer:
+    """Shard/manifest store for one relay node: shards in files, manifests in
+    memory.
+
+    Files, not Python memory, because the store holds whole checkpoints: ~18 GB
+    per version for a 9B model in bf16, ``retain_last`` versions of them. The
     in-memory store this replaced grew to 13.3 GB on a 16 GB hub and was
     OOM-killed mid-publish (run 817f7f419fab); the trainer only saw "Server
     disconnected". Uploads stream into a temp file renamed into place, so a
     shard is visible only once complete; downloads go out with sendfile.
 
+    ``spool_dir=None`` picks per version: RAM (/dev/shm) when it has room
+    (see ``_RAM_HEADROOM``), else a temp dir on disk -- both private and
+    removed with the server. RAM matters on a big hub: on the dev box's root
+    disk the trainer's upload ran at ~115 MB/s (164 s per 18 GB publish,
+    longer than a 68 s window, so 2 of 3 publishes were skipped; run
+    a8acf96f4daa) against ~1.5 GB/s into /dev/shm. A small hub can't fit
+    the versions in RAM and keeps the disk. An explicit ``spool_dir`` holds
+    every version.
+
     Not thread-safe by locking (aiohttp's default single-threaded event loop
     serializes handler bodies between awaits, which is enough here since
     nothing awaits mid-mutation) but IS safe under normal aiohttp concurrency
-    for that reason. ``spool_dir=None`` uses a private temp dir, removed with
-    the server.
+    for that reason.
     """
 
     def __init__(self, retain_last: int = 5, spool_dir: str | None = None):
         self.retain_last = retain_last
-        if spool_dir is None:
-            spool_dir = tempfile.mkdtemp(prefix="pf-relay-")
-            weakref.finalize(self, shutil.rmtree, spool_dir, True)
-        self.spool_dir = Path(spool_dir)
-        self.spool_dir.mkdir(parents=True, exist_ok=True)
+        self.spool_dir = Path(spool_dir) if spool_dir is not None else None
+        if self.spool_dir is not None:
+            self.spool_dir.mkdir(parents=True, exist_ok=True)
+        self._roots: dict[Path, Path] = {}  # base -> this server's private spool
+        self._dirs: dict[int, Path] = {}
         self._landed: dict[int, set[int]] = {}
         self._manifests: dict[int, CheckpointManifest] = {}
 
+    def _private_root(self, base: Path) -> Path:
+        if base not in self._roots:
+            _sweep_dead_spools(base)
+            root = Path(tempfile.mkdtemp(prefix="pf-relay-", dir=base))
+            (root / ".owner").write_text(f"{socket.gethostname()} {os.getpid()}")
+            weakref.finalize(self, shutil.rmtree, root, True)
+            self._roots[base] = root
+        return self._roots[base]
+
+    def _spool_root(self, nbytes: int) -> Path:
+        if self.spool_dir is not None:
+            return self.spool_dir
+        if _ram_room() >= _RAM_HEADROOM * nbytes:
+            return self._private_root(_RAM_SPOOL)
+        return self._private_root(Path(tempfile.gettempdir()))
+
     def _version_dir(self, version: int) -> Path:
-        return self.spool_dir / str(version)
+        return self._dirs[version]
 
     def latest_version(self) -> int | None:
         """The newest version whose shards have ALL landed. A publish posts its
@@ -235,13 +302,20 @@ class RelayServer:
                 self._landed.pop(version, None)
                 # A download already streaming one of these files keeps its
                 # open fd, so unlinking never cuts a transfer short.
-                shutil.rmtree(self._version_dir(version), ignore_errors=True)
+                if (vdir := self._dirs.pop(version, None)) is not None:
+                    shutil.rmtree(vdir, ignore_errors=True)
 
     def publish_manifest(self, version: int, manifest: CheckpointManifest) -> None:
         self._manifests[version] = manifest
         self._landed.setdefault(version, set())
-        self._version_dir(version).mkdir(exist_ok=True)
+        # Evict first: the versions it frees count toward this one's room.
         self._evict_old()
+        if version in self._manifests and version not in self._dirs:
+            nbytes = sum(manifest.shard_sizes)
+            root = self._spool_root(nbytes)
+            self._dirs[version] = root / str(version)
+            self._dirs[version].mkdir(exist_ok=True)
+            logger.info("spooling v%d (%.2f GB) in %s", version, nbytes / 1e9, root)
 
     def new_shard_file(self, version: int, idx: int) -> Path:
         """A temp file in ``version``'s spool dir to stream shard ``idx`` into;
@@ -369,7 +443,8 @@ async def run_relay_server(
     await web.TCPSite(runner, host, port).start()
     logger.info(
         "relay server listening on %s:%d (retain_last=%d, spool_dir=%s)",
-        host, port, retain_last, relay.spool_dir,
+        host, port, retain_last,
+        relay.spool_dir or "auto: /dev/shm when it fits, else disk",
     )
     return runner
 
@@ -731,6 +806,11 @@ async def _serve(host: str, port: int, retain_last: int,
     runner = await run_relay_server(host=host, port=port, retain_last=retain_last,
                                     spool_dir=spool_dir)
     print(f"ASYNC_INFERENCE_RELAY_ADDR=http://{host}:{port}", flush=True)
+    # A job cancel SIGTERMs us; die through the normal exit so the spool's
+    # finalizers run (default SIGTERM skips them and leaked a 34 GB spool).
+    asyncio.get_running_loop().add_signal_handler(
+        signal.SIGTERM, asyncio.current_task().cancel
+    )
     logger.info("relay server serving; ctrl-c to stop")
     try:
         while True:
@@ -756,8 +836,9 @@ def main() -> None:
         "--spool_dir",
         type=str,
         default=None,
-        help="where shards are stored (needs retain_last x checkpoint size of "
-        "disk); default: a temp dir removed on exit",
+        help="where shards are stored (needs retain_last x checkpoint size); "
+        "default: per version, /dev/shm when RAM has room, else a temp dir on "
+        "disk, removed on exit",
     )
     args = parser.parse_args()
 

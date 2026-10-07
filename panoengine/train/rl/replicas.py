@@ -577,25 +577,33 @@ class AsyncInferenceReplica(PureLearnerReplica):
     # ------------------------------------------------------------------ #
 
     async def _publish_checkpoint(self) -> str:
-        theta = self._get_rank_0_value(
-            await self.trainer.get_full_state_dict_cpu.call()
-        )
         # bf16 over the wire: halves every publish and every worker download.
         # Safe because relay checkpoints are a dead end -- workers use them
         # only as the generation behavior policy (the engine runs bf16 anyway)
         # and never train on or push back these weights, so unlike the
         # trainer<->server DiLoCo channel the cast can't compound. The IS-
         # corrected loss stays consistent: the recorded behavior logprobs come
-        # from the bf16 model that actually generated.
-        theta = {k: v.to(dtype=torch.bfloat16) for k, v in theta.items()}
-        self._checkpoint_version += 1
-        # Shard in a thread: torch.save of ~GB blobs would otherwise block
-        # the event loop (and with it the embedded rollout queue).
-        shards = await asyncio.to_thread(
-            shard_state_dict, theta, self.config.num_shards
+        # from the bf16 model that actually generated. Cast on the trainer GPU,
+        # before the device->host copy, so the copy, the reply, and its
+        # deserialization here are all half size.
+        reply = await self.trainer.get_full_state_dict_cpu.call(
+            dtype=torch.bfloat16
         )
-        manifest = build_manifest(self._checkpoint_version, shards)
-        await self._relay_client.publish(self._checkpoint_version, shards, manifest)
+        self._checkpoint_version += 1
+        version = self._checkpoint_version
+
+        def prepare():
+            # Deserializing the reply (it unpickles lazily, on .get), sharding,
+            # and hashing ~GBs all hold the GIL for seconds: on the event loop
+            # they stalled the next window's steps ~25 s per publish (run
+            # a8acf96f4daa). The cast is a no-op on the trainer's bf16 reply.
+            theta = self._get_rank_0_value(reply)
+            theta = {k: v.to(dtype=torch.bfloat16) for k, v in theta.items()}
+            shards = shard_state_dict(theta, self.config.num_shards)
+            return shards, build_manifest(version, shards)
+
+        shards, manifest = await asyncio.to_thread(prepare)
+        await self._relay_client.publish(version, shards, manifest)
         total_bytes = sum(manifest.shard_sizes)
         return (
             f"relay: published v{self._checkpoint_version} "

@@ -10,6 +10,10 @@
 # is faked.
 
 import asyncio
+import os
+import socket
+import subprocess
+import tempfile
 import time
 import itertools
 import pickle
@@ -21,6 +25,7 @@ import torch
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
+import panoengine.decentralized.relay as relay_mod
 import panoengine.train.rl.worker as worker_mod
 from panoengine.decentralized.relay import (
     build_manifest,
@@ -171,6 +176,40 @@ def test_relay_spools_shards_to_disk_and_evicts_them(tmp_path):
             await server.close()
 
     asyncio.run(scenario())
+
+
+def test_relay_spools_in_ram_only_when_it_fits(tmp_path, monkeypatch):
+    """Auto spool: a version goes to /dev/shm while RAM has 4x its size free
+    (~13x faster uploads than the dev box's disk), else to disk. Creating a
+    spool sweeps ones whose relay died (in RAM they would pin memory until
+    reboot) and leaves a live relay's alone."""
+    ram, disk = tmp_path / "shm", tmp_path / "disk"
+    ram.mkdir()
+    disk.mkdir()
+    monkeypatch.setattr(relay_mod, "_RAM_SPOOL", ram)
+    monkeypatch.setattr(tempfile, "tempdir", str(disk))
+    room = {"bytes": 1 << 40}
+    monkeypatch.setattr(relay_mod, "_ram_room", lambda: room["bytes"])
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    for name, pid in (("pf-relay-dead", dead.pid), ("pf-relay-live", os.getpid())):
+        (ram / name).mkdir()
+        (ram / name / ".owner").write_text(f"{socket.gethostname()} {pid}")
+
+    relay = RelayServer(retain_last=1)
+    shards = [b"x" * 100]
+    relay.publish_manifest(1, build_manifest(1, shards))
+    relay.publish_shard(1, 0, shards[0])
+    assert relay.shard_path(1, 0).is_relative_to(ram)
+    assert not (ram / "pf-relay-dead").exists()
+    assert (ram / "pf-relay-live").exists()
+
+    room["bytes"] = 399  # under 4 x 100
+    relay.publish_manifest(2, build_manifest(2, shards))
+    relay.publish_shard(2, 0, shards[0])
+    assert relay.shard_path(2, 0).is_relative_to(disk)
+    assert relay.get_shard(2, 0) == shards[0]
+    assert not list(ram.glob("pf-relay-*/1"))  # v1 evicted from RAM
 
 
 def _site_sd():
@@ -432,7 +471,10 @@ def make_async_inference_replica(*, publish_every=1):
     r._window_count = 0
     sd = _state_dict()
 
-    async def fake_get_full_state_dict_cpu():
+    r.requested_dtypes = []
+
+    async def fake_get_full_state_dict_cpu(dtype=torch.float32):
+        r.requested_dtypes.append(dtype)
         return {0: sd}  # {rank: value}, so inherited _get_rank_0_value (.get(0)) works
 
     r.trainer = SimpleNamespace(
@@ -463,6 +505,8 @@ def test_window_sync_publishes_only_on_boundary_in_background():
         assert len(r._relay_client.published) == 1
         version, num_shards, manifest = r._relay_client.published[0]
         assert version == 1 and num_shards == 2 and manifest.version == 1
+        # Cast on the trainer GPU, not after a full-precision copy home.
+        assert r.requested_dtypes == [torch.bfloat16]
 
         stats3 = await r._window_sync(t0=0.0)
         assert "relay" not in stats3

@@ -1,0 +1,45 @@
+# The same tool-calling RL run with generation split off.
+# The trainer publishes weights to the generators through the sync hub's relay
+# and pops its rollouts off the hub's queue.
+#
+# Submit with:
+#   panofabric run submit spec_slurm_generator.yaml --code models/rl_tool_agent
+name: rl-tool-agent-slurm-generator
+workload:
+  kind: rl
+  sync:
+    method: none
+model:
+  module: models.rl_tool_agent
+  preset: rl_async_inference_tool_agent_qwen3_5_9b
+  hf_model: Qwen/Qwen3.5-9B
+training:
+  steps: 100
+overrides:
+  # The trainer waits this long for its FIRST rollout before declaring the
+  # generator pool dead (default 900 s). A cold start spends longer than that:
+  # generators build their env, start vLLM, then download v1.
+  rollout_stall_timeout_s: 3600
+  trainer.checkpointer.interval: 1000
+  # Oldest rollout the trainer still trains on, in trainer steps (default 50).
+  max_staleness: 30
+fabric:
+  sync_hub_infra: ""
+  islands:
+    - role: trainer
+      resources:
+        accelerators: "H200:2"
+        memory: "256+"
+        infra: ""
+    - role: generator
+      count: 4
+      # groups_per_round: rollout groups each generator keeps in flight,
+      # 8 sequences apiece. 4 is the preset default (at 2, an L40S's KV cache
+      # sat 92% idle); raise it if the trainer waits on rollouts.
+      overrides:
+        groups_per_round: 4
+      resources:
+        accelerators: "L40S:1"
+        memory: "96+"
+        cpus: "32"
+        infra: ""

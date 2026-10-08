@@ -42,8 +42,8 @@ VENV ?= .venv
 .PHONY: all setup-env sync-project install-torch install-torchtt-ft forks dev-forks build-into ensure gc-env-cache show-backend clean-protoc-zip
 
 all: setup-env sync-project install-torch install-torchtt-ft
-	@[ "$${PF_RL:-0}" = "1" ] && $(MAKE) install-rl || \
-	  echo "[all] PF_RL!=1; skipping the RL runtime"
+	@if [ "$${PF_RL:-0}" = "1" ]; then $(MAKE) install-rl; \
+	else echo "[all] PF_RL!=1; skipping the RL runtime"; fi
 
 # $HOME/.cargo/bin is on PATH so the torchft maturin build finds cargo/rustc after a
 # user-local rustup install (this was missing before — a latent no-root bug).
@@ -256,8 +256,11 @@ build-into: setup-env
 	$(UV_PIP_CMD) --no-deps .
 	$(MAKE) install-torch VENV=$(VENV)
 	$(MAKE) install-torchtt-ft VENV=$(VENV)
-	@[ "$${PF_RL:-0}" = "1" ] && $(MAKE) install-rl VENV=$(VENV) || \
-	  echo "[build-into] PF_RL!=1; skipping the RL runtime"
+	@# if/else, NOT `[ ... ] && install-rl || echo skipping`: that form ran the echo when
+	@# install-rl FAILED, so a half-built env passed as "PF_RL!=1" and was PUBLISHED --
+	@# and won the publish race over three complete builds (run 8911e6f16bb2).
+	@if [ "$${PF_RL:-0}" = "1" ]; then $(MAKE) install-rl VENV=$(VENV); \
+	else echo "[build-into] PF_RL!=1; skipping the RL runtime"; fi
 
 ensure:
 	@set -eu; \
@@ -273,10 +276,12 @@ ensure:
 	       echo "[ensure] $$root not shared ($$fstype); per-run make all"; exec $(MAKE) all;; \
 	     esac;; esac; \
 	export UV_PYTHON_INSTALL_DIR="$$root/uv-python"; \
+	export UV_CACHE_DIR="$$root/uv-cache/$$(hostname)"; \
 	backend=$$(sh scripts/pf_backend.sh); \
 	verify='import torch,torchtitan,torchft'; \
-	case "$${PF_RL:-0}" in 1) verify="$$verify,vllm";; esac; \
-	src=$$(sh scripts/pf_env_fp.sh --source); \
+	case "$${PF_RL:-0}" in 1) verify="$$verify,vllm,torchstore";; esac; \
+	src=$$(PF_FORK_PINS="torchtitan=$(TORCHTITAN_REF) torchft=$(TORCHFT_REF)" \
+	  sh scripts/pf_env_fp.sh --source); \
 	[ -n "$$src" ] || { echo "[ensure] no fingerprint; per-run make all"; exec $(MAKE) all; }; \
 	fp=$$(printf '%s:%s:rl%s' "$$src" "$$backend" "$${PF_RL:-0}" | sha256sum | cut -c1-16); \
 	env="$$root/env-$$fp"; \
@@ -293,14 +298,18 @@ ensure:
 	"$$tmp/.venv/bin/python" -c "$$verify"; \
 	printf '%s\n%s\n%s\n' "$$fp" "$$backend" "$$(date -u +%FT%TZ)" > "$$tmp/.stamp"; \
 	if [ -n "$$stale" ]; then mv -T "$$env" "$$env.stale.$$$$" 2>/dev/null || rm -rf "$$env"; fi; \
-	if mv -T "$$tmp" "$$env" 2>/dev/null; then echo "[ensure] published $$fp"; \
-	else echo "[ensure] lost publish race; using existing $$fp"; rm -rf "$$tmp"; fi; \
 	rm -rf "$$env.stale.$$$$"; \
-	$(MAKE) gc-env-cache PF_ENV_CACHE_ROOT="$$root" || true; \
+	if mv -T "$$tmp" "$$env" 2>/dev/null; then echo "[ensure] published $$fp"; \
+	  $(MAKE) gc-env-cache PF_ENV_CACHE_ROOT="$$root" PF_ENV_CACHE_CURRENT="$$env" || true; \
+	else echo "[ensure] lost publish race; using existing $$fp"; rm -rf "$$tmp"; fi; \
 	restore
 
-# Prune the per-fingerprint cache to the N most-recent entries (mtime). Staging dirs are
-# `.build.*` (dot-prefixed) so this `env-*` glob never touches an in-flight build.
+# Prune the per-fingerprint cache to the N most-recently PUBLISHED entries, run only by the
+# build that just published (PF_ENV_CACHE_CURRENT, which it never prunes). Ranked by each
+# entry's .stamp, written once at publish -- not the dir mtime, which an `rm -rf` in progress
+# keeps refreshing: four concurrent prunes then ranked half-deleted old envs above the one
+# just published and deleted it under all four generators (run 7a2d6145e4dd). Staging dirs
+# are `.build.*` (dot-prefixed) so this `env-*` glob never touches an in-flight build.
 #
 # ALSO sweeps ABANDONED staging dirs. A build that is killed mid-flight (scancel, node
 # failure, a run torn down before setup finishes) never reaches its `mv -T`, so it strands
@@ -312,11 +321,17 @@ PF_ENV_BUILD_STALE_MIN ?= 240
 gc-env-cache:
 	@root="$(PF_ENV_CACHE_ROOT)"; keep=$(PF_ENV_CACHE_KEEP); \
 	[ -n "$$root" ] && [ -d "$$root" ] || exit 0; \
-	ls -1dt "$$root"/env-* 2>/dev/null | tail -n +$$((keep + 1)) | while IFS= read -r d; do \
+	ls -1t "$$root"/env-*/.stamp 2>/dev/null | tail -n +$$((keep + 1)) | while IFS= read -r s; do \
+	  d="$${s%/.stamp}"; [ "$$d" = "$(PF_ENV_CACHE_CURRENT)" ] && continue; \
 	  echo "[gc-env-cache] pruning $$d"; rm -rf "$$d"; done; \
+	find "$$root" -maxdepth 1 -name 'env-*' -type d -mmin +$(PF_ENV_BUILD_STALE_MIN) \
+	  ! -exec test -e {}/.stamp \; -print 2>/dev/null | while IFS= read -r d; do \
+	  echo "[gc-env-cache] pruning half-deleted $$d"; rm -rf "$$d"; done; \
 	find "$$root" -maxdepth 1 -name '.build.*' -type d \
 	  -mmin +$(PF_ENV_BUILD_STALE_MIN) 2>/dev/null | while IFS= read -r d; do \
 	  echo "[gc-env-cache] pruning abandoned build $$d"; rm -rf "$$d"; done; \
+	find "$$root/uv-cache" -mindepth 1 -maxdepth 1 -type d -mtime +14 \
+	  -exec rm -rf {} + 2>/dev/null; \
 	exit 0
 
 show-backend:

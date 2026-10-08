@@ -10,9 +10,9 @@
 #     consumes any worker's rollouts, at-most-once).
 #
 # Deliberately dumb: a bounded FIFO of pickled ``(worker_id, version,
-# groups)`` batches. Full -> push rejected (503; the worker drops the batch
-# -- the trainer's max_staleness bound is designed around lost rollouts).
-# Empty -> pop returns 204 (the trainer polls). Runs next to the relay
+# groups)`` batches. Full -> push rejected (503); the worker waits and retries,
+# which holds its generation to the trainer's pace. Empty -> pop returns 204
+# (the trainer polls). Runs next to the relay
 # process (relay.py) but separately from it, so multi-GB
 # checkpoint traffic and rollout traffic never queue behind each other.
 #
@@ -43,7 +43,14 @@ class RolloutQueueServer:
     ``asyncio.Queue.get_nowait`` has no await in it, so two concurrent pops
     can't claim the same batch."""
 
-    def __init__(self, maxsize: int = 256):
+    #: Small on purpose: everything queued ages while it waits, in trainer
+    #: steps. At 256 a backlog built up early (generators briefly outran the
+    #: trainer) and was consumed ~50 steps stale, then dropped -- 183 groups
+    #: and a 354 s window in run 1bedef07b284. 32 single-group batches is
+    #: ~6 steps of a 5-groups-per-step trainer, on top of its own buffer.
+    DEFAULT_MAXSIZE = 32
+
+    def __init__(self, maxsize: int = DEFAULT_MAXSIZE):
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
         self.num_received = 0
         self.num_rejected = 0
@@ -98,39 +105,49 @@ class RolloutQueueServer:
 class RolloutQueuePushClient:
     """The generator workers' side: one pickle+HTTP POST per batch.
 
-    A rejection (503, queue full) or transport failure is logged and the
-    batch is dropped rather than retried: blocking generation to retry a
-    stuck queue defeats the point of decoupled generation, and the trainer's
-    max_staleness bound already tolerates -- and is designed around -- losing
-    some rollouts."""
+    A full queue (503) is backpressure, not failure: ``send`` waits and retries
+    until the trainer has popped room, so the worker -- which awaits each send
+    before starting new groups -- generates at the trainer's pace instead of
+    racing ahead into rollouts that go stale in the queue. Any other rejection
+    or a transport failure is logged and the batch dropped: a dead or wedged
+    queue must not stall the worker, and the trainer's max_staleness bound
+    tolerates lost rollouts."""
 
-    def __init__(self, queue_address: str, *, timeout_s: float = 30.0):
+    def __init__(self, queue_address: str, *, timeout_s: float = 30.0,
+                 full_retry_s: float = 1.0):
         if not queue_address.strip():
             raise ValueError(
                 "queue_address is required (set $ASYNC_INFERENCE_ROLLOUT_QUEUE_ADDR)"
             )
         self.queue_address = queue_address.rstrip("/")
         self._timeout_s = timeout_s
+        self._full_retry_s = full_retry_s
 
     async def send(self, worker_id: int, version: int, groups: list) -> bool:
-        """Returns True if the queue accepted the batch, False otherwise
-        (rejected or unreachable) -- never raises on a transport failure."""
+        """Returns True once the queue accepted the batch (waiting while it is
+        full), False if it was rejected otherwise or is unreachable -- never
+        raises on a transport failure."""
         payload = pickle.dumps((worker_id, version, groups))
         try:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self._timeout_s)
             ) as session:
-                async with session.post(
-                    f"{self.queue_address}/rollouts", data=payload
-                ) as resp:
-                    if resp.status == 204:
-                        return True
-                    logger.warning(
-                        "rollout push to %s rejected (status=%d)",
-                        self.queue_address,
-                        resp.status,
-                    )
-                    return False
+                while True:
+                    async with session.post(
+                        f"{self.queue_address}/rollouts", data=payload
+                    ) as resp:
+                        status = resp.status
+                    if status != 503:
+                        break
+                    await asyncio.sleep(self._full_retry_s)
+                if status == 204:
+                    return True
+                logger.warning(
+                    "rollout push to %s rejected (status=%d)",
+                    self.queue_address,
+                    status,
+                )
+                return False
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             # TimeoutError too: aiohttp raises plain asyncio.TimeoutError (not
             # a ClientError) on a slow queue; a push must never raise.
@@ -209,7 +226,7 @@ def main() -> None:
         "(default: $TORCHFT_PS_ADVERTISE_HOST if set, else this machine's "
         "hostname -- NOT --host, which is only the local bind interface)",
     )
-    parser.add_argument("--maxsize", type=int, default=256)
+    parser.add_argument("--maxsize", type=int, default=RolloutQueueServer.DEFAULT_MAXSIZE)
     args = parser.parse_args()
 
     from torchft.parameter_server import _resolve_advertise_host

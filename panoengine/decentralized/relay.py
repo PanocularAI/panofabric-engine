@@ -35,6 +35,7 @@ import io
 import logging
 import os
 import random
+import re
 import shutil
 import signal
 import socket
@@ -168,20 +169,27 @@ def verify_shard(shard_idx: int, data: bytes, manifest: CheckpointManifest) -> N
 
 
 def reassemble_state_dict(
-    shard_bytes: list[bytes], manifest: CheckpointManifest
+    shard_bytes: list[bytes], manifest: CheckpointManifest, *, consume: bool = False
 ) -> dict[str, torch.Tensor]:
     """Verify every shard against the manifest, then merge into one state
     dict. Raises ShardIntegrityError on the first checksum mismatch or a
-    shard-count mismatch -- never returns a partially-trusted result."""
+    shard-count mismatch -- never returns a partially-trusted result.
+
+    ``consume`` drops each shard's bytes from the list as soon as they are
+    loaded, so the peak is the state dict plus ONE shard instead of both in
+    full."""
     if len(shard_bytes) != manifest.num_shards:
         raise ShardIntegrityError(
             f"expected {manifest.num_shards} shards, got {len(shard_bytes)}"
         )
     merged: dict[str, torch.Tensor] = {}
-    for idx, data in enumerate(shard_bytes):
+    for idx in range(len(shard_bytes)):
+        data = shard_bytes[idx]
+        if consume:
+            shard_bytes[idx] = None
         verify_shard(idx, data, manifest)
-        shard_sd = torch.load(io.BytesIO(data), weights_only=True)
-        merged.update(shard_sd)
+        merged.update(torch.load(io.BytesIO(data), weights_only=True))
+        del data
     return merged
 
 
@@ -194,6 +202,9 @@ _RAM_SPOOL = Path("/dev/shm")
 #: A version is spooled in RAM only while RAM has this many times its size
 #: free, so the retained versions never squeeze the host or its cgroup.
 _RAM_HEADROOM = 4
+#: A version some fetcher touched (manifest or shard) this recently is still
+#: being downloaded, so eviction spares it beyond ``retain_last``.
+_IN_USE_S = 300.0
 
 
 def _ram_room() -> int:
@@ -266,6 +277,7 @@ class RelayServer:
         self._dirs: dict[int, Path] = {}
         self._landed: dict[int, set[int]] = {}
         self._manifests: dict[int, CheckpointManifest] = {}
+        self._touched: dict[int, float] = {}  # version -> last fetcher access
 
     def _private_root(self, base: Path) -> Path:
         if base not in self._roots:
@@ -292,18 +304,29 @@ class RelayServer:
         in flight (or never coming: a trainer that exits mid-publish); a fetcher
         handed it gets 404s and re-downloads the shards that did land on every
         retry."""
-        complete = [v for v, m in self._manifests.items()
-                    if len(self._landed.get(v, ())) == m.num_shards]
+        complete = [v for v in self._manifests if self.complete_manifest(v)]
         return max(complete) if complete else None
+
+    def complete_manifest(self, version: int) -> CheckpointManifest | None:
+        """``version``'s manifest once all its shards have landed, else None."""
+        m = self._manifests.get(version)
+        return m if m is not None and len(self._landed.get(version, ())) == m.num_shards else None
+
+    def touch(self, version: int) -> None:
+        """Note a fetcher reading ``version``, which keeps it from eviction."""
+        self._touched[version] = time.monotonic()
 
     def _evict_old(self) -> None:
         if len(self._manifests) <= self.retain_last:
             return
         keep = set(sorted(self._manifests, reverse=True)[: self.retain_last])
+        now = time.monotonic()
+        keep |= {v for v, t in self._touched.items() if now - t < _IN_USE_S}
         for version in list(self._manifests):
             if version not in keep:
                 del self._manifests[version]
                 self._landed.pop(version, None)
+                self._touched.pop(version, None)
                 # A download already streaming one of these files keeps its
                 # open fd, so unlinking never cuts a transfer short.
                 if (vdir := self._dirs.pop(version, None)) is not None:
@@ -370,6 +393,7 @@ class RelayServer:
                 web.post("/publish/{version}/manifest", _handle_publish_manifest),
                 web.post("/publish/{version}/shard/{idx}", _handle_publish_shard),
                 web.get("/manifest/latest", _handle_manifest_latest),
+                web.get("/manifest/{version}", _handle_manifest_version),
                 web.get("/shard/{version}/{idx}", _handle_get_shard),
             ]
         )
@@ -418,7 +442,20 @@ async def _handle_manifest_latest(request: web.Request) -> web.Response:
     version = relay.latest_version()
     if version is None:
         return web.Response(status=404, text="no checkpoint published yet")
+    relay.touch(version)
     return web.json_response(relay.get_manifest(version).to_json())
+
+
+async def _handle_manifest_version(request: web.Request) -> web.Response:
+    """A retained, complete version's manifest: how a fetcher confirms that a
+    version its site already started is this run's and still on the relay."""
+    relay: RelayServer = request.app[_RELAY_KEY]
+    version = int(request.match_info["version"])
+    manifest = relay.complete_manifest(version)
+    if manifest is None:
+        return web.Response(status=404, text=f"no complete version {version}")
+    relay.touch(version)
+    return web.json_response(manifest.to_json())
 
 
 async def _handle_get_shard(request: web.Request) -> web.Response:
@@ -428,6 +465,7 @@ async def _handle_get_shard(request: web.Request) -> web.Response:
     path = relay.shard_path(version, idx)
     if path is None:
         return web.Response(status=404, text=f"no shard {idx} for version {version}")
+    relay.touch(version)
     # sendfile straight from the spool: no multi-GB copy through Python.
     # Returned unprepared: aiohttp prepares it, and a FileResponse prepared
     # here first asserts on that second prepare. Download rates are logged by
@@ -699,6 +737,37 @@ class RelayClient:
             tmp.unlink(missing_ok=True)
             claim.unlink(missing_ok=True)
 
+    async def _site_joinable_manifest(
+        self, session: aiohttp.ClientSession, url: str, min_version: int
+    ) -> CheckpointManifest | None:
+        """The newest version newer than ``min_version`` that this site's other
+        fetchers already started (or finished), so a site settles on ONE version
+        per round and splits its download, instead of each fetcher taking the
+        relay's latest at whatever moment it happens to be ready.
+
+        A candidate is confirmed with the relay by version AND content tag:
+        version numbers restart every run, and the site cache can still hold a
+        previous run's dirs under the same relay URL."""
+        root = self._site_cache / hashlib.sha256(url.encode()).hexdigest()[:12]
+        try:
+            names = [d.name for d in root.iterdir()]
+        except OSError:
+            return None
+        found = sorted(((int(m[1]), m[2]) for n in names
+                        if (m := re.fullmatch(r"v(\d+)-([0-9a-f]{12})", n))
+                        and int(m[1]) > min_version), reverse=True)
+        for version, tag in found:
+            try:
+                async with session.get(f"{url}/manifest/{version}") as resp:
+                    if resp.status != 200:
+                        continue
+                    manifest = CheckpointManifest.from_json(await resp.json())
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                return None
+            if self._site_version_dir(url, manifest).name == f"v{version}-{tag}":
+                return manifest
+        return None
+
     @staticmethod
     def _prune_site_cache(current: Path) -> None:
         """Keep this version and the newest other one (a slower fetcher may still
@@ -763,6 +832,17 @@ class RelayClient:
             pass
         return [shards[i] for i in range(manifest.num_shards)]
 
+    async def latest_version(self) -> int:
+        """The newest complete version any relay serves (0 when none, or none
+        reachable) -- read from the manifests alone, nothing downloaded."""
+        best = 0
+        async with aiohttp.ClientSession(timeout=self._transfer_timeout) as session:
+            for url in self.relay_urls:
+                manifest = await self._fetch_manifest(session, url, 0)
+                if manifest is not None:
+                    best = max(best, manifest.version)
+        return best
+
     async def fetch_latest(self, min_version: int = 0) -> tuple[int, dict] | None:
         """Try relays (probabilistically ordered, without replacement) for a
         checkpoint newer than ``min_version``, verifying checksums; a
@@ -777,7 +857,12 @@ class RelayClient:
                 url = self._weighted_choice(remaining)
                 remaining.remove(url)
 
-                manifest = await self._fetch_manifest(session, url, min_version)
+                manifest = None
+                if self._site_cache is not None:
+                    manifest = await self._site_joinable_manifest(
+                        session, url, min_version)
+                if manifest is None:
+                    manifest = await self._fetch_manifest(session, url, min_version)
                 if manifest is None:
                     continue
                 fetch = (self._fetch_shards_via_site if self._site_cache is not None
@@ -786,7 +871,8 @@ class RelayClient:
                 if shard_bytes is None:
                     continue
                 try:
-                    state_dict = reassemble_state_dict(shard_bytes, manifest)
+                    state_dict = reassemble_state_dict(
+                        shard_bytes, manifest, consume=True)
                 except ShardIntegrityError:
                     logger.warning(
                         "relay %s served a corrupted shard for version %d; "

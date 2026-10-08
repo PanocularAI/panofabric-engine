@@ -42,6 +42,7 @@ from panoengine.decentralized.parameter_server import (
     HeLoCoRLClient,
     param_metadata,
 )
+from panoengine.decentralized.relay import RelayClient
 from panoengine.decentralized.rollout_queue import (
     RolloutQueuePopClient,
 )
@@ -481,9 +482,10 @@ class AsyncInferenceReplica(PureLearnerReplica):
         upload's own duration paces the publishes.
 
     Versions are trainer steps: the weights after optimizer step k are
-    published as version k + 1 (workers treat 0 as "nothing loaded yet"), so
-    the staleness of a rollout is how many optimizer steps the trainer took
-    since the weights that generated it.
+    published as version base + k + 1 (workers treat 0 as "nothing loaded
+    yet"; base is 0 unless a restarted trainer finds the relay already holding
+    versions), so the staleness of a rollout is how many optimizer steps the
+    trainer took since the weights that generated it.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -522,6 +524,7 @@ class AsyncInferenceReplica(PureLearnerReplica):
         self._queue_client: RolloutQueuePopClient | None = None
         self._latest_published = 0
         self._window_published = 0
+        self._version_base = 0
 
     async def setup_async(self, *, trainer_mesh, generator_meshes):
         """Spawn only the SnapshotPolicyTrainer actor (one learner GPU), build
@@ -540,6 +543,19 @@ class AsyncInferenceReplica(PureLearnerReplica):
             url.strip() for url in cfg.relay_addresses.split(",") if url.strip()
         ]
         self._queue_client = RolloutQueuePopClient(cfg.rollout_queue_address)
+        # A restarted trainer begins again at step 0 while the relay still holds
+        # the previous attempt's versions: it took this attempt's v1 for the
+        # oldest and evicted it on arrival, so every restart died on its initial
+        # publish (run c3af15677e57, 10 restarts). Number above them -- by more
+        # than max_staleness, so the old attempt's queued rollouts are all too
+        # stale to train on.
+        latest = await RelayClient(self._relay_urls).latest_version()
+        if latest:
+            self._version_base = latest + cfg.max_staleness + 1
+            logger.info(
+                "[replica %d] relay already holds v%d; this attempt publishes from v%d",
+                cfg.replica_id, latest, self._weights_version(),
+            )
 
         await self._spawn_trainer_only(
             trainer_mesh=trainer_mesh,
@@ -564,10 +580,15 @@ class AsyncInferenceReplica(PureLearnerReplica):
         consumer then waits queue_poll_interval_s and retries)."""
         return await self._queue_client.pop()
 
+    def _weights_version(self) -> int:
+        """The version the trainer's CURRENT weights publish as (see the class
+        docstring)."""
+        return self._version_base + self._policy_version + 1
+
     def _staleness_reference(self) -> int:
-        """The version the trainer's CURRENT weights would publish as (see the
-        class docstring), so reference minus a rollout's version is steps."""
-        return self._policy_version + 1
+        """Reference minus a rollout's version is the trainer steps since the
+        weights that generated it."""
+        return self._weights_version()
 
     # ------------------------------------------------------------------ #
     # Relay publish.
@@ -579,7 +600,7 @@ class AsyncInferenceReplica(PureLearnerReplica):
         uploads that finished since the last offer."""
         status = self._get_rank_0_value(
             await self.trainer.publish_to_relay.call(
-                version=self._policy_version + 1,
+                version=self._weights_version(),
                 relay_urls=self._relay_urls,
                 num_shards=self.config.num_shards,
             )

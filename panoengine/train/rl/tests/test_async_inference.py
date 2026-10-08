@@ -83,6 +83,10 @@ def test_shard_reassemble_round_trip_and_integrity():
     assert restored.keys() == sd.keys()
     for name in sd:
         assert torch.equal(restored[name], sd[name])
+    # consume=True (the fetch path) frees each shard's bytes as it is loaded.
+    pieces = list(shards)
+    restored = reassemble_state_dict(pieces, manifest, consume=True)
+    assert pieces == [None] * 3 and all(torch.equal(restored[n], sd[n]) for n in sd)
 
     # A corrupted shard is rejected by checksum, both when verified alone and
     # at reassembly.
@@ -108,7 +112,8 @@ async def _start_relay(retain_last=5):
     return relay, server, base_url
 
 
-def test_relay_server_publish_and_fetch_round_trip():
+def test_relay_server_publish_and_fetch_round_trip(monkeypatch):
+    monkeypatch.setattr(relay_mod, "_IN_USE_S", 0.0)  # count-based eviction only
     async def scenario():
         relay, server, base_url = await _start_relay(retain_last=2)
         try:
@@ -150,11 +155,12 @@ def test_relay_server_publish_and_fetch_round_trip():
     asyncio.run(scenario())
 
 
-def test_relay_spools_shards_to_disk_and_evicts_them(tmp_path):
+def test_relay_spools_shards_to_disk_and_evicts_them(tmp_path, monkeypatch):
     """Shards live on disk, not in the relay's memory: a 9B checkpoint is ~18 GB
     per version and the in-memory store OOM-killed a 16 GB hub mid-publish. A
     shard bigger than one upload chunk must stream in intact, be served back
     byte-for-byte, and leave disk when its version is evicted."""
+    monkeypatch.setattr(relay_mod, "_IN_USE_S", 0.0)  # count-based eviction only
     async def scenario():
         relay = RelayServer(retain_last=1, spool_dir=str(tmp_path))
         server = TestServer(relay.app())
@@ -297,17 +303,79 @@ def test_site_cache_recovers_from_stale_claims_and_bad_shards(tmp_path, monkeypa
     asyncio.run(scenario())
 
 
-def test_site_cache_keeps_only_the_two_newest_versions(tmp_path):
+def test_site_cache_keeps_only_the_two_newest_versions(tmp_path, monkeypatch):
+    monkeypatch.setattr(relay_mod, "_IN_USE_S", 0.0)  # count-based eviction only
     async def scenario():
         relay, server, base_url = await _start_relay()
         try:
             client = RelayClient([base_url], site_cache_dir=str(tmp_path))
             for version in (1, 2, 3):
                 await _publish(base_url, version, _site_sd())
-                assert (await client.fetch_latest())[0] == version
+                # min_version = the version held, as the worker passes it
+                assert (await client.fetch_latest(min_version=version - 1))[0] == version
                 time.sleep(0.01)   # distinct mtimes for the newest-first prune
             names = sorted(p.name.split("-")[0] for p in tmp_path.glob("*/v*"))
             assert names == ["v2", "v3"]
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_site_fetchers_join_the_version_their_site_already_started(tmp_path, monkeypatch):
+    """A fetcher that gets ready after a newer version came out still takes the
+    version its site already has -- split once over the relay link -- instead
+    of the relay's latest; a same-numbered dir with other content (another
+    run's) is never taken for it."""
+    monkeypatch.setattr(relay_mod, "_SITE_POLL_S", 0.01)
+
+    async def scenario():
+        relay, server, base_url = await _start_relay()
+        try:
+            sd = _site_sd()
+            await _publish(base_url, 1, sd)
+            first = RelayClient([base_url], site_cache_dir=str(tmp_path))
+            assert (await first.fetch_latest())[0] == 1   # the site now holds v1
+            await _publish(base_url, 2, {k: v + 1 for k, v in sd.items()})
+            relay_dir = next(tmp_path.iterdir())
+            (relay_dir / "v2-0123456789ab").mkdir()        # v2 by number, wrong content
+            counts = _count_shard_gets(relay, monkeypatch)
+            late = RelayClient([base_url], site_cache_dir=str(tmp_path))
+            version, restored = await late.fetch_latest()
+            assert version == 1 and counts == {}            # joined v1 from the cache
+            assert all(torch.equal(restored[k], sd[k]) for k in sd)
+            version, restored = await late.fetch_latest(min_version=1)
+            assert version == 2 and len(counts) == 4        # then moved on, downloading
+            assert torch.equal(restored["w0"], sd["w0"] + 1)
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_relay_spares_a_version_still_being_fetched(monkeypatch):
+    """Eviction keeps a version a fetcher touched recently even past
+    retain_last (downloads to a Slurm site outlast retain_last publishes), and
+    /manifest/{v} serves only complete, retained versions."""
+
+    async def scenario():
+        relay, server, base_url = await _start_relay(retain_last=1)
+        try:
+            sd = _site_sd()
+            await _publish(base_url, 1, sd)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{base_url}/manifest/1") as resp:
+                    assert resp.status == 200               # a fetcher starts on v1
+                await _publish(base_url, 2, sd)
+                assert relay.complete_manifest(1) is not None   # spared, in use
+                monkeypatch.setattr(relay_mod, "_IN_USE_S", 0.0)
+                await _publish(base_url, 3, sd)
+                assert relay.latest_version() == 3
+                assert relay.complete_manifest(1) is None and relay.complete_manifest(2) is None
+                relay.publish_manifest(4, build_manifest(4, [b"x"]))   # no shards yet
+                for version in (1, 4):
+                    async with session.get(f"{base_url}/manifest/{version}") as resp:
+                        assert resp.status == 404
         finally:
             await server.close()
 
@@ -371,10 +439,11 @@ async def _start_rollout_queue(maxsize=64):
 
 
 def test_rollout_queue_wire_protocol_and_client_robustness():
-    """push/pop round trip over the wire; a full queue rejects the push
-    (client sees False, server counts it); malformed payloads get 400 without
-    crashing the server; and send() reports failure as False rather than
-    raising -- a dead queue endpoint must not take the worker down."""
+    """push/pop round trip over the wire; a push to a full queue WAITS until a
+    pop makes room (backpressure: the worker slows to the trainer's pace
+    instead of piling up rollouts that go stale); malformed payloads get 400
+    without crashing the server; and send() reports failure as False rather
+    than raising -- a dead queue endpoint must not take the worker down."""
 
     async def scenario():
         # Nothing listening: send() must return False, not raise.
@@ -384,18 +453,21 @@ def test_rollout_queue_wire_protocol_and_client_robustness():
         )
         server, test_server, base_url = await _start_rollout_queue(maxsize=1)
         try:
-            pusher = RolloutQueuePushClient(base_url)
+            pusher = RolloutQueuePushClient(base_url, full_retry_s=0.02)
             popper = RolloutQueuePopClient(base_url)
             assert await popper.pop() is None  # nothing pushed yet
             accepted = await pusher.send(worker_id=3, version=7, groups=["g1", "g2"])
             assert accepted is True
-            # Nothing has popped yet, so the queue (maxsize=1) is now full.
-            assert await pusher.send(0, 8, ["g3"]) is False
-            assert server.num_received == 1
-            assert server.num_rejected == 1
+            # Nothing has popped yet, so the queue (maxsize=1) is now full:
+            # the next push waits instead of dropping its batch.
+            waiting = asyncio.create_task(pusher.send(0, 8, ["g3"]))
+            await asyncio.sleep(0.2)
+            assert not waiting.done() and server.num_rejected >= 1
 
             assert await popper.pop() == (3, 7, ["g1", "g2"])
-            assert server.num_popped == 1
+            assert await asyncio.wait_for(waiting, 5) is True
+            assert await popper.pop() == (0, 8, ["g3"])
+            assert server.num_received == 2 and server.num_popped == 2
             assert await popper.pop() is None  # drained (at-most-once claims)
 
             async with aiohttp.ClientSession() as session:
@@ -408,7 +480,7 @@ def test_rollout_queue_wire_protocol_and_client_robustness():
                         f"{base_url}/rollouts", data=payload
                     ) as resp:
                         assert resp.status == 400
-            assert server.num_received == 1  # nothing malformed was enqueued
+            assert server.num_received == 2  # nothing malformed was enqueued
         finally:
             await test_server.close()
 
@@ -472,7 +544,7 @@ def make_async_inference_replica():
     r.config = SimpleNamespace(replica_id=0, num_shards=2)
     r._relay_urls = ["http://relay"]
     r._latest_published = r._window_published = 0
-    r._policy_version = 0
+    r._policy_version = r._version_base = 0
     r.offered, r.started, r.upload_done = [], [], True
     pending = []
 
@@ -587,11 +659,16 @@ class _FakeRolloutQueueClient:
 
 
 class _FakeTorchStore:
+    """TorchStore's layout for a state dict: one entry per tensor under
+    ``<key>/<name>`` plus ``<key>/MAPPING``."""
+
     def __init__(self):
-        self.puts = []
+        self.store = {}
 
     async def put_state_dict(self, state_dict, key):
-        self.puts.append((key, state_dict))
+        self.store.update({f"{key}/{k}": v for k, v in state_dict.items()})
+        self.store[f"{key}/MAPPING"] = sorted(state_dict)
+
 
 
 def make_worker(monkeypatch, results, *, num_rounds=0, groups_per_round=1):
@@ -630,7 +707,8 @@ def test_worker_free_runs_without_a_newer_checkpoint(monkeypatch):
     worker would produce exactly ONE round and then idle, starving a trainer
     whose only rollout source is this worker."""
     # Only ONE checkpoint ever exists; every later poll returns None.
-    results = [(1, {"w": torch.zeros(1)}), None, None, None]
+    results_dict = {"w": torch.zeros(1)}
+    results = [(1, results_dict), None, None, None]
     w, fake_ts, pull_calls = make_worker(
         monkeypatch, results, num_rounds=3, groups_per_round=1
     )
@@ -640,6 +718,9 @@ def test_worker_free_runs_without_a_newer_checkpoint(monkeypatch):
     # Three rounds ran despite only one checkpoint fetch, all tagged v1.
     assert pull_calls == [1]  # loaded the checkpoint exactly once
     assert w._version == 1
+    # The fetched dict is released once TorchStore holds the weights;
+    # TorchStore keeps its copy (a repeated put reuses its segments in place).
+    assert results_dict == {} and "model_state_dict/w" in fake_ts.store
     assert len(w._rollouter.groups_run) == 3  # 1 group/round x 3 rounds
     sent = w._rollout_queue_client.sent
     assert [(wid, ver, len(g)) for wid, ver, g in sent] == [
@@ -708,6 +789,7 @@ def make_replica(*, max_staleness=4, policy_version=9):
     r._buffer = asyncio.Queue(maxsize=8)
     r._num_dropped = 0
     r._policy_version = policy_version  # reference = policy_version + 1
+    r._version_base = 0
     return r
 
 
@@ -779,6 +861,37 @@ def test_collect_and_build_drops_groups_more_steps_stale_than_the_bound():
     asyncio.run(scenario())
 
 
+def test_restarted_trainer_numbers_above_the_relay_and_drops_old_rollouts():
+    """A restarted trainer begins at step 0 while the relay holds the previous
+    attempt's versions. Numbering from latest + max_staleness + 1 makes its 
+    weights the relay's newest, and every rollout the old attempt left queued 
+    too stale to train on."""
+
+    async def scenario():
+        relay, server, base_url = await _start_relay()
+        try:
+            assert await RelayClient([base_url]).latest_version() == 0  # empty relay
+            await _publish(base_url, 85, _site_sd())
+            assert await RelayClient([base_url]).latest_version() == 85
+        finally:
+            await server.close()
+
+        r = make_replica(max_staleness=30, policy_version=0)
+        r._version_base = 85 + 30 + 1
+        assert r._weights_version() == 117
+        r.trainer = SimpleNamespace(sync_log_step=_ep(lambda step: _noop()))
+        r.trainer_dp_degree = 1
+        _passthrough_pipeline(r, min_policy_versions=[117])
+        r._remote_consumer_task = asyncio.create_task(asyncio.sleep(30))
+        await r._buffer.put((_group(num_tokens=5), 85))   # old attempt's: dropped
+        await r._buffer.put((_group(num_tokens=5), 117))  # this attempt's: kept
+        _, rollout_groups = await asyncio.wait_for(r._collect_and_build(1), 1)
+        assert r._num_dropped == 1 and len(rollout_groups) == 1
+        r._remote_consumer_task.cancel()
+
+    asyncio.run(scenario())
+
+
 # --------------------------------------------------------------------- #
 # End-to-end controller loop on fakes (mirrors the GPU smoke's shape) for the
 # PURE-LEARNER trainer: no generators, consume from a fake embedded queue,
@@ -818,7 +931,7 @@ def test_train_end_to_end_pure_learner_on_fakes():
             rollout_stall_timeout_s=0,
             num_shards=2,
         )
-        r._policy_version = 0
+        r._policy_version = r._version_base = 0
         r._num_dropped = 0
         r._relay_urls = ["http://relay"]
         r._latest_published = r._window_published = 0

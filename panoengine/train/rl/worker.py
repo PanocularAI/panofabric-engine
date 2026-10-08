@@ -208,8 +208,16 @@ class AsyncInferenceWorker:
     async def _load_checkpoint(self, version: int, state_dict: dict) -> None:
         """Push the relay-fetched state dict into TorchStore under the same
         key `Trainer.push_model_state_dict` uses, then pull it into the
-        local engine through the generator's existing, unmodified endpoint."""
+        local engine through the generator's existing, unmodified endpoint.
+
+        Takes ownership of ``state_dict`` and empties it once TorchStore holds
+        the weights: the put copies them into shared memory before returning,
+        and kept, this dict was another full 18 GB at 9B. TorchStore's own copy stays:
+        deleting its keys made every next put allocate fresh shared-memory
+        segments while the old ones stayed mapped and pinned in each process's
+        segment cache, where a repeated put otherwise reuses them in place."""
         await ts.put_state_dict(state_dict, "model_state_dict")
+        state_dict.clear()
         await self.generator.pull_model_state_dict.call(version)
         self._version = version
         logger.info(

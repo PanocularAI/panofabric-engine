@@ -37,9 +37,33 @@ py="${PF_PYTHON_VERSION:-3.13}"
 # order-independent.
 forks="${FORKS_DIR:-..}"
 
+# A fork checked out CLEANLY at its pin (PF_FORK_PINS="name=ref ...", from the
+# Makefile) adds nothing the hashed Makefile does not already pin -- and hashing
+# it made the key depend on whether a clone happened to exist: a build clones the
+# forks next to the workdir, so a relaunch on the same node hashed them and
+# rebuilt the whole env (run 8e0a2f714cae). So a fork is hashed only when it
+# differs from its pin (a dev checkout with edits, or another commit). Without
+# PF_FORK_PINS (a standalone call) every fork present is hashed, as before.
+fork_dirs="$forks/torchtitan $forks/torchft"
+if [ -n "${PF_FORK_PINS:-}" ]; then
+	fork_dirs=""
+	for pin in $PF_FORK_PINS; do
+		dir="$forks/${pin%%=*}"
+		[ -d "$dir" ] || continue
+		head=$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)
+		want=$(git -C "$dir" rev-parse "${pin#*=}^{commit}" 2>/dev/null || true)
+		if [ -n "$head" ] && [ "$head" = "$want" ] &&
+			[ -z "$(git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+			continue
+		fi
+		fork_dirs="$fork_dirs $dir"
+	done
+fi
+
 src=$(
 	{
-		find models panoengine "$forks/torchtitan" "$forks/torchft" \
+		# shellcheck disable=SC2086 # fork_dirs is a space-separated list of paths
+		find models panoengine $fork_dirs \
 			\( -type d \( -name target -o -name __pycache__ -o -name .git \
 				-o -name node_modules -o -name '*.egg-info' -o -name .venv \
 				-o -name build -o -name dist \

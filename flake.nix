@@ -186,6 +186,13 @@
           # `rustup default stable` (run by nix_dev_setup.sh) installs its shims here.
           export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 
+          # Activate the project venv, so a bare `python` (and the venv's console
+          # scripts, e.g. torchft_lighthouse) resolve without `uv run` -- NixOS has
+          # no system python to fall back to. First on PATH, so it wins over
+          # anything in ~/.local/bin.
+          export VIRTUAL_ENV="$UV_PROJECT_ENVIRONMENT"
+          export PATH="$VIRTUAL_ENV/bin:$PATH"
+
           # Selects nix_dev_setup.sh's install path for THIS shell. An outer
           # PF_RL from the calling environment is deliberately overridden --
           # the whole point of picking a named shell is to pin this.

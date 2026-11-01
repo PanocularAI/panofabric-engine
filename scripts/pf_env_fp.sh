@@ -6,7 +6,21 @@
 # (docs/slurm-setup-cache-plan.md) — this is the panofabric-engine side of it.
 #
 # POSIX sh; invoked as `sh scripts/pf_env_fp.sh --source`.
+#
+# `--editable` is the key for an env whose engine AND forks are installed editable
+# (scripts/nix_dev_setup.sh's default): a .py edit there is live without reinstalling,
+# so only what changes the INSTALL is hashed -- the manifests, the lockfile, the
+# Makefile pins, and sources that get COMPILED at install time (torchft's Rust
+# extension). Hashing every .py, as `--source` must for a copied-in venv, rebuilt the
+# whole dev env (uv sync uninstalls ~260 packages first) on every source edit, and on
+# every checkpoint downloaded into a fork (its merges.txt matched *.txt).
 set -eu
+
+mode="${1:---source}"
+case "$mode" in
+--source | --editable) ;;
+*) echo "usage: pf_env_fp.sh [--source|--editable]" >&2; exit 2 ;;
+esac
 
 py="${PF_PYTHON_VERSION:-3.13}"
 
@@ -59,6 +73,30 @@ if [ -n "${PF_FORK_PINS:-}" ]; then
 		fi
 		fork_dirs="$fork_dirs $dir"
 	done
+fi
+
+if [ "$mode" = "--editable" ]; then
+	src=$(
+		{
+			# shellcheck disable=SC2086 # fork_dirs is a space-separated list of paths
+			for dir in $fork_dirs; do
+				[ -d "$dir" ] || continue
+				# Packaging manifests at the fork root. -L: torchtitan's
+				# requirements*.txt are symlinks into .ci/.
+				find -L "$dir" -maxdepth 1 -type f \( -name pyproject.toml \
+					-o -name 'setup.py' -o -name 'setup.cfg' -o -name 'requirements*.txt' \
+					-o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'build.rs' \) -print0
+				# Compiled-at-install sources: an editable install does not pick these up.
+				find "$dir" \( -type d \( -name target -o -name .git -o -name build \
+					-o -name dist -o -name node_modules \) -prune \) -o \
+					\( -type f \( -name '*.rs' -o -name '*.proto' \) -print0 \)
+			done 2>/dev/null
+			printf 'pyproject.toml\0uv.lock\0Makefile\0'
+		} | xargs -0 sha256sum 2>/dev/null | awk '{ print $1 }' | sort -u |
+			sha256sum | cut -c1-64
+	)
+	printf 'sl-v1-editable|py=%s|src=%s' "$py" "$src" | sha256sum | cut -c1-40 | tr -d '\n'
+	exit 0
 fi
 
 src=$(

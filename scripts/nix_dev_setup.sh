@@ -59,7 +59,14 @@ pf_dev_forks="${PF_DEV_FORKS:-1}"
 
 # --- skip if nothing install-determining changed ----------------------------
 backend=$(sh "$repo/scripts/pf_backend.sh")
-src_fp=$(sh "$repo/scripts/pf_env_fp.sh" --source)
+# Editable forks (the default) -> everything this script installs from source is
+# editable (`uv sync` installs the engine editable too), so source edits need no
+# reinstall and must not trigger one; see pf_env_fp.sh --editable.
+if [ "$pf_dev_forks" = "1" ]; then
+	src_fp=$(sh "$repo/scripts/pf_env_fp.sh" --editable)
+else
+	src_fp=$(sh "$repo/scripts/pf_env_fp.sh" --source)
+fi
 fp=$(printf '%s:%s:rl%s:devforks%s' "$src_fp" "$backend" "$pf_rl" "$pf_dev_forks" | sha256sum | cut -c1-16)
 stamp="$venv/.nix-dev-setup-stamp"
 verify='import torch,torchtitan,torchft'

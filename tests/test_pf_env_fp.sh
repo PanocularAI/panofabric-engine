@@ -78,6 +78,43 @@ check_eq "derived trees pruned" "$base" "$(fp)"
 prev=$(fp)
 echo "worker_count + finished_count" > "$tmp/engine/panoengine/decentralized/async_diloco.py"
 check_ne "panoengine edit" "$prev" "$(fp)"
+echo "worker_count" > "$tmp/engine/panoengine/decentralized/async_diloco.py"
+
+# --editable (nix_dev_setup.sh's key): engine and forks are installed editable, so a
+# source edit is live and must NOT rebuild the env -- it did, uninstalling ~260
+# packages per .py edit, and per checkpoint downloaded into a fork (merges.txt).
+# What changes the INSTALL still must: manifests, the lock, pins, compiled sources.
+printf '[project]\nname = "torchft"\n' > "$tmp/torchft/pyproject.toml"
+mkdir -p "$tmp/torchft/src" "$tmp/torchtitan/torchtitan/rl/example_checkpoint/Qwen3-0.6B"
+echo "fn main() {}" > "$tmp/torchft/src/lib.rs"
+printf 'torch\n' > "$tmp/torchtitan/requirements.txt"
+efp() { (cd "$tmp/engine" && sh "$script" --editable); }
+ebase=$(efp)
+[ -n "$ebase" ] || { echo "FAIL editable fingerprint is empty"; exit 1; }
+check_ne "editable key differs from source key" "$(fp)" "$ebase"
+
+echo "edited" > "$tmp/engine/panoengine/decentralized/async_diloco.py"
+echo "AF_INET fallback" > "$tmp/torchft/torchft/http.py"
+echo "print('titan v2')" > "$tmp/torchtitan/train.py"
+echo "merges" > "$tmp/torchtitan/torchtitan/rl/example_checkpoint/Qwen3-0.6B/merges.txt"
+check_eq "editable: .py edits and a downloaded checkpoint ignored" "$ebase" "$(efp)"
+
+echo "fn main() { changed() }" > "$tmp/torchft/src/lib.rs"
+check_ne "editable: compiled Rust source edit" "$ebase" "$(efp)"
+echo "fn main() {}" > "$tmp/torchft/src/lib.rs"
+printf '[project]\nname = "torchft"\ndependencies = ["x"]\n' > "$tmp/torchft/pyproject.toml"
+check_ne "editable: fork pyproject edit" "$ebase" "$(efp)"
+printf '[project]\nname = "torchft"\n' > "$tmp/torchft/pyproject.toml"
+printf 'torch\nnumpy\n' > "$tmp/torchtitan/requirements.txt"
+check_ne "editable: fork requirements edit" "$ebase" "$(efp)"
+printf 'torch\n' > "$tmp/torchtitan/requirements.txt"
+printf 'lock2\n' > "$tmp/engine/uv.lock"
+check_ne "editable: engine lockfile edit" "$ebase" "$(efp)"
+printf 'lock\n' > "$tmp/engine/uv.lock"
+printf 'TORCHFT_REF ?= bbb\n' > "$tmp/engine/Makefile"
+check_ne "editable: fork pin bump" "$ebase" "$(efp)"
+printf 'TORCHFT_REF ?= aaa\n' > "$tmp/engine/Makefile"
+check_eq "editable: restored" "$ebase" "$(efp)"
 
 [ "$fails" -eq 0 ] || exit 1
 echo "all pf_env_fp checks passed"

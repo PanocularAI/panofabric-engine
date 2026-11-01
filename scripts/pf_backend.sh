@@ -3,8 +3,8 @@
 # `sh scripts/pf_backend.sh compat-dir` instead prints the CUDA forward-compat lib dir
 # when one is resolvable (else nothing) — a diagnostic for setting up old-driver clusters.
 #
-# Single source of truth shared by `make install-torch` (which picks the PyTorch index
-# URL from it) and the env-cache fingerprint (scripts/pf_env_fp.sh / the Makefile `ensure`
+# Single source of truth shared by `make install` (which picks pyproject.toml's backend
+# extra, and so the PyTorch index, from it) and the env-cache fingerprint (scripts/pf_env_fp.sh / the Makefile `ensure`
 # target), so the cache KEY and the actual torch INSTALL can never disagree.
 #
 # WHY EVERY NVIDIA NODE GETS cu130: torchtitan tracks PyTorch main, published only for

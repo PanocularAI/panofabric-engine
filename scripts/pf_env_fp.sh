@@ -18,14 +18,14 @@ py="${PF_PYTHON_VERSION:-3.13}"
 # The fork roots come from FORKS_DIR (default `..`, matching the Makefile), NOT from
 # in-repo `torchtitan/`/`torchft/` directories. Hashing the in-repo copies was wrong in
 # both directions and cost a live debug (2026-08-28):
-#   - `install-torchtt-ft` installs $(FORKS_DIR)/torchft, so an edit to the REAL fork left
+#   - `make install` installs $(FORKS_DIR)/torchft, so an edit to the REAL fork left
 #     the key unchanged and `ensure` happily reused a venv built from the old code -- a
 #     fix that appeared to do nothing, silently;
 #   - a stale leftover copy inside the repo DID change the key, forcing a multi-GB rebuild
 #     that installed byte-identical packages.
 # When a fork is absent (a fresh node clones it during the build), it contributes nothing
-# and the fork VERSION is still covered: the Makefile pins TORCHTITAN_REF/TORCHFT_REF and
-# the Makefile itself is hashed below.
+# and the fork VERSION is still covered: pyproject.toml pins both SHAs (installed from
+# those git pins when no clone exists) and it is hashed below.
 #
 # Only file CONTENT is hashed, not paths, so the key does not shift when the forks sit at
 # a different FORKS_DIR (an in-tree checkout vs a sibling) -- what matters for a venv is
@@ -38,9 +38,10 @@ py="${PF_PYTHON_VERSION:-3.13}"
 forks="${FORKS_DIR:-..}"
 
 # A fork checked out CLEANLY at its pin (PF_FORK_PINS="name=ref ...", from the
-# Makefile) adds nothing the hashed Makefile does not already pin -- and hashing
-# it made the key depend on whether a clone happened to exist: a build clones the
-# forks next to the workdir, so a relaunch on the same node hashed them and
+# Makefile, parsed from pyproject.toml) adds nothing the hashed pyproject.toml does
+# not already pin -- and hashing it made the key depend on whether a clone happened
+# to exist: a build cloned the forks next to the workdir, so a relaunch on the same
+# node hashed them and
 # rebuilt the whole env (run 8e0a2f714cae). So a fork is hashed only when it
 # differs from its pin (a dev checkout with edits, or another commit). Without
 # PF_FORK_PINS (a standalone call) every fork present is hashed, as before.

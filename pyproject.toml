@@ -24,11 +24,11 @@ dependencies = []
 # published dist is not reproducible and breaks outright when the branch is
 # deleted (which is exactly what happened to @async_rl / @async-diloco).
 #
-# INSTALL-ORDER TRAP — do not "clean this up":
-#   torchft declares torch>=2.7, so resolving this extra unconstrained can pull
-#   a STABLE torch over a backend-matched NIGHTLY and clobber the whole stack.
-#   torch must be installed LAST, which is what the Makefile's `install-torch`
-#   target does. Same policy as the deliberately-undeclared torch/vllm below.
+# torch is NOT a dependency of this extra: a bare `[train]` resolve takes PyPI's stable
+#   torch (torchft declares torch>=2.7), which is fine for an outside user. Our own envs
+#   add exactly one BACKEND extra (cu130/rocm/cpu/rl, below), which pins torch to a
+#   nightly from the matching PyTorch index via [tool.uv.sources] -- so the old
+#   "install torch LAST and --force-reinstall it" dance is gone.
 #
 #   torchft also builds via maturin, so a git install needs Rust + protoc 32.0
 #   and CPython <= 3.13 (pyo3 0.24's ceiling) on the consumer's machine. That is
@@ -55,9 +55,8 @@ train = [
   # attn-gym[linear], which torchtitan now declares itself.)
 ]
 
-# The serving plane. torch and vllm are DELIBERATELY NOT DECLARED: every runtime
-# that launches these modules carries backend-matched nightlies installed last,
-# and a plain resolve here would clobber them. This is hard-won; do not "fix" it.
+# The serving plane. torch and vllm are not declared here: they come from whichever
+# backend extra (below) the env was built with.
 serve = [
   "aiohttp>=3.9",      # stage control channel, gateway, engine_stage endpoints
   "huggingface_hub",   # snapshot_download for --ensure-from
@@ -66,9 +65,64 @@ serve = [
   "transformers",      # AutoTokenizer in engine_stage (unpinned: matched to the env vLLM)
 ]
 
-# Standalone/dev installs where a STABLE torch is acceptable: pulls vllm (which
-# pins its matched torch). Never select this on nightly-matched nodes.
-serve-vllm = ["vllm"]
+# ---- backend extras: pick EXACTLY ONE (they are declared conflicting in [tool.uv]) ----
+# Each pins torch to a nightly from its own PyTorch index ([tool.uv.sources]); the
+# Makefile and scripts/nix_dev_setup.sh pick one from scripts/pf_backend.sh's token.
+# Bumping torch means bumping it here and re-running `uv lock`. The rocm7.2 nightly
+# index stopped at a single 2.15 build (PyTorch moved on to rocm10.x), hence its date.
+# triton/triton-rocm are listed only so their sources apply: torch nightlies pin a
+# `+git` triton that exists solely on the PyTorch index.
+cu130 = ["torch==2.15.0.dev20260928", "triton"]
+rocm = ["torch==2.15.0.dev20260827", "triton-rocm"]
+cpu = ["torch==2.15.0.dev20260928"]
+
+# The decentralized-RL runtime: cu130 plus vLLM (the generator), torchmonarch (the actor
+# mesh), torchstore, renderers and flash-attn-3. A backend extra of its own, not an add-on
+# to cu130, because it resolves some shared packages differently (apache-tvm-ffi: vLLM
+# pins 0.1.11) and only conflicting extras get separate resolutions. Pins move together:
+#   - torch/torchvision/vllm are one nightly date: vllm's wheel is compiled against that
+#     exact torch (torchtitan rl/README §4; torchvision only because vllm's kernel warmup
+#     imports it). torchtitan at a182e530+ needs a 2.15 nightly
+#     (torch.distributed.config.pipeline_per_edge_p2p).
+#   - torchmonarch is the STABLE release, not a nightly: monarch nightlies are pruned
+#     from PyPI after a few weeks (0.7.0.dev20260930 vanished, breaking fresh installs),
+#     and post-branch-cut ones are built on 2.16. 0.7.0 is built against torch 2.14.1,
+#     but only monarch.gradient (version-checked; nothing here imports it) needs a
+#     matched libtorch -- actor/spmd/rdma were smoke-tested on 2.15 (2026-10-30).
+#   - torchstore comes from a pinned source tarball (no `git` needed in the runtime
+#     image); its declared torchmonarch==0.4.1 is overridden in [tool.uv].
+#   - flash-attn-3 comes from the pytorch TEST index, not nightly. The RL trainer imports
+#     flash_attn_interface on Hopper+; pre-Hopper (e.g. L40S/Ada) falls back to FA2.
+#   - math-verify is the dapo_math example rubric's dep; cheap and pure-python, so it
+#     rides here rather than needing model.requirements (whose file is not packaged).
+#   - renderers is pinned EXACTLY by torchtitan itself (==0.1.11 at a182e530).
+#   - verifiers runs bring-your-own agent harnesses (torchtitan's verifiers bridge targets
+#     0.3.1). It needs mcp<2 (it imports mcp.server.fastmcp); this vLLM DECLARES mcp>=2 but
+#     only imports it lazily for --tool-server, through APIs mcp 1.x has. So mcp is
+#     overridden to verifiers' range in [tool.uv].
+# Resolved together 2026-09-30 from the pytorch cu130 nightly index, the way
+# torchtitan's own RL CI installs them.
+rl = [
+  "torch==2.15.0.dev20260928",
+  "triton",
+  "torchvision==0.30.0.dev20260928",
+  "vllm==1.0.0.dev20260928",
+  "torchmonarch==0.7.0",
+  "torchstore",
+  "renderers==0.1.11",
+  "pygtrie",
+  "portpicker",
+  "opentelemetry-sdk",
+  "opentelemetry-exporter-otlp-proto-http",
+  "math-verify==0.9.0",
+  "verifiers==0.3.1",
+  "flash-attn-3==3.0.0",
+]
+
+# Standalone/dev installs where a STABLE torch is acceptable: pulls vllm, which pins its
+# matched stable torch from PyPI. Conflicts with the backend extras above. The floor
+# keeps the universal resolve from backtracking to vllm's ancient 0.1.2 sdist.
+serve-vllm = ["vllm>=0.30"]
 
 [project.urls]
 Homepage = "https://github.com/PanocularAI/panofabric-engine"
@@ -98,7 +152,101 @@ testpaths = [
 ]
 addopts = "-ra"
 
-# No [tool.uv.sources] for the forks on purpose: a declarative `path =
-# "../torchtitan"` override makes `uv sync` fail for anyone who clones this repo
-# without the siblings — i.e. every outside user. Engine hackers get editable
-# forks from `make dev-forks`, which installs them imperatively instead.
+[tool.uv]
+# Every node this runs on is x86_64 Linux (pf_backend.sh, the protoc download, the
+# image); locking for other platforms only invites resolver failures on wheels that
+# don't exist there.
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+conflicts = [
+  [
+    { extra = "cu130" },
+    { extra = "rocm" },
+    { extra = "cpu" },
+    { extra = "rl" },
+    { extra = "serve-vllm" },
+  ],
+]
+# Overrides replace EVERY requirement on the package, the project's own included, so
+# only ones that hold in every env belong here (see the rl extra for why each exists).
+override-dependencies = [
+  "torchmonarch==0.7.0", # torchstore declares ==0.4.1
+  "mcp>=1.24,<2",        # vllm declares >=2; verifiers needs <2
+]
+
+[[tool.uv.index]]
+name = "pytorch-nightly-cu130"
+url = "https://download.pytorch.org/whl/nightly/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-nightly-rocm"
+url = "https://download.pytorch.org/whl/nightly/rocm7.2"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-nightly-cpu"
+url = "https://download.pytorch.org/whl/nightly/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-test-cu130"
+url = "https://download.pytorch.org/whl/test/cu130"
+explicit = true
+
+# `explicit` indexes serve ONLY the packages routed to them here; everything else
+# (including torch's nvidia-* deps) still comes from PyPI.
+#
+# No sources for the forks on purpose: a declarative `path = "../torchtitan"` override
+# makes `uv sync` fail for anyone who clones this repo without the siblings -- i.e.
+# every outside user. The lock installs them from their git pins; the Makefile and
+# scripts/nix_dev_setup.sh overlay sibling clones when present.
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-nightly-cu130", extra = "cu130" },
+  { index = "pytorch-nightly-cu130", extra = "rl" },
+  { index = "pytorch-nightly-rocm", extra = "rocm" },
+  { index = "pytorch-nightly-cpu", extra = "cpu" },
+]
+triton = [
+  { index = "pytorch-nightly-cu130", extra = "cu130" },
+  { index = "pytorch-nightly-cu130", extra = "rl" },
+]
+triton-rocm = { index = "pytorch-nightly-rocm", extra = "rocm" }
+torchvision = { index = "pytorch-nightly-cu130", extra = "rl" }
+vllm = { index = "pytorch-nightly-cu130", extra = "rl" }
+flash-attn-3 = { index = "pytorch-test-cu130", extra = "rl" }
+torchstore = { url = "https://github.com/meta-pytorch/torchstore/archive/a80f8cae60ed9336b547fded9108f4df8222f0e8.tar.gz" }
+
+# Upstream metadata corrections. uv reads ONE wheel's metadata per version and assumes
+# the rest agree; these are where they don't, or where an env is known to run outside
+# a declared range.
+#
+# torchvision's aarch64 nightlies pin the PREVIOUS day's torch (0926) while its x86_64
+# ones pin the same day's (0928); uv happened to read an aarch64 wheel. This is the
+# x86_64 wheels' metadata, verbatim.
+[[tool.uv.dependency-metadata]]
+name = "torchvision"
+version = "0.30.0.dev20260928+cu130"
+requires-python = ">=3.10,!=3.14.1"
+requires-dist = ["numpy", "torch==2.15.0.dev20260928", "pillow>=5.3.0,!=8.3.*"]
+
+# attn-gym 0.0.13 (torchtitan's GatedDeltaNet kernels) declares apache-tvm-ffi>=0.1.12,
+# but the rl extra's vllm pins ==0.1.11. The RL env has always run 0.1.11 (the old
+# imperative install let vllm win), so this relaxes attn-gym's floor to match rather than
+# overriding tvm-ffi everywhere: the other backends still resolve the newest. Otherwise
+# PyPI's metadata verbatim, minus the dev/docs/tests/viz extras.
+[[tool.uv.dependency-metadata]]
+name = "attn-gym"
+version = "0.0.13"
+requires-python = ">=3.10"
+provides-extras = ["cudnn", "linear"]
+requires-dist = [
+  "torch",
+  "apache-tvm-ffi>=0.1.11; extra == 'cudnn'",
+  "cuda-python>=13.0; sys_platform == 'linux' and extra == 'cudnn'",
+  "nvidia-cutlass-dsl[cu13]>=4.7.0; sys_platform == 'linux' and extra == 'cudnn'",
+  "packaging; extra == 'cudnn'",
+  "apache-tvm-ffi>=0.1.11; extra == 'linear'",
+  "nvidia-cutlass-dsl[cu13]>=4.6.2; sys_platform == 'linux' and extra == 'linear'",
+  "packaging; extra == 'linear'",
+]

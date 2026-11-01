@@ -101,8 +101,9 @@ below are ordered the way they are.
 # 1. Development on the engine itself: sibling fork clones, installed editable.
 git clone https://github.com/PanocularAI/panofabric-engine.git
 cd panofabric-engine
-make all          # toolchain, project, backend-matched torch, the forks
-make dev-forks    # optional: editable forks for hacking on them
+make all          # toolchain, then `uv sync` with your node's backend extra
+make dev-forks    # optional: sibling fork clones, installed editable
+PF_RL=1 make all  # the RL runtime too (vLLM, torchmonarch, ...; CUDA only)
 
 # 2. Ordinary install (needs the Rust toolchain above).
 pip install 'panofabric-engine[train]'
@@ -112,11 +113,14 @@ pip install 'panofabric-engine[decentralized]'
 ```
 
 There are no submodules: `git clone --recursive` plus a Rust build is where a newcomer
-bounces. `make all` clones the forks as siblings at their pinned SHAs.
+bounces. The forks install from the SHAs pinned in `pyproject.toml`; when sibling clones
+exist (`make forks` / `make dev-forks`), those are installed instead.
 
-> **Install-order trap.** torchft declares `torch>=2.7`, so resolving `[train]`
-> unconstrained can pull a *stable* torch over a backend-matched *nightly* and clobber the
-> stack. torch must be installed **last** — which is what `make install-torch` does.
+> **Backend extras.** A bare `[train]` install gets PyPI's stable torch. The engine's own
+> envs add exactly one backend extra — `cu130`, `rocm`, `cpu`, or `rl` (cu130 plus the RL
+> runtime) — which pins torch to a nightly from the matching PyTorch index, e.g.
+> `uv sync --extra train --extra cu130`. `make install` picks it from
+> `scripts/pf_backend.sh`. Pins live in `pyproject.toml`; re-run `uv lock` after changing one.
 
 If a Makefile step fails on your setup, see the [Installation Guideline](docs/installation.md).
 

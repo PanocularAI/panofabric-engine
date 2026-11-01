@@ -4,9 +4,9 @@
     Makefile at all: it supplies the native toolchain (uv, protoc, rust, gcc, ...)
     as real nix packages, and its shellHook drives scripts/nix_dev_setup.sh --
     a standalone reimplementation of `make all`/`make dev-forks` -- instead of
-    `make`. See that script's header for why, and for the pins it reads
-    straight out of pyproject.toml/Makefile (as data, never via `make`) so
-    there is still only one place those live.
+    `make`. See that script's header for why. Every pin lives in
+    pyproject.toml/uv.lock, which that script and the Makefile both
+    `uv sync` from, so there is still only one place those live.
 
     Three shells share the same toolchain and differ only in which install
     path nix_dev_setup.sh (and, for `serving`, a post-setup step) takes:
@@ -14,8 +14,8 @@
       serving  -- default + a real, unpinned (stable-torch) vllm, for
                   panoengine.serve.engine_stage's actual pipeline stage.
       rl       -- PF_RL=1: the matched RL runtime (vllm/torchmonarch/
-                  torchstore/flash-attn-3, pinned together, torch force-
-                  reinstalled to match) -- see the Makefile's install-rl.
+                  torchstore/flash-attn-3, pinned together with torch) --
+                  pyproject.toml's `rl` extra.
     Pick one with `nix develop .#<name>` / direnv's `use flake .#<name>`; see
     .envrc / .envrc.local for how this repo selects one automatically.
   '';
@@ -130,10 +130,10 @@
 
         # Shared shellHook body. `pfRl` picks nix_dev_setup.sh's install path
         # (its own header documents PF_RL): "0" is the training/decentralized/
-        # serving-glue env this repo has always had; "1" drives the Makefile's
-        # install-rl path (pinned vllm/torchmonarch/torchstore/flash-attn-3,
-        # with torch force-reinstalled to the exact nightly those pins were
-        # built against). `postSetup`, run after nix_dev_setup.sh, is for the
+        # serving-glue env this repo has always had; "1" syncs pyproject.toml's
+        # `rl` extra instead of `cu130` (pinned vllm/torchmonarch/torchstore/
+        # flash-attn-3, with the exact torch nightly those pins were built
+        # against). `postSetup`, run after nix_dev_setup.sh, is for the
         # `serving` shell's extra unpinned `uv pip install vllm`.
         mkShellHook = { pfRl, label, postSetup ? "" }: ''
           # --- machine-local state ---------------------------------------------
@@ -211,7 +211,7 @@
 
         # Light/serving-only path: a plain, unpinned vllm so
         # panoengine.serve.engine_stage's real vLLM engine runs. Deliberately
-        # NOT the matched RL pins (Makefile's install-rl) -- it pulls vllm's
+        # NOT the matched RL pins (the `rl` extra) -- it pulls vllm's
         # own STABLE torch and clobbers the backend-matched nightly
         # nix_dev_setup.sh just installed. Fine for a serving-only sandbox;
         # don't also use this venv for torchtitan/torchft training or the RL

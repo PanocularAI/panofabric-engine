@@ -1,11 +1,12 @@
 #!/bin/sh
-# Sets up the training env WITHOUT going through the Makefile: `uv sync`, backend-matched
-# torch, and the sibling torchtitan/torchft forks -- the same outcome as `make all` (plus
-# `make dev-forks`), driven by flake.nix's devShell/direnv instead. See flake.nix for why:
+# Sets up the training env WITHOUT going through the Makefile: one `uv sync` with the
+# backend extra, plus the sibling torchtitan/torchft forks -- the same outcome as `make all`
+# (plus `make dev-forks`), driven by flake.nix's devShell/direnv instead. See flake.nix for why:
 # the Makefile's own `setup-env` assumes things (an apt-managed toolchain, a writable
 # ~/.bashrc) that don't hold under NixOS/home-manager, and the toolchain itself (protoc,
 # rust, uv, gcc) is supplied by the flake's devShell instead of setup-env's curl|sh/apt
-# paths. Everything FROM sync-project ON, this script reimplements directly.
+# paths. Everything after setup-env (the Makefile's `install` target), this script
+# reimplements directly.
 #
 # Run with no args from inside the devShell (flake.nix's shellHook does this on every
 # `nix develop`/direnv entry): it hashes the same install-determining inputs the Makefile's
@@ -36,9 +37,9 @@ die() {
 }
 
 # --- pins -------------------------------------------------------------------
-# Fork URL+SHA: parsed from pyproject.toml's [train]/[decentralized] extras (the pins the
-# Makefile's own TORCHTITAN_REF/TORCHFT_REF comment says to keep in sync with), not
-# hand-copied, so this script can never drift from them on its own.
+# Everything that gets installed is pinned in pyproject.toml/uv.lock. The fork URL+SHA are
+# parsed out of the [train]/[decentralized] git pins (as the Makefile does) only to clone
+# missing siblings.
 fork_pin() { # $1 = package name (torchtitan|torchft)
 	sed -n "s/.*\"$1 @ \(git+[^\"]*\)\".*/\1/p" "$repo/pyproject.toml" | head -1
 }
@@ -53,34 +54,8 @@ torchft_url=${torchft_pin#git+}
 torchft_url=${torchft_url%@*}
 torchft_ref=${torchft_pin##*@}
 
-# RL runtime pins: these exist ONLY in the Makefile (pyproject.toml deliberately leaves
-# torch/vllm undeclared there -- see its "serve" extra comment), so there is nowhere else
-# to read them from. Parsed out of the Makefile's own `RL_* ?= ...`/`TORCH_VERSION ?= ...`
-# lines as plain text -- `make` itself is never invoked.
-mk_var() { # $1 = variable name
-	sed -n "s/^$1[[:space:]]*?=[[:space:]]*//p" "$repo/Makefile" | head -1
-}
-TORCH_VERSION=$(mk_var TORCH_VERSION)
-RL_TORCHMONARCH_VERSION=$(mk_var RL_TORCHMONARCH_VERSION)
-RL_TORCHSTORE_SHA=$(mk_var RL_TORCHSTORE_SHA)
-RL_RENDERERS_VERSION=$(mk_var RL_RENDERERS_VERSION)
-RL_FLASH_ATTN_3_VERSION=$(mk_var RL_FLASH_ATTN_3_VERSION)
-RL_VLLM_VERSION=$(mk_var RL_VLLM_VERSION)
-RL_TORCHVISION_VERSION=$(mk_var RL_TORCHVISION_VERSION)
-RL_MATH_VERIFY_VERSION=$(mk_var RL_MATH_VERIFY_VERSION)
-RL_VERIFIERS_VERSION=$(mk_var RL_VERIFIERS_VERSION)
-
 pf_rl="${PF_RL:-0}"
 pf_dev_forks="${PF_DEV_FORKS:-1}"
-
-if [ "$pf_rl" = "1" ]; then
-	for v in TORCH_VERSION RL_TORCHMONARCH_VERSION RL_TORCHSTORE_SHA RL_RENDERERS_VERSION \
-		RL_FLASH_ATTN_3_VERSION RL_VLLM_VERSION RL_TORCHVISION_VERSION \
-		RL_MATH_VERIFY_VERSION RL_VERIFIERS_VERSION; do
-		eval "val=\${$v}"
-		[ -n "$val" ] || die "PF_RL=1 but couldn't parse $v out of the Makefile"
-	done
-fi
 
 # --- skip if nothing install-determining changed ----------------------------
 backend=$(sh "$repo/scripts/pf_backend.sh")
@@ -105,31 +80,6 @@ log "setting up (fp=$fp, backend=$backend, PF_RL=$pf_rl, PF_DEV_FORKS=$pf_dev_fo
 # because nix-ld is enabled cluster-wide (the flake checked $NIX_LD is set).
 rustup default stable >/dev/null
 
-# --- project venv ------------------------------------------------------------
-log "uv sync"
-uv sync
-
-uv_pip() {
-	VIRTUAL_ENV="$venv" uv pip install "$@"
-}
-
-# --- torch (LAST relative to the project's own deps, matching install-torch's own
-# comment: an unconstrained resolve can pull a stable torch over this backend-matched
-# nightly). When PF_RL=1 on cu130, pin to the exact nightly date the RL pins below were
-# resolved against (cf. docker/engine.Dockerfile's TORCH_VERSION handling) instead of
-# whatever the day's unpinned nightly happens to be. --------------------------
-case "$backend" in
-cu130 | rocm7.2 | cpu) index_url="https://download.pytorch.org/whl/nightly/$backend" ;;
-*) die "unknown backend $backend" ;;
-esac
-if [ "$pf_rl" = "1" ] && [ "$backend" = "cu130" ]; then
-	torch_spec="torch==${TORCH_VERSION}+${backend}"
-else
-	torch_spec="torch"
-fi
-log "installing $torch_spec from $index_url"
-uv_pip --pre "$torch_spec" --index-url "$index_url" --force-reinstall
-
 # --- forks: clone as siblings if absent, same "never touch an existing clone" rule as
 # the Makefile's `forks` target (it's the engine hacker's working tree) ------
 clone_fork() { # $1=dir $2=url $3=ref
@@ -144,35 +94,25 @@ clone_fork() { # $1=dir $2=url $3=ref
 clone_fork "$torchtitan_dir" "$torchtitan_url" "$torchtitan_ref"
 clone_fork "$torchft_dir" "$torchft_url" "$torchft_ref"
 
-uv_pip -r "$torchtitan_dir/requirements.txt"
-if [ "$pf_dev_forks" = "1" ]; then
-	uv_pip -e "$torchtitan_dir" -e "$torchft_dir"
-else
-	uv_pip "$torchtitan_dir"
-	uv_pip "$torchft_dir"
-fi
-# transformers: torchtitan's transformers_modeling_backend imports it without declaring
-# it anywhere -- see the Makefile's own install-torchtt-ft comment.
-uv_pip transformers
+# --- project venv: one sync, same extra selection as the Makefile's `install` -------
+case "$backend:$pf_rl" in
+cu130:1) extra=rl ;;
+*:1) die "RL runtime is CUDA-only; backend=$backend" ;;
+cu130:*) extra=cu130 ;;
+rocm7.2:*) extra=rocm ;;
+cpu:*) extra=cpu ;;
+*) die "unknown backend $backend" ;;
+esac
+log "uv sync --extra train --extra $extra (forks from the siblings)"
+uv sync --locked --extra train --extra "$extra" \
+	--no-install-package torchtitan --no-install-package torchft
 
-# --- RL runtime (PF_RL=1): vllm, torchmonarch, torchstore, flash-attn-3, ... ----------
-if [ "$pf_rl" = "1" ]; then
-	[ "$backend" = "cu130" ] || die "RL runtime is CUDA-only; backend=$backend"
-	test_index_url="https://download.pytorch.org/whl/test/$backend"
-	log "RL runtime: vllm+torchvision from $index_url"
-	uv_pip --pre \
-		"torchvision==${RL_TORCHVISION_VERSION}+${backend}" \
-		"vllm==${RL_VLLM_VERSION}+${backend}" \
-		--extra-index-url "$index_url" --index-strategy unsafe-best-match
-	uv_pip "torchmonarch==${RL_TORCHMONARCH_VERSION}" \
-		"renderers==${RL_RENDERERS_VERSION}" pygtrie portpicker \
-		opentelemetry-sdk opentelemetry-exporter-otlp-proto-http \
-		"math-verify==${RL_MATH_VERIFY_VERSION}"
-	printf 'mcp>=1.24,<2\n' >"$venv/rl-overrides.txt"
-	uv_pip "verifiers==${RL_VERIFIERS_VERSION}" --override "$venv/rl-overrides.txt"
-	uv_pip --no-deps \
-		"torchstore @ https://github.com/meta-pytorch/torchstore/archive/${RL_TORCHSTORE_SHA}.tar.gz"
-	uv_pip "flash-attn-3==${RL_FLASH_ATTN_3_VERSION}" --extra-index-url "$test_index_url"
+# The forks from the sibling clones. Must follow every sync: an exact sync uninstalls the
+# packages it was told not to install.
+if [ "$pf_dev_forks" = "1" ]; then
+	VIRTUAL_ENV="$venv" uv pip install -e "$torchtitan_dir" -e "$torchft_dir"
+else
+	VIRTUAL_ENV="$venv" uv pip install "$torchtitan_dir" "$torchft_dir"
 fi
 
 "$venv/bin/python" -c "$verify"

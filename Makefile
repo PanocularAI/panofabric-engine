@@ -1,28 +1,27 @@
 # Makefile for installing the panofabric-engine project.
 # Usage:
-#   make all         # full bootstrap: toolchain, project, torch, the forks
+#   make all         # full bootstrap: toolchain, then the project env (`make install`)
 #   make dev-forks   # engine hackers: sibling fork clones, installed editable
+#
+# WHAT gets installed (torch per backend, the forks, the RL runtime, every pin) lives in
+# pyproject.toml + uv.lock. This file only bootstraps the toolchain, picks the backend
+# extra, overlays sibling fork clones, and runs the shared env cache (`make ensure`).
 
 
 # ------------------------------------------------- the forks (no submodules)
-# torchtitan/torchft live as SIBLINGS of this repo, cloned on demand. Submodules
-# are gone from the public repo: `git clone --recursive` plus a Rust build is
-# where a newcomer bounces. Keep these refs in sync with pyproject.toml's
-# [train] extra — they are the same pins.
+# torchtitan/torchft are pinned by SHA in pyproject.toml's [train]/[decentralized] extras;
+# `uv sync` installs them from those git pins. Sibling clones (cloned by `make forks`) are
+# for engine hackers: when one exists, `make install` installs IT over the pin, so a fork
+# edit is picked up without touching pyproject.toml. URL/REF are parsed out of the
+# pyproject pins, never copied, so they cannot drift.
 FORKS_DIR      ?= ..
 TORCHTITAN_DIR ?= $(FORKS_DIR)/torchtitan
 TORCHFT_DIR    ?= $(FORKS_DIR)/torchft
-TORCHTITAN_URL ?= https://github.com/PanocularAI/torchtitan.git
-TORCHFT_URL    ?= https://github.com/PanocularAI/torchft.git
-TORCHTITAN_REF ?= 0483d9ff3a939a206c6e66c79e0ceae56efadfa7
-TORCHFT_REF    ?= 716bff9584a9e0613dd07f1837a63a9f2e3583b4
-
-# RL builds pin torch to the nightly vLLM was built against (TORCH_VERSION, below).
-# Unpinned, install-torch pulls the NEWEST nightly and install-rl then downgrades it to
-# vLLM's pin: a wasted ~2.5 GB download and thousands of deleted/re-created files on the
-# shared FS, every env build.
-TORCH_SPEC ?= $(if $(filter 1,$(PF_RL)),torch==$(TORCH_VERSION),torch)
-PYTORCH_BASE_URL ?= https://download.pytorch.org/whl/nightly
+fork_pin = $(subst @, ,$(shell sed -n 's/.*"$(1) @ git+\([^"]*\)".*/\1/p' pyproject.toml | head -1))
+TORCHTITAN_URL ?= $(firstword $(call fork_pin,torchtitan))
+TORCHTITAN_REF ?= $(lastword $(call fork_pin,torchtitan))
+TORCHFT_URL    ?= $(firstword $(call fork_pin,torchft))
+TORCHFT_REF    ?= $(lastword $(call fork_pin,torchft))
 
 PROTOC_VERSION ?= 32.0
 PROTOC_ZIP ?= protoc-$(PROTOC_VERSION)-linux-x86_64.zip
@@ -31,19 +30,18 @@ LOCAL_BIN ?= $(HOME)/.local/bin
 EXPORT_LINE ?= export PATH=$$PATH:$(LOCAL_BIN)
 
 UV ?= $(LOCAL_BIN)/uv
-UV_PIP_CMD ?= $(UV) pip install
 # torchft's Rust extension builds via pyo3 (caps at CPython 3.13); pin the built venv so a
 # newer default python can't break the maturin build. Matches panofabric's env cache.
 PYTHON_VERSION ?= 3.13
-# The venv the install targets build into. Default ./.venv (uv's default, so `make all` is
-# unchanged); `build-into` overrides it with an out-of-tree staging venv for the env cache.
+# The venv `install` syncs. Default ./.venv (uv's default); `build-into` overrides it with
+# an out-of-tree staging venv for the env cache.
 VENV ?= .venv
+# Extra `uv sync` flags (build-into adds --no-editable).
+UV_SYNC_FLAGS ?=
 
-.PHONY: all setup-env sync-project install-torch install-torchtt-ft forks dev-forks build-into ensure gc-env-cache show-backend clean-protoc-zip
+.PHONY: all setup-env install forks dev-forks build-into ensure gc-env-cache show-backend clean-protoc-zip
 
-all: setup-env sync-project install-torch install-torchtt-ft
-	@if [ "$${PF_RL:-0}" = "1" ]; then $(MAKE) install-rl; \
-	else echo "[all] PF_RL!=1; skipping the RL runtime"; fi
+all: setup-env install
 
 # $HOME/.cargo/bin is on PATH so the torchft maturin build finds cargo/rustc after a
 # user-local rustup install (this was missing before — a latent no-root bug).
@@ -87,38 +85,43 @@ setup-env:
 	# uv (user-local) for installs.
 	@[ -x $(LOCAL_BIN)/uv ] || command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Resolve + install the project (panofabric-engine; its engine deps are the [train]
-# extra's sha-pinned forks) into the in-tree .venv. Split out of setup-env so
-# `build-into` (env cache) can reuse the toolchain from setup-env WITHOUT this
-# project sync, building into an out-of-tree venv instead.
-sync-project:
-	$(UV) sync
-
-# Backend detection extracted to scripts/pf_backend.sh — the SINGLE source of truth shared
-# with the env-cache fingerprint (scripts/pf_env_fp.sh), so the cache KEY and the actual
-# torch INSTALL can never drift. `export VIRTUAL_ENV` (target-scoped, propagated to sub-makes
-# via the command-line VENV) targets `make all`'s ./.venv or build-into's staging venv.
-install-torch: export VIRTUAL_ENV := $(abspath $(VENV))
-install-torch:
-	@backend=$$(sh scripts/pf_backend.sh); \
-	case "$$backend" in \
-		cu130|rocm7.2|cpu) \
-			index_url="$(PYTORCH_BASE_URL)/$$backend"; \
-			;; \
-		*) \
-			echo "[make install-torch] Unknown backend $$backend" >&2; \
-			exit 1; \
-			;; \
+# The whole env in one `uv sync`: the project, the [train] extra (torchtitan + torchft from
+# their git pins), and ONE backend extra, chosen from scripts/pf_backend.sh -- the SINGLE
+# source of truth shared with the env-cache fingerprint (scripts/pf_env_fp.sh), so the
+# cache KEY and the actual torch INSTALL can never drift. PF_RL=1 swaps cu130 for `rl`
+# (cu130 + vLLM/torchmonarch/torchstore/...; CUDA-only). --locked fails loudly if
+# pyproject.toml was edited without re-running `uv lock`.
+#
+# A fork with a sibling clone is excluded from the sync and installed from the clone
+# instead (editable under PF_DEV_FORKS=1). That overlay must follow EVERY sync: an exact
+# sync uninstalls packages it was told not to install.
+install: export UV_PROJECT_ENVIRONMENT := $(abspath $(VENV))
+install: export VIRTUAL_ENV := $(abspath $(VENV))
+install:
+	@set -e; \
+	backend=$$(sh scripts/pf_backend.sh); \
+	case "$$backend:$${PF_RL:-0}" in \
+		cu130:1) extra=rl ;; \
+		*:1) echo "[make install] RL runtime is CUDA-only; backend=$$backend" >&2; exit 1 ;; \
+		cu130:*) extra=cu130 ;; \
+		rocm7.2:*) extra=rocm ;; \
+		cpu:*) extra=cpu ;; \
+		*) echo "[make install] Unknown backend $$backend" >&2; exit 1 ;; \
 	esac; \
-	echo "[make install-torch] Backend: $$backend"; \
-	echo "[make install-torch] Index URL: $$index_url"; \
+	skip=""; overlay=""; edit=""; \
+	[ "$${PF_DEV_FORKS:-0}" != "1" ] || edit="-e"; \
+	for spec in "torchtitan|$(TORCHTITAN_DIR)" "torchft|$(TORCHFT_DIR)"; do \
+		name=$${spec%%|*}; dir=$${spec#*|}; \
+		if [ -d "$$dir/.git" ]; then \
+			skip="$$skip --no-install-package $$name"; \
+			overlay="$$overlay $$edit $$dir"; \
+		fi; \
+	done; \
+	echo "[make install] backend=$$backend extra=$$extra forks=$${overlay:- (git pins)}"; \
 	set -x; \
-	$(UV_PIP_CMD) --pre $(TORCH_SPEC) --index-url "$$index_url" --force-reinstall
-# NO trailing `set +x`: it was the recipe's LAST command, so its 0 exit status MASKED a
-# failed torch install and the build marched on. The next target then resolved
-# torchdata's `torch` dep off PyPI and installed a STABLE CUDA torch over the backend-
-# matched one — a silently wrong env, published under a valid-looking cache fingerprint.
-# Seen live on an MI300X node whose home quota ran out mid-download (2026-08-31).
+	$(UV) sync --locked $(UV_SYNC_FLAGS) --python $(PYTHON_VERSION) \
+		--extra train --extra "$$extra" $$skip; \
+	if [ -n "$$overlay" ]; then $(UV) pip install $$overlay; fi
 
 # Clone the forks as siblings if they are ABSENT (at the pinned ref). An existing
 # clone is left exactly as it is — never checked out to the pin, because it is the
@@ -139,100 +142,17 @@ forks:
 
 # Engine hackers: the forks installed EDITABLE, so a change in ../torchtitan is
 # live without a reinstall. This is what replaced `git submodule update --init`.
+# Re-run it after any plain `make install`/`uv sync`, which put the forks back to
+# regular installs.
 dev-forks: forks
-	$(UV_PIP_CMD) -e $(TORCHTITAN_DIR) -e $(TORCHFT_DIR)
-
-install-torchtt-ft: export VIRTUAL_ENV := $(abspath $(VENV))
-install-torchtt-ft: forks
-	$(UV_PIP_CMD) -r $(TORCHTITAN_DIR)/requirements.txt
-	$(UV_PIP_CMD) $(TORCHTITAN_DIR)
-	$(UV_PIP_CMD) $(TORCHFT_DIR)
-	# transformers: required by panoengine.train.pretrain.hf_transformers (the
-	# HF-architecture backend glue) — torchtitan's transformers_modeling_backend
-	# imports it but declares it in neither its pyproject nor requirements.txt, so
-	# that recipe fails to import on a node without this line. Unpinned deliberately
-	# (the backend's own 4.57 pin predates the 5.x we run locally, matched to vLLM).
-	# (Qwen3.5's GatedDeltaNet kernels now come from attn-gym, a declared torchtitan
-	# dependency, so flash-linear-attention is no longer installed here.)
-	$(UV_PIP_CMD) transformers
-
-# ------------------------------------------------- RL runtime (PF_RL=1)
-# The decentralized-RL engine needs a stack the training-only env does NOT: vLLM (the
-# generator), torchmonarch (the actor mesh), torchstore, renderers, and flash-attn-3.
-# These were previously installed ONLY in the panofabric engine IMAGE, so an image-less
-# bootstrap (a Slurm site without Pyxis/enroot) produced a venv that dies with
-# "ModuleNotFoundError: No module named 'monarch'" the moment an RL island starts.
-#
-# Pins are the image's, verbatim (panofabric infra/engine-image/Dockerfile) — they must
-# move together:
-#   - torchmonarch is the STABLE release, not a nightly: monarch nightlies are pruned
-#     from PyPI after a few weeks (0.7.0.dev20260930 vanished, breaking fresh installs),
-#     and post-branch-cut ones are built on 2.16. 0.7.0 is built against torch 2.14.1,
-#     but only monarch.gradient (version-checked; nothing here imports it) needs a
-#     matched libtorch -- actor/spmd/rdma were smoke-tested on 2.15 (2026-10-30).
-#   - torchstore's PyPI release pins torch==2.9.0 and would drag the stack backwards, so
-#     it is installed --no-deps from a pinned source tarball with its real deps by hand.
-#   - flash-attn-3 comes from the pytorch TEST index, not nightly. The RL trainer imports
-#     flash_attn_interface on Hopper+; pre-Hopper (e.g. L40S/Ada) falls back to FA2.
-#   - math-verify is the dapo_math example rubric's dep; cheap and pure-python, so it
-#     rides here rather than needing model.requirements (whose file is not packaged).
-#   - renderers is pinned EXACTLY by torchtitan itself (==0.1.11 at a182e530).
-#   - verifiers runs bring-your-own agent harnesses (torchtitan's verifiers bridge targets
-#     0.3.1). It needs mcp<2 (it imports mcp.server.fastmcp); this vLLM DECLARES mcp>=2 but
-#     only imports it lazily for --tool-server, through APIs mcp 1.x has. So mcp is
-#     overridden to verifiers' range, as in the image.
-#   - TORCH_VERSION is the nightly the vllm/torchvision wheels below were built against
-#     (same date); the image build reads it from here. torchtitan at a182e530 needs a
-#     2.15 nightly (torch.distributed.config.pipeline_per_edge_p2p).
-# Resolved together 2026-09-30 from the pytorch cu130 nightly index, the way
-# torchtitan's own RL CI installs them.
-TORCH_VERSION ?= 2.15.0.dev20260928
-RL_TORCHMONARCH_VERSION ?= 0.7.0
-RL_TORCHSTORE_SHA ?= a80f8cae60ed9336b547fded9108f4df8222f0e8
-RL_RENDERERS_VERSION ?= 0.1.11
-RL_FLASH_ATTN_3_VERSION ?= 3.0.0
-RL_VLLM_VERSION ?= 1.0.0.dev20260928
-RL_TORCHVISION_VERSION ?= 0.30.0.dev20260928
-RL_MATH_VERIFY_VERSION ?= 0.9.0
-RL_VERIFIERS_VERSION ?= 0.3.1
-
-install-rl: export VIRTUAL_ENV := $(abspath $(VENV))
-install-rl:
-	@set -e; \
-	backend=$$(sh scripts/pf_backend.sh); \
-	case "$$backend" in \
-		cu130) : ;; \
-		*) echo "[make install-rl] RL runtime is CUDA-only; backend=$$backend" >&2; exit 1;; \
-	esac; \
-	index_url="$(PYTORCH_BASE_URL)/$$backend"; \
-	test_index_url="$(patsubst %/nightly,%,$(PYTORCH_BASE_URL))/test/$$backend"; \
-	echo "[make install-rl] vllm+torchvision from $$index_url"; \
-	set -x; \
-	$(UV_PIP_CMD) --pre \
-	  "torchvision==$(RL_TORCHVISION_VERSION)+$$backend" \
-	  "vllm==$(RL_VLLM_VERSION)+$$backend" \
-	  --extra-index-url "$$index_url" --index-strategy unsafe-best-match; \
-	$(UV_PIP_CMD) "torchmonarch==$(RL_TORCHMONARCH_VERSION)" \
-	  "renderers==$(RL_RENDERERS_VERSION)" pygtrie portpicker \
-	  opentelemetry-sdk opentelemetry-exporter-otlp-proto-http \
-	  "math-verify==$(RL_MATH_VERIFY_VERSION)"; \
-	printf 'mcp>=1.24,<2\n' > "$(VENV)/rl-overrides.txt"; \
-	$(UV_PIP_CMD) "verifiers==$(RL_VERIFIERS_VERSION)" --override "$(VENV)/rl-overrides.txt"; \
-	$(UV_PIP_CMD) --no-deps \
-	  "torchstore @ https://github.com/meta-pytorch/torchstore/archive/$(RL_TORCHSTORE_SHA).tar.gz"; \
-	$(UV_PIP_CMD) "flash-attn-3==$(RL_FLASH_ATTN_3_VERSION)" \
-	  --extra-index-url "$$test_index_url"; \
-	set +x; \
-	echo "[make install-rl] done"
+	$(MAKE) install PF_DEV_FORKS=1
 
 # ------------------------------------------------- persistent env (`make ensure`)
 
 # build-into: `all` built into a relocatable, SELF-CONTAINED, out-of-tree $(VENV) so the
 # cached venv survives the builder's teardown. Non-editable (an -e install records an
 # absolute finder into the builder's workdir, rm -rf'd at teardown -> dangling in every
-# consumer). `--no-deps .` skips the redundant git engine pull (panofabric-engine's only
-# deps are torchtitan/torchft, installed locally from the sibling clones next).
-build-into: export VIRTUAL_ENV := $(abspath $(VENV))
+# consumer).
 # Copy, not uv's default hardlinks from its cache: the cache is ONE shared dir
 # (~/.cache/uv), so every cached env shared each file's inode with it and with every
 # other env (link counts of 6-8 seen live). On BeeGFS, opening such files while
@@ -256,14 +176,7 @@ build-into: setup-env
 	fi
 	env $${UV_PYTHON_INSTALL_DIR:+UV_PYTHON_DOWNLOADS=never} \
 	  $(UV) venv $(VENV) --relocatable --python $(PYTHON_VERSION)
-	$(UV_PIP_CMD) --no-deps .
-	$(MAKE) install-torch VENV=$(VENV)
-	$(MAKE) install-torchtt-ft VENV=$(VENV)
-	@# if/else, NOT `[ ... ] && install-rl || echo skipping`: that form ran the echo when
-	@# install-rl FAILED, so a half-built env passed as "PF_RL!=1" and was PUBLISHED --
-	@# and won the publish race over three complete builds (run 8911e6f16bb2).
-	@if [ "$${PF_RL:-0}" = "1" ]; then $(MAKE) install-rl VENV=$(VENV); \
-	else echo "[build-into] PF_RL!=1; skipping the RL runtime"; fi
+	$(MAKE) install VENV=$(VENV) UV_SYNC_FLAGS=--no-editable
 
 ensure:
 	@set -eu; \
@@ -338,7 +251,7 @@ gc-env-cache:
 	exit 0
 
 show-backend:
-	@make --no-print-directory -s install-torch UV_PIP_CMD="echo Would run: uv pip install" TORCH_SPEC="$(TORCH_SPEC)"
+	@$(MAKE) --no-print-directory -s install UV="echo Would run: uv"
 
 clean-protoc-zip:
 	rm -f $(PROTOC_ZIP)

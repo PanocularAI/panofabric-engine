@@ -30,7 +30,7 @@
 #   ./docker/build-engine-image.sh --no-cache      # extra args pass through to `docker build`
 #
 # Override via env: REGISTRY, IMAGE_NAME, TARGETS, CUDA_TAG, CUDA_VERSION,
-# PYTHON_VERSION, PROTOC_VERSION, PYTORCH_BASE_URL, TORCH_VERSION, PUSH.
+# PYTHON_VERSION, PROTOC_VERSION, PUSH. Package pins live in pyproject.toml/uv.lock.
 
 set -euo pipefail
 export DOCKER_BUILDKIT=1   # required for the `--mount=type=cache` steps in the Dockerfile
@@ -44,12 +44,10 @@ command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not found on PATH" >&
 REGISTRY="${REGISTRY:-ghcr.io/panocularai}"
 IMAGE_NAME="${IMAGE_NAME:-panofabric-engine}"
 TARGETS="${TARGETS:-train full}"     # subset to build; `full` carries the unsuffixed tag
-CUDA_TAG="${CUDA_TAG:-cu130}"                 # torch nightly index (cu130/cpu/rocm7.0; CUDA 12 unsupported)
+CUDA_TAG="${CUDA_TAG:-cu130}"                 # picks the pyproject backend extra (cu130/cpu/rocm*; CUDA 12 unsupported)
 CUDA_VERSION="${CUDA_VERSION:-13.0.3}"        # nvidia/cuda base image tag; keep aligned with CUDA_TAG
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 PROTOC_VERSION="${PROTOC_VERSION:-32.0}"
-PYTORCH_BASE_URL="${PYTORCH_BASE_URL:-https://download.pytorch.org/whl/nightly}"
-TORCH_VERSION="${TORCH_VERSION:-}"            # exact nightly pin; default: the Makefile's TORCH_VERSION
 
 PUSH="${PUSH:-0}"
 EXTRA_BUILD_ARGS=("$@")   # e.g. --no-cache, --progress=plain
@@ -114,29 +112,6 @@ if (( ${#DIRTY_TREES[@]} )); then
   echo "NOTE: uncommitted changes in ${DIRTY_TREES[*]} -> tagging :$VERSION_TAG"
 fi
 
-# ---- RL / serving pins: read from the Makefile, which is the single source of truth --
-# `make install-rl` (the imageless path) and this image MUST agree, and they used to be
-# two hand-synced copies in two repos. Parsed rather than duplicated so a bump lands in
-# one place.
-mk_var() {  # <NAME> -> the Makefile's `NAME ?= value`
-  local v
-  v="$(sed -nE "s/^$1[[:space:]]*\\?=[[:space:]]*(.*)\$/\\1/p" Makefile | head -1)"
-  [[ -n "$v" ]] || { echo "ERROR: $1 not found in Makefile" >&2; exit 1; }
-  echo "$v"
-}
-# The torch nightly must be the one the vllm/torchvision wheels were built against.
-TORCH_VERSION="${TORCH_VERSION:-$(mk_var TORCH_VERSION)}"
-RL_ARGS=(
-  --build-arg TORCHVISION_VERSION="$(mk_var RL_TORCHVISION_VERSION)"
-  --build-arg VLLM_VERSION="$(mk_var RL_VLLM_VERSION)"
-  --build-arg TORCHMONARCH_VERSION="$(mk_var RL_TORCHMONARCH_VERSION)"
-  --build-arg TORCHSTORE_SHA="$(mk_var RL_TORCHSTORE_SHA)"
-  --build-arg RENDERERS_VERSION="$(mk_var RL_RENDERERS_VERSION)"
-  --build-arg FLASH_ATTN_3_VERSION="$(mk_var RL_FLASH_ATTN_3_VERSION)"
-  --build-arg MATH_VERIFY_VERSION="$(mk_var RL_MATH_VERIFY_VERSION)"
-  --build-arg VERIFIERS_VERSION="$(mk_var RL_VERIFIERS_VERSION)"
-)
-
 # ---- build -----------------------------------------------------------------
 # `full` derives FROM `train`, so building both is one pass plus a cache-hit re-tag.
 # `full` gets the bare tags; `train` gets the same with a -train suffix. Every tag is
@@ -162,12 +137,9 @@ for target in $TARGETS; do
     --build-arg PYTHON_VERSION="$PYTHON_VERSION" \
     --build-arg PROTOC_VERSION="$PROTOC_VERSION" \
     --build-arg CUDA_TAG="$CUDA_TAG" \
-    --build-arg PYTORCH_BASE_URL="$PYTORCH_BASE_URL" \
-    --build-arg TORCH_VERSION="$TORCH_VERSION" \
     --build-arg ENGINE_SHA="$ENGINE_SHA" \
     --build-arg TORCHTITAN_SHA="$TT_SHA" \
     --build-arg TORCHFT_SHA="$FT_SHA" \
-    "${RL_ARGS[@]}" \
     --build-context torchtitan="$TORCHTITAN_DIR" \
     --build-context torchft="$TORCHFT_DIR" \
     -t "$version_ref" \

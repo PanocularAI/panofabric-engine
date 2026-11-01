@@ -24,11 +24,12 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION} AS builder
 ARG PYTHON_VERSION
 ARG PROTOC_VERSION=32.0
 ARG CUDA_TAG=cu130
-ARG PYTORCH_BASE_URL=https://download.pytorch.org/whl/nightly
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH=/root/.local/bin:/root/.cargo/bin:$PATH
 ENV VIRTUAL_ENV=/opt/panoengine/.venv
+# `uv sync` targets the venv above instead of creating ./.venv in the build context.
+ENV UV_PROJECT_ENVIRONMENT=/opt/panoengine/.venv
 
 # Build deps mirror Makefile `setup-env` (minus tailscale, a host concern): build-essential
 # + pkg-config + libssl-dev for torchft's maturin build, python headers, git, unzip.
@@ -56,33 +57,25 @@ RUN uv venv --python /usr/bin/python${PYTHON_VERSION} ${VIRTUAL_ENV}
 WORKDIR /build
 COPY . /build
 
-# install-torchtt-ft (Makefile): torchtitan deps, then torchtitan + torchft from the
-# sibling clones, bind-mounted from their named build contexts. `rw` because setuptools
-# and maturin write build metadata into the source dir (it lands in a scratch overlay,
-# never in the checkout). `uv pip install --no-deps .` then adds panofabric-engine for the
-# recipe registry (--no-deps: the forks are already installed from source here, not from
-# the pyproject git pins). This is where torchft compiles from source — paid once.
-# `transformers` is torchtitan's undeclared transformers_modeling_backend dep, which
-# panoengine.train.pretrain.hf_transformers imports (see the Makefile for the long version).
-# Qwen3.5's GatedDeltaNet kernels come from attn-gym[linear], a declared torchtitan dep.
+# The Makefile's `install`, once: one `uv sync` of the [train] extra plus the backend extra
+# for CUDA_TAG (pyproject.toml pins torch per backend, so no separate torch step), with
+# torchtitan + torchft built from the sibling clones -- bind-mounted from their named build
+# contexts -- instead of their git pins. `rw` because setuptools and maturin write build
+# metadata into the source dir (it lands in a scratch overlay, never in the checkout).
+# --no-editable: /build is not the runtime stage's tree. This is where torchft compiles
+# from source — paid once.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,from=torchtitan,target=/src/torchtitan,rw \
     --mount=type=bind,from=torchft,target=/src/torchft,rw \
-    uv pip install -r /src/torchtitan/requirements.txt \
-    && uv pip install /src/torchtitan \
-    && uv pip install /src/torchft \
-    && uv pip install --no-deps . \
-    && uv pip install transformers
-
-# install-torch LAST + --force-reinstall so the backend-matched torch NIGHTLY wins over
-# whatever stable torch the engine install pulled in (cf. Makefile `install-torch`).
-# TORCH_VERSION (e.g. 2.14.0.dev20260804) pins the exact nightly for reproducible
-# rebuilds — and for derived images that must layer wheels matched to this exact
-# torch build on top without reinstalling it. Unset = newest nightly (old behavior).
-ARG TORCH_VERSION=
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --pre "torch${TORCH_VERSION:+==${TORCH_VERSION}+${CUDA_TAG}}" \
-    --index-url "${PYTORCH_BASE_URL}/${CUDA_TAG}" --force-reinstall
+    set -eu; \
+    case "${CUDA_TAG}" in \
+      cu130) extra=cu130 ;; rocm*) extra=rocm ;; cpu) extra=cpu ;; \
+      *) echo "no backend extra for CUDA_TAG=${CUDA_TAG}" >&2; exit 1 ;; \
+    esac; \
+    uv sync --locked --no-editable --python /usr/bin/python${PYTHON_VERSION} \
+      --extra train --extra "$extra" \
+      --no-install-package torchtitan --no-install-package torchft \
+    && uv pip install /src/torchtitan /src/torchft
 
 # Park run_train.sh beside the venv so the whole engine travels as one /opt/panoengine tree.
 RUN cp /build/run_train.sh /opt/panoengine/run_train.sh && chmod +x /opt/panoengine/run_train.sh
@@ -164,88 +157,24 @@ LABEL org.opencontainers.image.title="panofabric-engine (train)" \
 FROM train AS full
 
 ARG CUDA_TAG=cu130
-ARG PYTORCH_BASE_URL=https://download.pytorch.org/whl/nightly
+ENV UV_PROJECT_ENVIRONMENT=/opt/panoengine/.venv
 
 # The train stage ships no installer (uv lived only in the builder).
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-# vLLM FIRST (the slow, rarely-changing, ~3 GB layer). All three EXACT-pinned to one
-# nightly date so the vllm wheel matches the torch it was compiled against (torchtitan
-# rl/README §4: build numbers must match; torchvision only because vllm's kernel warmup
-# imports it). Do NOT unpin: an unpinned resolve here backtracked past every nightly to
-# the vllm 0.2.5 SDIST from PyPI and tried to compile it (no nvcc in this runtime stage).
-# unsafe-best-match is still needed so uv consults the nightly index for the pins while
-# vllm's ordinary deps resolve from PyPI.
-#
-# NO --force-reinstall, and TORCH_VERSION must equal the train stage's own pin: torch is
-# then already satisfied and this layer holds ONLY vllm+torchvision+deps. If they drift
-# apart the pin still forces the matched torch — correct, but the layer silently
-# re-fattens by ~5 GB of duplicated torch stack.
-#
-# The dates are NOT all equal: torchvision's nightly of day D pins the torch of day D-1,
-# so it rides one day AHEAD of the torch/vllm pair. Defaults come from the Makefile's
-# RL_* vars via the build script — bump them THERE, not here.
-ARG TORCH_VERSION=
-ARG TORCHVISION_VERSION
-ARG VLLM_VERSION
-RUN --mount=type=cache,target=/root/.cache/uv \
-    set -eu; \
-    if [ -n "${TORCH_VERSION}" ]; then torch_spec="torch==${TORCH_VERSION}+${CUDA_TAG}"; \
-    else torch_spec="torch"; fi; \
-    uv pip install --python ${VIRTUAL_ENV}/bin/python --pre \
-      "$torch_spec" \
-      "torchvision==${TORCHVISION_VERSION}+${CUDA_TAG}" \
-      "vllm==${VLLM_VERSION}+${CUDA_TAG}" \
-      --extra-index-url "${PYTORCH_BASE_URL}/${CUDA_TAG}" \
-      --index-strategy unsafe-best-match
-
-# The RL runtime. All four are hand-pinned because none is resolvable the obvious way:
-#   - torchstore's PyPI release pins torch==2.9.0 + torchmonarch==0.1.2 and would drag the
-#     whole stack backwards, so it is installed --no-deps from a pinned SOURCE TARBALL
-#     (a git+https URL needs a `git` binary, which this runtime stage does not ship) with
-#     its two real runtime deps added by hand.
-#   - torchmonarch is the stable release (see the Makefile's RL pins for why): it is
-#     built against an older torch, which only monarch.gradient cares about, and
-#     nothing in the RL stack imports that.
-#   - flash-attn-3 comes from the pytorch TEST index, not the nightly one (upstream
-#     torchtitan rl/README §2). The RL trainer imports `flash_attn_interface`
-#     UNCONDITIONALLY on Hopper+ and dies without it; pre-Hopper falls back to FA2.
-#   - math-verify is the dapo_math example's rubric dep. It SHOULD ride
-#     model.requirements, but torchtitan's setuptools config has no package-data entry so
-#     the file is absent from the installed wheel; baking it keeps RL runs unblocked.
-#   - verifiers runs bring-your-own agent harnesses (panoengine.train.rl.harness, on
-#     torchtitan's rl/examples/verifiers bridge). 0.3.1 is the version that bridge
-#     targets; it needs mcp<2 (its taskset package imports mcp.server.fastmcp, gone in
-#     2.x) while this vLLM nightly DECLARES mcp>=2. vLLM only imports mcp lazily for
-#     --tool-server, through APIs mcp 1.x has, so the override takes verifiers' side.
-# Bump these together with TORCH_VERSION in the Makefile, and re-run the alphabet_sort
-# smoke test.
-ARG TORCHMONARCH_VERSION
-ARG TORCHSTORE_SHA
-ARG RENDERERS_VERSION
-ARG FLASH_ATTN_3_VERSION
-ARG MATH_VERIFY_VERSION
-ARG VERIFIERS_VERSION
-RUN --mount=type=cache,target=/root/.cache/uv \
-    printf 'mcp>=1.24,<2\n' > /tmp/rl-overrides.txt \
-    && uv pip install --python ${VIRTUAL_ENV}/bin/python \
-      "torchmonarch==${TORCHMONARCH_VERSION}" \
-      "renderers==${RENDERERS_VERSION}" \
-      "math-verify==${MATH_VERIFY_VERSION}" \
-      "verifiers==${VERIFIERS_VERSION}" --override /tmp/rl-overrides.txt \
-      pygtrie portpicker opentelemetry-sdk opentelemetry-exporter-otlp-proto-http \
-    && uv pip install --python ${VIRTUAL_ENV}/bin/python --no-deps \
-      "torchstore @ https://github.com/meta-pytorch/torchstore/archive/${TORCHSTORE_SHA}.tar.gz" \
-    && uv pip install --python ${VIRTUAL_ENV}/bin/python \
-      "flash-attn-3==${FLASH_ATTN_3_VERSION}" \
-      --extra-index-url "${PYTORCH_BASE_URL%/nightly}/test/${CUDA_TAG}"
-
-# The serving plane's declared deps (aiohttp/safetensors/hf-hub/numpy/transformers).
-# They come free with vllm where versions matter, but the extra makes that explicit
-# rather than accidental. torch/vllm stay undeclared by [serve] on purpose.
+# vLLM, the RL runtime and the serving plane: the `rl` backend extra (cu130 + vllm/
+# torchvision/torchmonarch/torchstore/flash-attn-3/...; see pyproject.toml for why each is
+# pinned the way it is) plus [serve]. rl pins the same torch nightly as cu130, so torch is
+# already satisfied and this layer holds only the additions.
+#   --inexact: torchtitan/torchft were installed from the sibling clones in the builder and
+#     are not mounted here; an exact sync would uninstall them.
+#   --no-install-package: and must not reinstall them from their git pins (no `git`, no
+#     Rust toolchain in this stage).
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=.,target=/src,rw \
-    uv pip install --python ${VIRTUAL_ENV}/bin/python "/src[serve]"
+    cd /src && uv sync --locked --inexact --no-editable \
+      --extra train --extra rl --extra serve \
+      --no-install-package torchtitan --no-install-package torchft
 
 # Fail the build if anything can't import (no GPU needed): catches a vllm/torch mismatch
 # and a torchft break from the torch bump before the image ships. The RL line is separate

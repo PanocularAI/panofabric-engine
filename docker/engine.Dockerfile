@@ -204,8 +204,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 #     whole stack backwards, so it is installed --no-deps from a pinned SOURCE TARBALL
 #     (a git+https URL needs a `git` binary, which this runtime stage does not ship) with
 #     its two real runtime deps added by hand.
-#   - torchmonarch ships compiled bindings that load libtorch, so its build date must
-#     track TORCH_VERSION's.
+#   - torchmonarch is the stable release (see the Makefile's RL pins for why): it is
+#     built against an older torch, which only monarch.gradient cares about, and
+#     nothing in the RL stack imports that.
 #   - flash-attn-3 comes from the pytorch TEST index, not the nightly one (upstream
 #     torchtitan rl/README §2). The RL trainer imports `flash_attn_interface`
 #     UNCONDITIONALLY on Hopper+ and dies without it; pre-Hopper falls back to FA2.

@@ -590,6 +590,11 @@ class AsyncInferenceReplica(PureLearnerReplica):
         weights that generated it."""
         return self._weights_version()
 
+    def _newest_possible_version(self) -> int:
+        """This trainer is the only publisher, so no worker can hold anything
+        newer than its current weights."""
+        return self._weights_version()
+
     # ------------------------------------------------------------------ #
     # Relay publish.
     # ------------------------------------------------------------------ #

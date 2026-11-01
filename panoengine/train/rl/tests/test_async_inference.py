@@ -38,7 +38,10 @@ from panoengine.decentralized.relay import (
     ShardIntegrityError,
     verify_shard,
 )
+import panoengine.decentralized.rollout_queue as rollout_queue_mod
 from panoengine.decentralized.rollout_queue import (
+    VERSION_HEADER,
+    WORKER_ID_HEADER,
     RolloutQueuePopClient,
     RolloutQueuePushClient,
     RolloutQueueServer,
@@ -441,9 +444,10 @@ async def _start_rollout_queue(maxsize=64):
 def test_rollout_queue_wire_protocol_and_client_robustness():
     """push/pop round trip over the wire; a push to a full queue WAITS until a
     pop makes room (backpressure: the worker slows to the trainer's pace
-    instead of piling up rollouts that go stale); malformed payloads get 400
-    without crashing the server; and send() reports failure as False rather
-    than raising -- a dead queue endpoint must not take the worker down."""
+    instead of piling up rollouts that go stale); malformed metadata gets 400
+    without crashing the server, and an unreadable payload is dropped by pop()
+    rather than raised; and send() reports failure as False rather than
+    raising -- a dead queue endpoint must not take the worker down."""
 
     async def scenario():
         # Nothing listening: send() must return False, not raise.
@@ -470,17 +474,62 @@ def test_rollout_queue_wire_protocol_and_client_robustness():
             assert server.num_received == 2 and server.num_popped == 2
             assert await popper.pop() is None  # drained (at-most-once claims)
 
+            ok_headers = {WORKER_ID_HEADER: "1", VERSION_HEADER: "9"}
             async with aiohttp.ClientSession() as session:
-                for payload in (
-                    b"not a pickle",  # UnpicklingError
-                    pickle.dumps(12345),  # unpickles fine but isn't a tuple: TypeError
-                    pickle.dumps(("only", "two")),  # wrong arity: ValueError
+                for headers, payload in (
+                    ({}, pickle.dumps(["g"])),  # no metadata
+                    ({WORKER_ID_HEADER: "1"}, pickle.dumps(["g"])),  # no version
+                    ({WORKER_ID_HEADER: "x", VERSION_HEADER: "9"}, pickle.dumps(["g"])),
+                    (ok_headers, b""),  # empty payload
                 ):
                     async with session.post(
-                        f"{base_url}/rollouts", data=payload
+                        f"{base_url}/rollouts", data=payload, headers=headers
                     ) as resp:
                         assert resp.status == 400
-            assert server.num_received == 2  # nothing malformed was enqueued
+                assert server.num_received == 2  # nothing malformed was enqueued
+
+                # The server stores payloads unread, so a garbage one is
+                # accepted -- and pop() drops it instead of raising.
+                async with session.post(
+                    f"{base_url}/rollouts", data=b"not a pickle", headers=ok_headers
+                ) as resp:
+                    assert resp.status == 204
+            assert await popper.pop() is None
+            assert server.num_popped == 3
+        finally:
+            await test_server.close()
+
+    asyncio.run(scenario())
+
+
+def test_rollout_queue_server_never_unpickles(monkeypatch):
+    """Regression: the server unpickled every push to read worker_id/version,
+    which imports the payload's classes -- torchtitan.rl, hence vLLM -- so a
+    queue on a CPU-only box 500'd every push. Payloads must pass through the
+    server as opaque bytes; only the pop client unpickles."""
+
+    def no_unpickling(*args, **kwargs):
+        raise AssertionError("the rollout queue server must not unpickle payloads")
+
+    async def scenario():
+        server, test_server, base_url = await _start_rollout_queue()
+        try:
+            await RolloutQueuePushClient(base_url).send(4, 11, [{"tokens": [1, 2]}])
+            monkeypatch.setattr(rollout_queue_mod.pickle, "loads", no_unpickling)
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{base_url}/rollouts",
+                    data=pickle.dumps([{"tokens": [3]}]),
+                    headers={WORKER_ID_HEADER: "5", VERSION_HEADER: "12"},
+                ) as resp:
+                    assert resp.status == 204
+            queued = list(server.queue._queue)
+            assert [(w, v) for w, v, _ in queued] == [(4, 11), (5, 12)]
+            assert all(isinstance(p, bytes) for _, _, p in queued)
+            monkeypatch.undo()
+            popper = RolloutQueuePopClient(base_url)
+            assert await popper.pop() == (4, 11, [{"tokens": [1, 2]}])
+            assert await popper.pop() == (5, 12, [{"tokens": [3]}])
         finally:
             await test_server.close()
 

@@ -9,8 +9,13 @@
 #   - heloco_async_inference: N trainers pop from the same queue (any trainer
 #     consumes any worker's rollouts, at-most-once).
 #
-# Deliberately dumb: a bounded FIFO of pickled ``(worker_id, version,
-# groups)`` batches. Full -> push rejected (503); the worker waits and retries,
+# Deliberately dumb: a bounded FIFO of ``(worker_id, version, payload)``
+# batches, where ``payload`` is the workers' pickled rollout groups, stored and
+# served as opaque bytes. worker_id and version ride in HTTP headers so the
+# server never unpickles anything: rollout groups are torchtitan.rl objects,
+# and unpickling them imports torchtitan.rl, which imports vLLM -- a queue that
+# did so needed the full GPU RL stack on a CPU-only box (every push 500'd on a
+# CPU-only venv). Full -> push rejected (503); the worker waits and retries,
 # which holds its generation to the trainer's pace. Empty -> pop returns 204
 # (the trainer polls). Runs next to the relay
 # process (relay.py) but separately from it, so multi-GB
@@ -30,12 +35,18 @@ from aiohttp import web
 
 logger = logging.getLogger(__name__)
 
+#: Batch metadata headers; the body is the pickled rollout groups.
+WORKER_ID_HEADER = "X-Rollout-Worker-Id"
+VERSION_HEADER = "X-Rollout-Version"
+
 
 class RolloutQueueServer:
-    """Bounded queue of ``(worker_id, version, rollout_groups)`` batches.
+    """Bounded queue of ``(worker_id, version, payload)`` batches, ``payload``
+    being the pickled rollout groups, kept as opaque bytes.
 
-    Push (``POST /rollouts``, pickled tuple) and pop (``POST /rollouts/pop``)
-    are both at-most-once: a popped batch is claimed and removed in one call
+    Push (``POST /rollouts``: metadata headers + payload body) and pop (``POST
+    /rollouts/pop``: the same, back) are both at-most-once: a popped batch is
+    claimed and removed in one call
     -- a lost batch is cheaper than a trainer that stalls waiting on a wedged
     one, the same dropping philosophy the rest of this swarm uses. Safe under
     concurrent trainers despite no explicit lock: aiohttp's single-threaded
@@ -71,19 +82,16 @@ class RolloutQueueServer:
         return app
 
     async def _handle_push(self, request: web.Request) -> web.Response:
-        data = await request.read()
         try:
-            worker_id, version, groups = pickle.loads(data)
-        except (
-            pickle.UnpicklingError,
-            EOFError,
-            AttributeError,
-            TypeError,
-            ValueError,
-        ) as exc:
-            return web.Response(status=400, text=f"malformed rollout payload: {exc}")
+            worker_id = int(request.headers[WORKER_ID_HEADER])
+            version = int(request.headers[VERSION_HEADER])
+        except (KeyError, ValueError) as exc:
+            return web.Response(status=400, text=f"malformed rollout headers: {exc}")
+        payload = await request.read()
+        if not payload:
+            return web.Response(status=400, text="empty rollout payload")
         try:
-            self.queue.put_nowait((worker_id, version, groups))
+            self.queue.put_nowait((worker_id, version, payload))
         except asyncio.QueueFull:
             self.num_rejected += 1
             return web.Response(status=503, text="rollout queue full; consumer stalled")
@@ -93,17 +101,20 @@ class RolloutQueueServer:
     async def _handle_pop(self, request: web.Request) -> web.Response:
         del request
         try:
-            batch = self.queue.get_nowait()
+            worker_id, version, payload = self.queue.get_nowait()
         except asyncio.QueueEmpty:
             return web.Response(status=204)
         self.num_popped += 1
         return web.Response(
-            body=pickle.dumps(batch), content_type="application/octet-stream"
+            body=payload,
+            content_type="application/octet-stream",
+            headers={WORKER_ID_HEADER: str(worker_id), VERSION_HEADER: str(version)},
         )
 
 
 class RolloutQueuePushClient:
-    """The generator workers' side: one pickle+HTTP POST per batch.
+    """The generator workers' side: one HTTP POST per batch, the groups
+    pickled here and the ids in headers.
 
     A full queue (503) is backpressure, not failure: ``send`` waits and retries
     until the trainer has popped room, so the worker -- which awaits each send
@@ -127,14 +138,15 @@ class RolloutQueuePushClient:
         """Returns True once the queue accepted the batch (waiting while it is
         full), False if it was rejected otherwise or is unreachable -- never
         raises on a transport failure."""
-        payload = pickle.dumps((worker_id, version, groups))
+        payload = pickle.dumps(groups)
+        headers = {WORKER_ID_HEADER: str(worker_id), VERSION_HEADER: str(version)}
         try:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self._timeout_s)
             ) as session:
                 while True:
                     async with session.post(
-                        f"{self.queue_address}/rollouts", data=payload
+                        f"{self.queue_address}/rollouts", data=payload, headers=headers
                     ) as resp:
                         status = resp.status
                     if status != 503:
@@ -171,8 +183,9 @@ class RolloutQueuePopClient:
         self._timeout_s = timeout_s
 
     async def pop(self):
-        """Returns ``(worker_id, version, groups)`` or ``None`` (empty queue
-        or unreachable/slow server)."""
+        """Returns ``(worker_id, version, groups)`` or ``None`` (empty queue,
+        unreachable/slow server, or a batch that won't unpickle -- the server
+        no longer vets payloads, so a bad one surfaces here and is dropped)."""
         try:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self._timeout_s)
@@ -187,12 +200,22 @@ class RolloutQueuePopClient:
                             resp.status,
                         )
                         return None
+                    worker_id = int(resp.headers[WORKER_ID_HEADER])
+                    version = int(resp.headers[VERSION_HEADER])
                     data = await resp.read()
-                    return pickle.loads(data)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError, KeyError, ValueError) as exc:
             # TimeoutError too: one slow response must not kill the consumer.
             logger.warning("rollout pop from %s failed: %s", self.queue_address, exc)
             return None
+        try:
+            groups = pickle.loads(data)
+        except Exception as exc:  # any unpickling failure; never kill the consumer
+            logger.warning(
+                "dropped an unreadable rollout batch from worker %d (v%d): %s",
+                worker_id, version, exc,
+            )
+            return None
+        return worker_id, version, groups
 
 
 async def _serve(*, host: str, port: int, advertise_host: str, maxsize: int) -> None:

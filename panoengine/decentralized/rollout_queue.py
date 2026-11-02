@@ -171,21 +171,34 @@ class RolloutQueuePopClient:
     """The trainer replicas' side: pops one batch at a time.
 
     A non-blocking poll: :meth:`pop` returns ``None`` immediately if the
-    queue is empty or unreachable, never raises (the pure-learner consumer
-    then waits ``queue_poll_interval_s`` and retries). Multiple trainer
+    queue is empty or unreachable (the pure-learner consumer then waits
+    ``queue_poll_interval_s`` and retries). It raises only when
+    ``max_unreadable_in_a_row`` batches in a row won't unpickle: one is a
+    corrupt batch, dropped; a run of them means the workers send something
+    this trainer can't read (different code), and raising stops the trainer
+    with that cause instead of a stall timeout blaming dead workers. Multiple trainer
     replicas pop from the SAME queue concurrently -- an at-most-once claim
     per call, so no two trainers ever consume the same batch."""
 
-    def __init__(self, queue_address: str, *, timeout_s: float = 30.0):
+    def __init__(
+        self,
+        queue_address: str,
+        *,
+        timeout_s: float = 30.0,
+        max_unreadable_in_a_row: int = 3,
+    ):
         if not queue_address.strip():
             raise ValueError("queue_address is required (set $ROLLOUT_QUEUE_ADDR)")
         self.queue_address = queue_address.rstrip("/")
         self._timeout_s = timeout_s
+        self._max_unreadable = max_unreadable_in_a_row
+        self._unreadable_in_a_row = 0
 
     async def pop(self):
         """Returns ``(worker_id, version, groups)`` or ``None`` (empty queue,
         unreachable/slow server, or a batch that won't unpickle -- the server
-        no longer vets payloads, so a bad one surfaces here and is dropped)."""
+        never reads payloads, so a bad one surfaces here and is dropped).
+        Raises RuntimeError once ``max_unreadable_in_a_row`` won't unpickle."""
         try:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self._timeout_s)
@@ -209,12 +222,20 @@ class RolloutQueuePopClient:
             return None
         try:
             groups = pickle.loads(data)
-        except Exception as exc:  # any unpickling failure; never kill the consumer
+        except Exception as exc:  # any unpickling failure
+            self._unreadable_in_a_row += 1
+            if self._unreadable_in_a_row >= self._max_unreadable:
+                raise RuntimeError(
+                    f"{self._unreadable_in_a_row} rollout batches in a row could not "
+                    f"be unpickled (latest from worker {worker_id}, v{version}) -- "
+                    "are the workers running the same code as this trainer?"
+                ) from exc
             logger.warning(
                 "dropped an unreadable rollout batch from worker %d (v%d): %s",
                 worker_id, version, exc,
             )
             return None
+        self._unreadable_in_a_row = 0
         return worker_id, version, groups
 
 

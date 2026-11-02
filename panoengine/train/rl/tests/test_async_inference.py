@@ -536,6 +536,42 @@ def test_rollout_queue_server_never_unpickles(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_pop_raises_once_batches_stay_unreadable():
+    """One unreadable batch is corruption: dropped. A run of them means the
+    workers send what this trainer can't read (different code), so pop()
+    raises -- killing the consumer stops the trainer with that cause, instead
+    of starving it until a stall timeout blames dead workers."""
+
+    async def scenario():
+        server, test_server, base_url = await _start_rollout_queue()
+        headers = {WORKER_ID_HEADER: "2", VERSION_HEADER: "7"}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async def push(payload):
+                    async with session.post(
+                        f"{base_url}/rollouts", data=payload, headers=headers
+                    ) as resp:
+                        assert resp.status == 204
+
+                popper = RolloutQueuePopClient(base_url, max_unreadable_in_a_row=3)
+                for payload in (b"junk", b"junk", pickle.dumps(["g"])):
+                    await push(payload)
+                assert await popper.pop() is None
+                assert await popper.pop() is None
+                assert await popper.pop() == (2, 7, ["g"])  # resets the run
+
+                for _ in range(3):
+                    await push(b"junk")
+                assert await popper.pop() is None
+                assert await popper.pop() is None
+                with pytest.raises(RuntimeError, match="3 rollout batches in a row"):
+                    await popper.pop()
+        finally:
+            await test_server.close()
+
+    asyncio.run(scenario())
+
+
 def test_pop_swallows_slow_queue_timeout():
     """Regression: pop() promises never to raise, but aiohttp reports a slow
     server as plain asyncio.TimeoutError (NOT a ClientError) -- one slow

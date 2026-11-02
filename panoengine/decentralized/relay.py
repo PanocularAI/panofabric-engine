@@ -465,6 +465,15 @@ def _sweep_dead_spools(base: Path) -> None:
             pass  # alive under another user, or not a spool of ours
 
 
+#: Bases each new version's deltas are pre-built against: the versions most
+#: recently served, i.e. what fetchers hold. Fetchers chase the latest, so a
+#: pool clusters on one or two; the third covers a straggler.
+_PREBUILD_BASES = 3
+#: A pre-build waiting this long for the next shard gives up (the publisher
+#: died mid-upload); a fetcher asking later gets an on-demand build.
+_PREBUILD_STALL_S = 600.0
+
+
 class _DeltaWriter:
     """One delta file written shard by shard: frames stream to a temp file as
     each target shard is cut, the footer goes last, then it's renamed into
@@ -492,6 +501,35 @@ class _DeltaWriter:
     def abort(self) -> None:
         self._file.close()
         self._tmp.unlink(missing_ok=True)
+
+
+class _Prebuild:
+    """State of one version's pipelined pre-build: the shard indices landing
+    (fed by publish_shard_file) and one future per base, which ensure_delta
+    awaits instead of starting a duplicate build."""
+
+    def __init__(self, target: int, paths: dict[int, Path], loop: asyncio.AbstractEventLoop):
+        self.target, self.paths = target, paths  # base -> its delta file
+        self.landed: asyncio.Queue[int] = asyncio.Queue()
+        self.ready = {base: loop.create_future() for base in paths}
+        self.task: asyncio.Task | None = None
+        self.stopped = False
+
+    def stop(self) -> None:
+        """Give up: the target was dropped. Not a task cancel -- that aborts the
+        writers while a _cut_shard thread may still be writing to them -- so
+        the build stops at its next await instead."""
+        self.stopped = True
+        self.landed.put_nowait(-1)
+
+    def finish(self, base: int, path: Path) -> None:
+        if not self.ready[base].done():
+            self.ready[base].set_result(path)
+
+    def fail(self, base: int, exc: Exception) -> None:
+        if not self.ready[base].done():
+            self.ready[base].set_exception(exc)
+            self.ready[base].exception()  # retrieved: no "never retrieved" noise if unawaited
 
 
 class RelayServer:
@@ -531,8 +569,11 @@ class RelayServer:
         self._manifests: dict[int, CheckpointManifest] = {}
         self._touched: dict[int, float] = {}  # version -> last fetcher access
         self._delta_builds: dict[Path, asyncio.Future] = {}  # delta file -> its build
+        self._served: dict[int, float] = {}  # version -> last time a fetcher took it
         self._digests: dict[int, dict[str, list[str]]] = {}  # version -> chunk digests
+        self._prebuilds: dict[int, _Prebuild] = {}
         self.num_delta_builds = 0  # on demand
+        self.num_delta_prebuilds = 0
 
     def _private_root(self, base: Path) -> Path:
         if base not in self._roots:
@@ -585,7 +626,10 @@ class RelayServer:
         del self._manifests[version]
         self._landed.pop(version, None)
         self._touched.pop(version, None)
+        self._served.pop(version, None)
         self._digests.pop(version, None)
+        if (build := self._prebuilds.get(version)) is not None:
+            build.stop()
         # A download already streaming one of these files keeps its
         # open fd, so unlinking never cuts a transfer short.
         if (vdir := self._dirs.pop(version, None)) is not None:
@@ -608,6 +652,7 @@ class RelayServer:
             self._dirs[version] = root / str(version)
             self._dirs[version].mkdir(exist_ok=True)
             logger.info("spooling v%d (%.2f GB) in %s", version, nbytes / 1e9, root)
+            self._start_prebuild(version)
 
     def new_shard_file(self, version: int, idx: int) -> Path:
         """A temp file in ``version``'s spool dir to stream shard ``idx`` into;
@@ -626,6 +671,8 @@ class RelayServer:
             raise KeyError(f"no manifest published for version {version}")
         os.replace(tmp, self._version_dir(version) / str(idx))
         self._landed[version].add(idx)
+        if (build := self._prebuilds.get(version)) is not None:
+            build.landed.put_nowait(idx)
 
     def publish_shard(self, version: int, idx: int, data: bytes) -> None:
         tmp = self.new_shard_file(version, idx)
@@ -657,6 +704,26 @@ class RelayServer:
         # never gets a delta cut against the old one.
         tag = manifest_tag(self._manifests[base])
         return self._version_dir(target) / f"delta-from-{base}-{tag}"
+
+    def note_served(self, version: int) -> None:
+        """A fetcher downloaded ``version`` (whole or as a delta), so it now
+        holds it: the versions served most recently are the bases the next
+        version's deltas get pre-built against."""
+        self._served[version] = time.monotonic()
+
+    def note_moved(self, base: int, target: int) -> None:
+        """A fetcher took ``target`` as a delta from ``base``, so it holds
+        ``base`` no longer. Dropping ``base`` keeps pre-builds to what is held,
+        not every version ever served. Other fetchers still on ``base`` lose
+        nothing for this target (its delta is built) and get the next one
+        built on request."""
+        self._served.pop(base, None)
+        self.note_served(target)
+
+    def _prebuild_bases(self, target: int) -> list[int]:
+        recent = sorted(self._served, key=self._served.__getitem__, reverse=True)
+        return [v for v in recent
+                if v < target and self.complete_manifest(v) is not None][:_PREBUILD_BASES]
 
     def _cut_shard(
         self, target: int, idx: int, writers: dict[int, "_DeltaWriter"]
@@ -694,8 +761,9 @@ class RelayServer:
 
     def build_delta(self, base: int, target: int) -> Path:
         """Write ``target`` as a delta against ``base`` (both complete) into the
-        target's spool dir. Blocking, so callers run it on a thread; a shard at
-        a time, so the peak is two shards, not two checkpoints."""
+        target's spool dir -- the on-demand path, for a base no pre-build
+        covered. Blocking, so callers run it on a thread; a shard at a time, so
+        the peak is two shards, not two checkpoints."""
         target_m = self.complete_manifest(target)
         if target_m is None or self.complete_manifest(base) is None:
             raise KeyError(f"v{base} and v{target} must both be complete")
@@ -716,12 +784,90 @@ class RelayServer:
                     full / max(size, 1), full / 1e9, time.perf_counter() - t0)
         return out
 
+    def _start_prebuild(self, target: int) -> None:
+        """Pre-build ``target``'s deltas against the versions fetchers hold,
+        pipelined with its upload: each shard is cut as it lands (see
+        publish_shard_file), so by the time the last one lands -- the moment a
+        fetcher can see the version at all -- only that shard's work is left.
+        Needs a running event loop (the HTTP handlers); skipped without one."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        bases = self._prebuild_bases(target)
+        if not bases:
+            return
+        for base in bases:
+            self.touch(base)  # keep the bases through the build
+        build = _Prebuild(target, {b: self.delta_path(b, target) for b in bases}, loop)
+        self._prebuilds[target] = build
+        for base, path in build.paths.items():
+            self._delta_builds[path] = build.ready[base]
+        build.task = loop.create_task(self._run_prebuild(build))
+
+    async def _run_prebuild(self, build: "_Prebuild") -> None:
+        target = build.target
+        writers: dict[int, _DeltaWriter] = {}
+        try:
+            for base, path in build.paths.items():
+                writers[base] = _DeltaWriter(path, base, target)
+            num_shards = self._manifests[target].num_shards
+            done: set[int] = set()
+            last_landed = time.perf_counter()
+            while len(done) < num_shards and writers:
+                idx = await asyncio.wait_for(build.landed.get(), _PREBUILD_STALL_S)
+                last_landed = time.perf_counter()
+                if build.stopped:
+                    raise KeyError(f"v{target} was dropped mid-build")
+                if idx in done:
+                    continue
+                done.add(idx)
+                for base in await asyncio.to_thread(self._cut_shard, target, idx, writers):
+                    build.fail(base, KeyError(f"v{base} was evicted mid-build"))
+                    writers.pop(base).abort()
+            if build.stopped:  # dropped during the last cut
+                raise KeyError(f"v{target} was dropped mid-build")
+            full = sum(self._manifests[target].shard_sizes)
+            for base, writer in writers.items():
+                out = await asyncio.to_thread(writer.finish)
+                self.num_delta_prebuilds += 1
+                size = out.stat().st_size
+                logger.info("pre-built delta v%d->v%d: %.1f MB (%.0fx smaller than %.2f GB), "
+                            "ready %.2fs after the last shard landed", base, target,
+                            size / 1e6, full / max(size, 1), full / 1e9,
+                            time.perf_counter() - last_landed)
+                build.finish(base, out)
+            writers.clear()
+        except BaseException as exc:  # incl. a dropped target, a stalled upload, shutdown
+            if not (build.stopped or isinstance(exc, asyncio.CancelledError)):
+                logger.warning("pre-build of v%d's deltas stopped: %r", target, exc)
+            for base, writer in writers.items():
+                writer.abort()
+                build.fail(base, exc if isinstance(exc, Exception) else KeyError(str(exc)))
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+        finally:
+            if self._prebuilds.get(target) is build:
+                del self._prebuilds[target]
+            for base, path in build.paths.items():
+                if self._delta_builds.get(path) is build.ready[base]:
+                    del self._delta_builds[path]
+
     async def ensure_delta(self, base: int, target: int) -> Path:
-        """The delta file: already built, or built now -- once, however many
-        fetchers ask for the same pair."""
+        """The delta file: already built, being pre-built (wait for it), or
+        built now -- once, however many fetchers ask for the same pair."""
         path = self.delta_path(base, target)
         if path.exists():
             return path
+        pending = self._delta_builds.get(path)
+        if pending is not None:
+            try:
+                return await asyncio.shield(pending)
+            except Exception:  # that build failed (logged there): build it here instead
+                if self._delta_builds.get(path) is pending:
+                    del self._delta_builds[path]
+            if path.exists():
+                return path
         build = self._delta_builds.get(path)
         if build is None:
             build = asyncio.ensure_future(asyncio.to_thread(self.build_delta, base, target))
@@ -819,6 +965,7 @@ async def _handle_get_shard(request: web.Request) -> web.Response:
     if path is None:
         return web.Response(status=404, text=f"no shard {idx} for version {version}")
     relay.touch(version)
+    relay.note_served(version)
     # sendfile straight from the spool: no multi-GB copy through Python.
     # Returned unprepared: aiohttp prepares it, and a FileResponse prepared
     # here first asserts on that second prepare. Download rates are logged by
@@ -846,6 +993,7 @@ async def _handle_get_delta(request: web.Request) -> web.Response:
     except (KeyError, OSError) as exc:  # evicted mid-build, or the spool failed
         logger.warning("delta v%d->v%d failed: %s", base, target, exc)
         return web.Response(status=404, text=f"no delta v{base}->v{target}: {exc}")
+    relay.note_moved(base, target)
     return web.FileResponse(path, headers={"X-Delta-Target-Tag": manifest_tag(target_m)})
 
 

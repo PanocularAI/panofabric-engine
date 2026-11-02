@@ -9,6 +9,7 @@ wrong weights. Every comparison here is on raw bits, never a tolerance.
 """
 import asyncio
 import json
+import threading
 
 import pytest
 import torch
@@ -208,13 +209,16 @@ def test_worker_fetches_newer_versions_as_exact_deltas():
                 assert client.last_fetch["bytes"] < 0.25 * full
                 _assert_bit_identical(sd, published[version])
                 sd.clear()
-            assert relay.num_delta_builds == 3  # one per version, on request
+            # Every delta was pre-built while its version uploaded, against
+            # exactly the version the worker held -- one per version, none
+            # wasted on versions it had moved off, none built on request.
+            assert relay.num_delta_builds == 0 and relay.num_delta_prebuilds == 3
 
             # A second worker at the same base reuses the cached delta.
             twin = RelayClient([url])
             twin._base = (3, relay_mod.manifest_tag(relay.get_manifest(3)), published[3])
             _, sd = await twin.fetch_latest(min_version=3)
-            assert twin.last_fetch["kind"] == "delta" and relay.num_delta_builds == 3
+            assert twin.last_fetch["kind"] == "delta" and relay.num_delta_builds == 0
             _assert_bit_identical(sd, published[4])
         finally:
             await server.close()
@@ -386,6 +390,160 @@ def test_use_deltas_false_keeps_the_old_behaviour():
             await _publish(url, 2, trainer.published())
             _, sd = await client.fetch_latest(min_version=1)
             assert client.last_fetch["kind"] == "full" and relay.num_delta_builds == 0
+            _assert_bit_identical(sd, trainer.published())
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------- #
+# Pre-building: deltas cut while the version uploads, before anyone asks.
+# --------------------------------------------------------------------- #
+
+
+def _four_shard_trainer():
+    return _Trainer(sizes=((512, 256), (256, 256), (1024, 64), (128, 512)))
+
+
+def test_prebuild_is_pipelined_with_the_upload(monkeypatch):
+    """The relay knows a fetcher holds v1, so v2's delta against it is cut
+    shard by shard AS v2 UPLOADS -- each shard before the next one lands --
+    and the fetch is served from it, with nothing built on request."""
+    async def scenario():
+        relay, server, url = await _start_relay()
+        try:
+            trainer = _four_shard_trainer()
+            client = RelayClient([url])
+            await _publish(url, 1, trainer.published(), num_shards=4)
+            await client.fetch_latest()
+            trainer.step()
+            shards = shard_state_dict(trainer.published(), 4)
+
+            cuts = []
+            real_cut = relay._cut_shard
+
+            def recording(target, idx, writers):
+                cuts.append((idx, set(relay._landed[target])))
+                return real_cut(target, idx, writers)
+
+            monkeypatch.setattr(relay, "_cut_shard", recording)
+            relay.publish_manifest(2, build_manifest(2, shards))
+            for idx, data in enumerate(shards):
+                relay.publish_shard(2, idx, data)
+                for _ in range(500):  # give the pre-build its turn
+                    if len(cuts) > idx:
+                        break
+                    await asyncio.sleep(0.01)
+            assert [idx for idx, _ in cuts] == [0, 1, 2, 3]
+            assert all(landed == set(range(idx + 1)) for idx, landed in cuts), \
+                "a shard must be cut before the next one lands"
+
+            await relay.ensure_delta(1, 2)
+            assert relay.num_delta_prebuilds == 1 and relay.num_delta_builds == 0
+            _, sd = await client.fetch_latest(min_version=1)
+            assert client.last_fetch["kind"] == "delta" and relay.num_delta_builds == 0
+            _assert_bit_identical(sd, trainer.published())
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_prebuild_gives_up_on_a_stalled_upload_and_builds_on_request(monkeypatch):
+    """A publisher that dies mid-upload must not wedge the pre-build: it gives
+    up, and once the version does complete a fetch still gets an exact delta,
+    built on request."""
+    monkeypatch.setattr(relay_mod, "_PREBUILD_STALL_S", 0.2)
+
+    async def scenario():
+        relay, server, url = await _start_relay()
+        try:
+            trainer = _four_shard_trainer()
+            client = RelayClient([url])
+            await _publish(url, 1, trainer.published(), num_shards=4)
+            await client.fetch_latest()
+            trainer.step()
+            shards = shard_state_dict(trainer.published(), 4)
+            relay.publish_manifest(2, build_manifest(2, shards))
+            relay.publish_shard(2, 0, shards[0])
+            await asyncio.sleep(0.6)  # the pre-build times out waiting for shard 1
+            assert relay._prebuilds == {} and relay.num_delta_prebuilds == 0
+            for idx in (1, 2, 3):
+                relay.publish_shard(2, idx, shards[idx])
+
+            _, sd = await client.fetch_latest(min_version=1)
+            assert client.last_fetch["kind"] == "delta"
+            assert relay.num_delta_builds == 1 and relay.num_delta_prebuilds == 0
+            _assert_bit_identical(sd, trainer.published())
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_evicting_a_version_mid_prebuild_stops_it_quietly(monkeypatch, caplog):
+    """Eviction stops a pre-build at its next await rather than cancelling it:
+    a cancel aborted the delta writers while a _cut_shard thread could still be
+    writing to them. Stopping is routine, so it logs no warning."""
+    monkeypatch.setattr(relay_mod, "_IN_USE_S", 3600.0)  # the touched base v1 stays
+
+    async def scenario():
+        relay, server, url = await _start_relay(retain_last=2)
+        try:
+            trainer = _four_shard_trainer()
+            client = RelayClient([url])
+            await _publish(url, 1, trainer.published(), num_shards=4)
+            await client.fetch_latest()  # the relay now pre-builds against v1
+
+            entered, release = threading.Event(), threading.Event()
+            real_cut = relay._cut_shard
+
+            def held_cut(*args):  # a cut still running on its thread
+                entered.set()
+                release.wait(5)
+                return real_cut(*args)
+
+            monkeypatch.setattr(relay, "_cut_shard", held_cut)
+            trainer.step()
+            shards = shard_state_dict(trainer.published(), 4)
+            relay.publish_manifest(2, build_manifest(2, shards))
+            relay.publish_shard(2, 0, shards[0])
+            build = relay._prebuilds[2]
+            assert await asyncio.to_thread(entered.wait, 5)
+            for version in (3, 4):  # v2 never completes; v4 evicts it mid-cut
+                trainer.step()
+                later = shard_state_dict(trainer.published(), 4)
+                relay.publish_manifest(version, build_manifest(version, later))
+                for idx, data in enumerate(later):
+                    relay.publish_shard(version, idx, data)
+            assert relay.get_manifest(2) is None and relay.get_manifest(1) is not None
+            release.set()
+            await asyncio.wait_for(build.task, 5)
+            assert not build.task.cancelled() and 2 not in relay._prebuilds
+            assert all(f.done() and f.exception() for f in build.ready.values())
+            assert not [r for r in caplog.records if "pre-build of v2" in r.getMessage()]
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_no_prebuild_until_some_fetcher_holds_a_version():
+    """Nothing to cut against before the first download: the first publish
+    builds nothing, and the first fetch is a whole download."""
+    async def scenario():
+        relay, server, url = await _start_relay()
+        try:
+            trainer = _Trainer()
+            await _publish(url, 1, trainer.published())
+            trainer.step()
+            await _publish(url, 2, trainer.published())
+            await asyncio.sleep(0.1)
+            assert relay.num_delta_prebuilds == 0
+            client = RelayClient([url])
+            _, sd = await client.fetch_latest()
+            assert client.last_fetch["kind"] == "full"
             _assert_bit_identical(sd, trainer.published())
         finally:
             await server.close()

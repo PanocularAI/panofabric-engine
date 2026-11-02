@@ -54,6 +54,7 @@ import threading
 import time
 import warnings
 import weakref
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1038,11 +1039,19 @@ class RelayClient:
         stall_timeout_s: float = 120.0,
         site_cache_dir: str | None = None,
         use_deltas: bool = True,
+        base_provider: Callable[[], Awaitable[dict[str, torch.Tensor]]] | None = None,
     ):
         """``use_deltas``: ask for each checkpoint newer than the last one
         returned as a delta against it (``GET /delta``), falling back to the
         whole download whenever the relay can't serve one or it fails
         verification.
+
+        ``base_provider``: an async callable returning the state dict this
+        client returned last, read back from wherever the caller keeps it (the
+        inference worker: TorchStore, which holds its copy anyway). The client
+        then remembers only that version's number and content tag. Without
+        one, the client keeps its own reference to the last state dict -- one
+        extra checkpoint of host RAM (18 GB at 9B) for as long as it lives.
 
         ``site_cache_dir``: a directory shared with the other fetchers on this
         site (a cluster's shared filesystem). Fetchers then split each version's
@@ -1078,10 +1087,12 @@ class RelayClient:
             url: 1.0 for url in self.relay_urls
         }  # arbitrary units, EMA of bytes/sec
         self._use_deltas = use_deltas
-        # (version, manifest_tag, state dict) of the last checkpoint returned:
-        # the base the next delta is cut against. The client's own dict, so a
+        self._base_provider = base_provider
+        # (version, manifest_tag, state dict or None) of the last checkpoint
+        # returned: the base the next delta is cut against. The state dict is
+        # None with a base_provider; otherwise the client's own dict, so a
         # caller emptying the returned one (the worker does) leaves it intact.
-        self._base: tuple[int, str, dict[str, torch.Tensor]] | None = None
+        self._base: tuple[int, str, dict[str, torch.Tensor] | None] | None = None
         #: How the last fetch_latest arrived: {"kind": "delta"|"full", "bytes",
         #: "seconds"} -- for logs, metrics and tests.
         self.last_fetch: dict | None = None
@@ -1382,6 +1393,13 @@ class RelayClient:
         if base_version >= manifest.version:
             return None
         t0 = time.monotonic()
+        if base_sd is None:
+            try:
+                base_sd = await self._base_provider()
+            except Exception as exc:  # a delta is an optimization; never fail the fetch
+                logger.warning("could not read back base v%d (%s); fetching whole",
+                               base_version, exc)
+                return None
         try:
             async with session.get(
                 f"{url}/delta/{base_version}/{manifest.version}",
@@ -1429,7 +1447,8 @@ class RelayClient:
 
     def _remember(self, manifest: CheckpointManifest, state_dict: dict) -> None:
         if self._use_deltas:
-            self._base = (manifest.version, manifest_tag(manifest), dict(state_dict))
+            held = None if self._base_provider is not None else dict(state_dict)
+            self._base = (manifest.version, manifest_tag(manifest), held)
 
     async def latest_version(self) -> int:
         """The newest complete version any relay serves (0 when none, or none

@@ -150,6 +150,7 @@ class AsyncInferenceWorker:
         self._relay_client = RelayClient(
             [u.strip() for u in config.relay_addresses.split(",") if u.strip()],
             site_cache_dir=_site_relay_cache(),
+            base_provider=self._loaded_state_dict,
         )
         self._rollout_queue_client = RolloutQueuePushClient(
             config.rollout_queue_address
@@ -204,6 +205,14 @@ class AsyncInferenceWorker:
         # controller starts it via generator_router.start_engine_loop;
         # this worker has a single generator actor and must do the same).
         await self.generator.start_engine_loop.call()
+
+    async def _loaded_state_dict(self) -> dict:
+        """The checkpoint loaded last, read back from TorchStore as the base for
+        the relay client's next delta (RelayClient base_provider), instead of
+        the client holding a whole checkpoint for good. Exact bits
+        (_load_checkpoint puts it without a transfer_dtype) and current (the
+        next fetch starts only after _load_checkpoint returns)."""
+        return await ts.get_state_dict("model_state_dict")
 
     async def _load_checkpoint(self, version: int, state_dict: dict) -> None:
         """Push the relay-fetched state dict into TorchStore under the same

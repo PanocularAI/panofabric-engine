@@ -377,6 +377,86 @@ def test_republished_versions_start_over_as_the_new_content():
     asyncio.run(scenario())
 
 
+class _Store:
+    """Stands in for the worker's TorchStore: holds the loaded checkpoint as its
+    own tensors (a put copies), and reads back a fresh copy (as get does)."""
+
+    def __init__(self):
+        self.held: dict | None = None
+        self.reads = 0
+
+    def load(self, sd):  # the worker's _load_checkpoint: put, then drop the dict
+        self.held = {k: v.clone() for k, v in sd.items()}
+        sd.clear()
+
+    async def read(self):
+        self.reads += 1
+        return {k: v.clone() for k, v in self.held.items()}
+
+
+def test_base_read_back_from_the_worker_store_holds_nothing_extra():
+    """The worker path: the client keeps only the base's version and tag, and
+    reads the weights back from the store when it needs a delta."""
+    async def scenario():
+        relay, server, url = await _start_relay()
+        try:
+            trainer, store = _Trainer(), _Store()
+            client = RelayClient([url], base_provider=store.read)
+            await _publish(url, 1, trainer.published())
+            version, sd = await client.fetch_latest()
+            store.load(sd)
+            assert client._base[:2] == (1, relay_mod.manifest_tag(relay.get_manifest(1)))
+            assert client._base[2] is None  # no checkpoint held by the client
+            for version in (2, 3):
+                trainer.step()
+                await _publish(url, version, trainer.published())
+                got, sd = await client.fetch_latest(min_version=version - 1)
+                assert got == version and client.last_fetch["kind"] == "delta"
+                _assert_bit_identical(sd, trainer.published())
+                store.load(sd)
+                assert client._base[2] is None
+            assert store.reads == 2
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_base_provider_failure_or_stale_store_falls_back_visibly():
+    """A store that can't be read, or holds something other than the version the
+    client returned, must cost only the optimization: a whole download, exact
+    weights, and last_fetch saying "full" so the regression is visible."""
+    async def scenario():
+        relay, server, url = await _start_relay()
+        try:
+            trainer, store = _Trainer(), _Store()
+            client = RelayClient([url], base_provider=store.read)
+            await _publish(url, 1, trainer.published())
+            _, sd = await client.fetch_latest()
+            store.load(sd)
+
+            trainer.step()
+            await _publish(url, 2, trainer.published())
+            async def broken():
+                raise RuntimeError("store unavailable")
+            client._base_provider = broken
+            _, sd = await client.fetch_latest(min_version=1)
+            assert client.last_fetch["kind"] == "full"
+            _assert_bit_identical(sd, trainer.published())
+
+            # The store still holds v1 while the client believes it returned v2.
+            client._base_provider = store.read
+            trainer.step()
+            await _publish(url, 3, trainer.published())
+            _, sd = await client.fetch_latest(min_version=2)
+            assert client.last_fetch["kind"] == "full"
+            _assert_bit_identical(sd, trainer.published())
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
 def test_use_deltas_false_keeps_the_old_behaviour():
     async def scenario():
         relay, server, url = await _start_relay()

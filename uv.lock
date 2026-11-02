@@ -3,11 +3,11 @@ revision = 3
 requires-python = ">=3.11, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra != 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra == 'extra-17-panofabric-engine-serve-vllm'",
+    "python_full_version >= '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra == 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm'",
     "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra != 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra == 'extra-17-panofabric-engine-serve-vllm'",
+    "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra == 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm'",
     "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra != 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra == 'extra-17-panofabric-engine-serve-vllm'",
     "platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra != 'extra-17-panofabric-engine-rl' and extra == 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm'",
-    "python_full_version >= '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra == 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm'",
-    "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra == 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm'",
     "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra == 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm'",
     "platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra == 'extra-17-panofabric-engine-cu130' and extra != 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm'",
     "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra != 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm'",
@@ -2373,7 +2373,7 @@ dependencies = [
     { name = "requests" },
     { name = "starlette" },
     { name = "typing-extensions" },
-    { name = "urllib3", version = "2.8.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "urllib3" },
     { name = "websockets", version = "16.1.1", source = { registry = "https://pypi.org/simple" } },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a5/36/537006bc2a22f3aa232ce0907f52a333f831a6a2f525894ff43747a7abee/openai_agents-0.24.0.tar.gz", hash = "sha256:4b4b285f4fed81fdf1b4ac426a9101658d9cd29b4fb1aaeee18f639b77e704e3", size = 7026950, upload-time = "2026-10-15T02:38:21.466Z" }
@@ -2588,6 +2588,9 @@ wheels = [
 name = "panofabric-engine"
 version = "0.1.0"
 source = { editable = "." }
+dependencies = [
+    { name = "zstandard" },
+]
 
 [package.optional-dependencies]
 cpu = [
@@ -2668,6 +2671,7 @@ requires-dist = [
     { name = "verifiers", marker = "extra == 'rl'", specifier = "==0.3.1" },
     { name = "vllm", marker = "extra == 'rl'", specifier = "==1.0.0.dev20260928", index = "https://download.pytorch.org/whl/nightly/cu130", conflict = { package = "panofabric-engine", extra = "rl" } },
     { name = "vllm", marker = "extra == 'serve-vllm'", specifier = ">=0.30" },
+    { name = "zstandard", specifier = ">=0.23" },
 ]
 provides-extras = ["decentralized", "train", "serve", "cu130", "rocm", "cpu", "rl", "serve-vllm"]
 
@@ -3210,8 +3214,7 @@ dependencies = [
     { name = "certifi" },
     { name = "charset-normalizer" },
     { name = "idna" },
-    { name = "urllib3", version = "2.7.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-17-panofabric-engine-cpu' and extra == 'extra-17-panofabric-engine-cu130') or (extra == 'extra-17-panofabric-engine-cpu' and extra == 'extra-17-panofabric-engine-rl') or (extra == 'extra-17-panofabric-engine-cu130' and extra == 'extra-17-panofabric-engine-rl') or (extra != 'extra-17-panofabric-engine-rl' and extra == 'extra-17-panofabric-engine-rocm') or (extra != 'extra-17-panofabric-engine-rl' and extra == 'extra-17-panofabric-engine-serve-vllm') or (extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra == 'extra-17-panofabric-engine-rocm') or (extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra == 'extra-17-panofabric-engine-serve-vllm')" },
-    { name = "urllib3", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-17-panofabric-engine-cpu' or extra == 'extra-17-panofabric-engine-cu130' or extra == 'extra-17-panofabric-engine-rl' or (extra == 'extra-17-panofabric-engine-rocm' and extra == 'extra-17-panofabric-engine-serve-vllm') or (extra != 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm')" },
+    { name = "urllib3" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ac/c3/e2a2b89f2d3e2179abd6d00ebd70bff6273f37fb3e0cc209f48b39d00cbf/requests-2.34.2.tar.gz", hash = "sha256:f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed", size = 142856, upload-time = "2026-05-14T19:25:27.735Z" }
 wheels = [
@@ -3307,8 +3310,7 @@ version = "2.67.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "certifi" },
-    { name = "urllib3", version = "2.7.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-17-panofabric-engine-cpu' and extra == 'extra-17-panofabric-engine-cu130') or (extra == 'extra-17-panofabric-engine-cpu' and extra == 'extra-17-panofabric-engine-rl') or (extra == 'extra-17-panofabric-engine-cu130' and extra == 'extra-17-panofabric-engine-rl') or (extra != 'extra-17-panofabric-engine-rl' and extra == 'extra-17-panofabric-engine-rocm') or (extra != 'extra-17-panofabric-engine-rl' and extra == 'extra-17-panofabric-engine-serve-vllm') or (extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra == 'extra-17-panofabric-engine-rocm') or (extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra == 'extra-17-panofabric-engine-serve-vllm')" },
-    { name = "urllib3", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-17-panofabric-engine-cpu' or extra == 'extra-17-panofabric-engine-cu130' or extra == 'extra-17-panofabric-engine-rl' or (extra == 'extra-17-panofabric-engine-rocm' and extra == 'extra-17-panofabric-engine-serve-vllm') or (extra != 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm')" },
+    { name = "urllib3" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ad/8a/b2eec40df8a67bf073e244d29001d04ee365d163bc4f15efdfce35f53090/sentry_sdk-2.67.1.tar.gz", hash = "sha256:f263d8c9aa4137750640de8fb0ed5404df6bb564e20e4b59cb16a6eeba18d4ed", size = 990599, upload-time = "2026-08-10T13:05:55.892Z" }
 wheels = [
@@ -4088,31 +4090,8 @@ wheels = [
 
 [[package]]
 name = "urllib3"
-version = "2.7.0"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra != 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra == 'extra-17-panofabric-engine-serve-vllm'",
-    "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra != 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra == 'extra-17-panofabric-engine-serve-vllm'",
-    "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra != 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra == 'extra-17-panofabric-engine-serve-vllm'",
-    "platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra != 'extra-17-panofabric-engine-rl' and extra == 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm'",
-]
-sdist = { url = "https://files.pythonhosted.org/packages/53/0c/06f8b233b8fd13b9e5ee11424ef85419ba0d8ba0b3138bf360be2ff56953/urllib3-2.7.0.tar.gz", hash = "sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c", size = 433602, upload-time = "2026-05-07T16:13:18.596Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/3e/5db95bcf282c52709639744ca2a8b149baccf648e39c8cc87553df9eae0c/urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897", size = 131087, upload-time = "2026-05-07T16:13:17.151Z" },
-]
-
-[[package]]
-name = "urllib3"
 version = "2.8.0"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra == 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm'",
-    "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra == 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm'",
-    "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra == 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm'",
-    "platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra == 'extra-17-panofabric-engine-cu130' and extra != 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm'",
-    "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra != 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm'",
-    "platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-17-panofabric-engine-cpu' and extra != 'extra-17-panofabric-engine-cu130' and extra != 'extra-17-panofabric-engine-rl' and extra != 'extra-17-panofabric-engine-rocm' and extra != 'extra-17-panofabric-engine-serve-vllm'",
-]
 sdist = { url = "https://files.pythonhosted.org/packages/e3/05/b17359e1cefb4f909b5e40b1b90a496d987258916dbbf88e842c729f510e/urllib3-2.8.0.tar.gz", hash = "sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63", size = 458972, upload-time = "2026-09-15T19:29:36.253Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/92/9d/c4e665119135114480843e7ab388fa94d8480650450e6f8e26b70d323a4c/urllib3-2.8.0-py3-none-any.whl", hash = "sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3", size = 135717, upload-time = "2026-09-15T19:29:34.577Z" },
@@ -4538,4 +4517,21 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/dc/23/655a1802fe8041302c959774ca7c80b53bc24737ff3ef45cb50ef11bd96c/zipp-4.1.1.tar.gz", hash = "sha256:7ebb7a44c021b29fd8dbd7cce6812d0d7b5b454521f93cc71af6ccd155aaa70b", size = 27649, upload-time = "2026-10-03T17:03:03.452Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b5/98/df615823cd9419131ce19fba00de53a663794369e198aade064a244b385d/zipp-4.1.1-py3-none-any.whl", hash = "sha256:8979f52d874162f485ff2981e3891f3a3317b7a3dd43ff1e1775b9304f307a9c", size = 10582, upload-time = "2026-10-03T17:03:02.506Z" },
+]
+
+[[package]]
+name = "zstandard"
+version = "0.25.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/fd/aa/3e0508d5a5dd96529cdc5a97011299056e14c6505b678fd58938792794b1/zstandard-0.25.0.tar.gz", hash = "sha256:7713e1179d162cf5c7906da876ec2ccb9c3a9dcbdffef0cc7f70c3667a205f0b", size = 711513, upload-time = "2025-09-14T22:15:54.002Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bb/1f/e9cfd801a3f9190bf3e759c422bbfd2247db9d7f3d54a56ecde70137791a/zstandard-0.25.0-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:9300d02ea7c6506f00e627e287e0492a5eb0371ec1670ae852fefffa6164b072", size = 5559635, upload-time = "2025-09-14T22:16:37.141Z" },
+    { url = "https://files.pythonhosted.org/packages/46/c0/ca3e533b4fa03112facbe7fbe7779cb1ebec215688e5df576fe5429172e0/zstandard-0.25.0-cp311-cp311-musllinux_1_1_x86_64.whl", hash = "sha256:f373da2c1757bb7f1acaf09369cdc1d51d84131e50d5fa9863982fd626466313", size = 5574377, upload-time = "2025-09-14T22:16:40.523Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/be/94267dc6ee64f0f8ba2b2ae7c7a2df934a816baaa7291db9e1aa77394c3c/zstandard-0.25.0-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:72d35d7aa0bba323965da807a462b0966c91608ef3a48ba761678cb20ce5d8b7", size = 5366047, upload-time = "2025-09-14T22:16:51.328Z" },
+    { url = "https://files.pythonhosted.org/packages/53/60/7be26e610767316c028a2cbedb9a3beabdbe33e2182c373f71a1c0b88f36/zstandard-0.25.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:5a56ba0db2d244117ed744dfa8f6f5b366e14148e00de44723413b2f3938a902", size = 5546993, upload-time = "2025-09-14T22:17:06.781Z" },
+    { url = "https://files.pythonhosted.org/packages/08/b3/206883dd25b8d1591a1caa44b54c2aad84badccf2f1de9e2d60a446f9a25/zstandard-0.25.0-cp312-cp312-musllinux_1_1_x86_64.whl", hash = "sha256:aaf21ba8fb76d102b696781bddaa0954b782536446083ae3fdaa6f16b25a1c4b", size = 5576659, upload-time = "2025-09-14T22:17:10.164Z" },
+    { url = "https://files.pythonhosted.org/packages/fc/5f/75aafd4b9d11b5407b641b8e41a57864097663699f23e9ad4dbb91dc6bfe/zstandard-0.25.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:474d2596a2dbc241a556e965fb76002c1ce655445e4e3bf38e5477d413165ffa", size = 5360237, upload-time = "2025-09-14T22:17:19.954Z" },
+    { url = "https://files.pythonhosted.org/packages/63/4b/e3678b4e776db00f9f7b2fe58e547e8928ef32727d7a1ff01dea010f3f13/zstandard-0.25.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:8e735494da3db08694d26480f1493ad2cf86e99bdd53e8e9771b2752a5c0246a", size = 5547173, upload-time = "2025-09-14T22:17:36.084Z" },
+    { url = "https://files.pythonhosted.org/packages/50/d5/870aa06b3a76c73eced65c044b92286a3c4e00554005ff51962deef28e28/zstandard-0.25.0-cp313-cp313-musllinux_1_1_x86_64.whl", hash = "sha256:172de1f06947577d3a3005416977cce6168f2261284c02080e7ad0185faeced3", size = 5576368, upload-time = "2025-09-14T22:17:40.206Z" },
+    { url = "https://files.pythonhosted.org/packages/b2/e5/fbd822d5c6f427cf158316d012c5a12f233473c2f9c5fe5ab1ae5d21f3d8/zstandard-0.25.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:4f187a0bb61b35119d1926aee039524d1f93aaf38a9916b8c4b78ac8514a0aaf", size = 5360113, upload-time = "2025-09-14T22:17:48.893Z" },
 ]

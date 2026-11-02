@@ -17,7 +17,14 @@ license = { file = "LICENSE" }
 # Base install is light: it gets you the package, `--help`, and the serving
 # plane's pure-python glue. The training engine is the [train] extra because
 # torchft has to COMPILE (see below).
-dependencies = []
+dependencies = [
+  # The relay's delta wire format (panoengine.decentralized.relay): the relay
+  # compresses checkpoint deltas, every inference worker decompresses them. A
+  # single small wheel with no deps, and here rather than in an extra because
+  # every install path (nix dev shell, Makefile, image) installs the base
+  # project, so both ends of the wire are guaranteed to have it.
+  "zstandard>=0.23",
+]
 
 [project.optional-dependencies]
 # The training engine. Pinned by SHA, never by branch: a moving ref in a

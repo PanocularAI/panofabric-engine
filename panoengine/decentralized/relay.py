@@ -32,22 +32,28 @@ import argparse
 import asyncio
 import hashlib
 import io
+import json
 import logging
+import math
 import os
 import random
 import re
 import shutil
 import signal
 import socket
+import struct
 import tempfile
 import threading
 import time
+import warnings
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import aiohttp
 import torch
+import zstandard
 from aiohttp import web
 
 logger = logging.getLogger(__name__)
@@ -191,6 +197,216 @@ def reassemble_state_dict(
         merged.update(torch.load(io.BytesIO(data), weights_only=True))
         del data
     return merged
+
+
+# --------------------------------------------------------------------- #
+# Deltas: version B as a lossless XOR against a version A the fetcher holds.
+# --------------------------------------------------------------------- #
+
+#: Blob layout: this magic, the zstd frames, a JSON footer (versions plus one
+#: entry per tensor), then the footer's length as a little-endian u64. Footer
+#: last so the relay can stream frames to disk a shard at a time.
+_DELTA_MAGIC = b"PFDELTA1"
+#: zstd level 3 (its default): the XOR is mostly zero bytes, which every level
+#: crushes; higher levels only cost relay CPU.
+_DELTA_LEVEL = 3
+#: Each tensor is cut into chunks of at most this many bytes, every chunk its
+#: own zstd frame and SHA-256, so one big tensor (an embedding) spreads over
+#: every core instead of pinning one -- on the relay encoding and on each
+#: worker decoding and verifying.
+_CHUNK_BYTES = 16 << 20
+_INT_VIEW = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+_POOL: ThreadPoolExecutor | None = None
+_POOL_LOCK = threading.Lock()
+
+
+def _codec_pool() -> ThreadPoolExecutor:
+    """One pool per process, as wide as the machine: zstd, hashlib and torch's
+    XOR all release the GIL, so threads scale with cores. Never submit to it
+    from one of its own threads (a job waiting on jobs can starve the pool)."""
+    global _POOL
+    with _POOL_LOCK:
+        if _POOL is None:
+            _POOL = ThreadPoolExecutor(os.cpu_count() or 1,
+                                       thread_name_prefix="relay-codec")
+        return _POOL
+
+
+def manifest_tag(manifest: CheckpointManifest) -> str:
+    """A published version's content identity. Version numbers restart every
+    run while a relay can outlive it, so deltas name their base by version AND
+    this tag."""
+    return hashlib.sha256("|".join(manifest.shard_checksums).encode()).hexdigest()[:16]
+
+
+def _flat_bits(t: torch.Tensor) -> torch.Tensor:
+    """``t``'s raw bit pattern as a flat integer tensor of the same width --
+    XOR on the bits, not arithmetic on the values, is what makes the delta
+    exact (it preserves -0.0, NaN payloads, everything)."""
+    flat = t.detach().contiguous().reshape(-1)
+    return flat.view(_INT_VIEW[flat.element_size()])
+
+
+def _chunk_ranges(numel: int, chunk_elems: int) -> list[tuple[int, int]]:
+    return [(s, min(s + chunk_elems, numel)) for s in range(0, numel, chunk_elems)] or [(0, 0)]
+
+
+def _digest(bits: torch.Tensor) -> str:
+    return hashlib.sha256(bits.view(torch.uint8).numpy()).hexdigest()
+
+
+def _encode_entries(
+    base: dict[str, torch.Tensor],
+    target: dict[str, torch.Tensor],
+    digests: dict[str, list[str]] | None = None,
+) -> tuple[list[dict], list[bytes], dict[str, list[str]]]:
+    """Every target tensor (sorted by name) as a delta entry plus its frames,
+    all chunks of all tensors encoded in parallel. ``digests``: the target's
+    chunk digests when already known -- the relay caches them per version, so
+    cutting one target against several bases hashes it once. Returns
+    ``(entries, frames in file order, the target's digests)``."""
+    plan = []
+    for name in sorted(target):
+        t = target[name]
+        t_bits = _flat_bits(t)
+        b = base.get(name)
+        if b is not None and b.dtype == t.dtype and b.shape == t.shape:
+            kind, b_bits = "xor", _flat_bits(b)
+        else:  # a tensor the base lacks, or reshaped: ship it whole
+            kind, b_bits = "raw", None
+        chunk_elems = max(1, _CHUNK_BYTES // t_bits.element_size())
+        plan.append((name, t, kind, t_bits, b_bits, chunk_elems,
+                     _chunk_ranges(t_bits.numel(), chunk_elems)))
+    known = digests or {}
+
+    def encode_chunk(job):
+        _, _, _, t_bits, b_bits, _, _ = plan[job[0]]
+        start, end, want_digest = job[1], job[2], job[3]
+        piece = t_bits[start:end]
+        payload = piece if b_bits is None else piece ^ b_bits[start:end]
+        frame = zstandard.ZstdCompressor(level=_DELTA_LEVEL).compress(
+            payload.view(torch.uint8).numpy())
+        return frame, (_digest(piece) if want_digest else None)
+
+    jobs = [(i, s, e, p[0] not in known) for i, p in enumerate(plan) for s, e in p[6]]
+    results = iter(_codec_pool().map(encode_chunk, jobs))
+    entries, frames, out_digests = [], [], {}
+    for name, t, kind, _, _, chunk_elems, ranges in plan:
+        chunk = [next(results) for _ in ranges]
+        frames.extend(f for f, _ in chunk)
+        out_digests[name] = known[name] if name in known else [d for _, d in chunk]
+        entries.append({
+            "name": name,
+            "kind": kind,
+            "dtype": str(t.dtype).removeprefix("torch."),
+            "shape": list(t.shape),
+            "chunk_elems": chunk_elems,
+            "frames": [len(f) for f, _ in chunk],
+            "sha256": out_digests[name],
+        })
+    return entries, frames, out_digests
+
+
+def _delta_footer(entries: list[dict], base_version: int, target_version: int) -> bytes:
+    footer = json.dumps(
+        {"base": base_version, "target": target_version, "entries": entries}
+    ).encode()
+    return footer + struct.pack("<Q", len(footer))
+
+
+def encode_delta(
+    base: dict[str, torch.Tensor],
+    target: dict[str, torch.Tensor],
+    *,
+    base_version: int,
+    target_version: int,
+) -> bytes:
+    """``target`` as a delta against ``base``; ``decode_delta`` inverts it
+    bit-exactly given the same ``base``."""
+    entries, frames, _ = _encode_entries(base, target)
+    return b"".join([_DELTA_MAGIC, *frames,
+                     _delta_footer(entries, base_version, target_version)])
+
+
+def decode_delta(
+    blob: bytes,
+    base: dict[str, torch.Tensor],
+    *,
+    base_version: int,
+    target_version: int,
+) -> dict[str, torch.Tensor]:
+    """Rebuild the target state dict from a delta and the ``base`` it was cut
+    against. Every chunk is checked against the SHA-256 the relay computed
+    from the real target, so a wrong base, a corrupt blob or a codec bug raise
+    ShardIntegrityError -- never return different weights. ``base`` is only
+    read: the result is all new tensors."""
+    view = memoryview(blob)
+    try:
+        if len(view) < len(_DELTA_MAGIC) + 8 or bytes(view[:len(_DELTA_MAGIC)]) != _DELTA_MAGIC:
+            raise ValueError("not a delta blob (or another version of the format)")
+        (footer_len,) = struct.unpack("<Q", view[-8:])
+        footer_start = len(view) - 8 - footer_len
+        if footer_start < len(_DELTA_MAGIC):
+            raise ValueError("truncated delta blob")
+        meta = json.loads(bytes(view[footer_start:-8]))
+        if (meta["base"], meta["target"]) != (base_version, target_version):
+            raise ValueError(
+                f"delta is v{meta['base']}->v{meta['target']}, "
+                f"wanted v{base_version}->v{target_version}")
+        outputs, jobs, offset = {}, [], len(_DELTA_MAGIC)
+        for entry in meta["entries"]:
+            name = entry["name"]
+            dtype = getattr(torch, entry["dtype"], None)
+            if not isinstance(dtype, torch.dtype):
+                raise ValueError(f"unknown dtype {entry['dtype']!r}")
+            int_dtype = _INT_VIEW[torch.empty((), dtype=dtype).element_size()]
+            numel = math.prod(entry["shape"])
+            ranges = _chunk_ranges(numel, int(entry["chunk_elems"]))
+            if not len(ranges) == len(entry["frames"]) == len(entry["sha256"]):
+                raise ValueError(f"{name!r}: chunk count does not match its shape")
+            if entry["kind"] == "xor":
+                prev = base.get(name)
+                if prev is None or prev.dtype != dtype or prev.numel() != numel:
+                    raise ShardIntegrityError(
+                        f"delta entry {name!r} does not match the base it was asked against")
+                prev_bits = _flat_bits(prev)
+            elif entry["kind"] == "raw":
+                prev_bits = None
+            else:
+                raise ValueError(f"unknown entry kind {entry['kind']!r}")
+            out = torch.empty(numel, dtype=int_dtype)
+            outputs[name] = (out, dtype, entry["shape"])
+            for (start, end), size, digest in zip(ranges, entry["frames"], entry["sha256"]):
+                jobs.append((name, out, prev_bits, start, end, view[offset:offset + size], digest))
+                offset += size
+        if offset != footer_start:
+            raise ValueError("delta frames do not add up to the blob")
+    except (ValueError, KeyError, TypeError, struct.error) as exc:
+        raise ShardIntegrityError(f"malformed delta: {exc}") from exc
+
+    def decode_chunk(job):
+        name, out, prev_bits, start, end, frame, digest = job
+        raw = zstandard.ZstdDecompressor().decompress(frame)
+        if len(raw) != (end - start) * out.element_size():
+            raise ShardIntegrityError(f"delta entry {name!r}: a chunk has the wrong length")
+        piece = out[start:end]
+        if raw:
+            with warnings.catch_warnings():  # read-only buffer; never written to
+                warnings.simplefilter("ignore", UserWarning)
+                payload = torch.frombuffer(raw, dtype=out.dtype)
+            if prev_bits is None:
+                piece.copy_(payload)
+            else:
+                torch.bitwise_xor(prev_bits[start:end], payload, out=piece)
+        if _digest(piece) != digest:
+            raise ShardIntegrityError(f"delta entry {name!r} reconstructs to the wrong bytes")
+
+    try:
+        for _ in _codec_pool().map(decode_chunk, jobs):
+            pass
+    except zstandard.ZstdError as exc:
+        raise ShardIntegrityError(f"malformed delta: {exc}") from exc
+    return {name: out.view(dtype).reshape(shape) for name, (out, dtype, shape) in outputs.items()}
 
 
 # --------------------------------------------------------------------- #

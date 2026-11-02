@@ -1,0 +1,162 @@
+"""Lossless checkpoint deltas on the relay (relay.encode_delta/decode_delta, GET /delta).
+
+The contract that matters for training: a worker that fetched a checkpoint as a
+delta holds EXACTLY the weights it would have downloaded whole -- bit for bit,
+including -0.0 and NaN payloads -- and anything short of that (a corrupt delta, a
+base the relay no longer has, a base that is different content under the same
+version number) falls back to the whole download instead of handing the worker
+wrong weights. Every comparison here is on raw bits, never a tolerance.
+"""
+import asyncio
+import json
+
+import pytest
+import torch
+
+import panoengine.decentralized.relay as relay_mod
+from panoengine.decentralized.relay import (
+    ShardIntegrityError,
+    decode_delta,
+    encode_delta,
+)
+
+
+def _bits(t):
+    return relay_mod._flat_bits(t)
+
+
+def _assert_bit_identical(got: dict, want: dict):
+    assert got.keys() == want.keys()
+    for name in want:
+        assert got[name].dtype == want[name].dtype, name
+        assert got[name].shape == want[name].shape, name
+        assert torch.equal(_bits(got[name]), _bits(want[name])), f"{name} differs in bits"
+
+
+class _Trainer:
+    """An fp32 master copy published as bf16 -- how the RL trainer's weights
+    reach the relay -- stepped at an RL-sized learning rate."""
+
+    def __init__(self, sizes=((512, 256), (256,), (1024, 64)), lr=2e-6, seed=0):
+        self.gen = torch.Generator().manual_seed(seed)
+        self.master = {f"p{i}": torch.randn(s, generator=self.gen) * 0.02
+                       for i, s in enumerate(sizes)}
+        self.lr = lr
+
+    def step(self):
+        for p in self.master.values():
+            # Adam-like: the update's magnitude is ~lr regardless of the gradient's.
+            p.add_(torch.randn(p.shape, generator=self.gen).sign() * self.lr)
+
+    def published(self):
+        return {n: p.to(torch.bfloat16) for n, p in self.master.items()}
+
+
+# --------------------------------------------------------------------- #
+# The codec.
+# --------------------------------------------------------------------- #
+
+
+def test_delta_round_trip_is_bit_exact_for_every_dtype_and_edge_case():
+    special = torch.tensor([0.0, -0.0, float("inf"), -float("inf"), float("nan"), 1e-40])
+    nan_payload = torch.tensor([0x7FC1, 0x7FFF, -1], dtype=torch.int16).view(torch.bfloat16)
+    base = {
+        "bf16": torch.randn(64, 32).to(torch.bfloat16),
+        "fp32": torch.randn(17),
+        "int64": torch.arange(10),
+        "bool": torch.tensor([True, False, True]),
+        "scalar": torch.tensor(3.5),
+        "special": special.clone(),
+        "nan_payload": torch.zeros(3, dtype=torch.bfloat16),
+        "reshaped": torch.randn(4, 6),
+        "dropped": torch.randn(5),  # not in target: must not appear in the result
+    }
+    target = {k: v.clone() for k, v in base.items() if k != "dropped"}
+    target["bf16"][::7] += 0.25
+    target["fp32"][3] = -0.0
+    target["int64"][-1] = 2**40
+    target["bool"][1] = True
+    target["scalar"] = torch.tensor(-1.25)
+    target["special"] = special.flip(0)
+    target["nan_payload"] = nan_payload
+    target["reshaped"] = torch.randn(6, 4)  # shape changed: shipped whole
+    target["new"] = torch.randn(2, 2, dtype=torch.float16)  # base lacks it
+    target["empty"] = torch.empty(0, 3)
+    base_snapshot = {k: v.clone() for k, v in base.items()}
+
+    blob = encode_delta(base, target, base_version=1, target_version=2)
+    restored = decode_delta(blob, base, base_version=1, target_version=2)
+
+    _assert_bit_identical(restored, target)
+    _assert_bit_identical(base, base_snapshot)  # decode never writes into the base
+
+
+def test_rl_sized_update_ships_as_a_small_exact_delta():
+    """The reason this exists: at RL learning rates most bf16 weights keep their
+    exact bits between versions, so the delta is a few percent of the checkpoint
+    -- and it must still reconstruct exactly."""
+    trainer = _Trainer()
+    v1 = trainer.published()
+    for _ in range(3):
+        trainer.step()
+    v2 = trainer.published()
+    changed = sum(int((_bits(v1[k]) != _bits(v2[k])).sum()) for k in v1)
+    total = sum(t.numel() for t in v1.values())
+    assert 0 < changed < 0.2 * total  # a real but sparse update
+
+    blob = encode_delta(v1, v2, base_version=1, target_version=4)
+    full = sum(t.numel() * t.element_size() for t in v2.values())
+    assert len(blob) < 0.25 * full, f"delta {len(blob)} B vs checkpoint {full} B"
+    _assert_bit_identical(decode_delta(blob, v1, base_version=1, target_version=4), v2)
+
+
+def test_tensors_split_into_many_chunks_still_round_trip_exactly(monkeypatch):
+    """Big tensors are cut into chunks (one frame + digest each) so they spread
+    over every core; with a tiny chunk size every tensor here spans many."""
+    monkeypatch.setattr(relay_mod, "_CHUNK_BYTES", 64)
+    trainer = _Trainer()
+    v1 = trainer.published()
+    trainer.step()
+    v2 = trainer.published()
+    v2["odd"] = torch.randn(37)  # numel not a multiple of the chunk
+    blob = encode_delta(v1, v2, base_version=1, target_version=2)
+    footer_len = int.from_bytes(blob[-8:], "little")
+    meta = json.loads(blob[-8 - footer_len:-8])
+    assert all(len(e["frames"]) > 1 for e in meta["entries"])
+    _assert_bit_identical(decode_delta(blob, v1, base_version=1, target_version=2), v2)
+
+    # Corrupt a chunk in the MIDDLE of a tensor: the per-chunk digest catches it.
+    entry = meta["entries"][0]
+    offset = len(relay_mod._DELTA_MAGIC) + sum(entry["frames"][: len(entry["frames"]) // 2])
+    corrupt = bytearray(blob)
+    corrupt[offset + 6] ^= 0x01
+    with pytest.raises(ShardIntegrityError):
+        decode_delta(bytes(corrupt), v1, base_version=1, target_version=2)
+
+
+def test_decode_refuses_anything_but_the_exact_target():
+    trainer = _Trainer()
+    v1 = trainer.published()
+    trainer.step()
+    v2 = trainer.published()
+    blob = encode_delta(v1, v2, base_version=1, target_version=2)
+
+    corrupt = bytearray(blob)
+    corrupt[len(relay_mod._DELTA_MAGIC) + 20] ^= 0x40  # inside the first frame
+    with pytest.raises(ShardIntegrityError):
+        decode_delta(bytes(corrupt), v1, base_version=1, target_version=2)
+
+    wrong_base = {k: v.clone() for k, v in v1.items()}
+    wrong_base["p0"][0, 0] += 1.0
+    with pytest.raises(ShardIntegrityError, match="wrong bytes"):
+        decode_delta(blob, wrong_base, base_version=1, target_version=2)
+
+    with pytest.raises(ShardIntegrityError):
+        decode_delta(blob, {k: v for k, v in v1.items() if k != "p1"},
+                     base_version=1, target_version=2)
+    with pytest.raises(ShardIntegrityError):
+        decode_delta(blob[:-30], v1, base_version=1, target_version=2)
+    with pytest.raises(ShardIntegrityError):
+        decode_delta(blob, v1, base_version=1, target_version=3)
+    with pytest.raises(ShardIntegrityError):
+        decode_delta(b"not a delta at all", v1, base_version=1, target_version=2)

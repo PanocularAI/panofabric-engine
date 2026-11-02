@@ -12,12 +12,17 @@ import json
 
 import pytest
 import torch
+from aiohttp.test_utils import TestServer
 
 import panoengine.decentralized.relay as relay_mod
 from panoengine.decentralized.relay import (
+    RelayClient,
+    RelayServer,
     ShardIntegrityError,
+    build_manifest,
     decode_delta,
     encode_delta,
+    shard_state_dict,
 )
 
 
@@ -160,3 +165,229 @@ def test_decode_refuses_anything_but_the_exact_target():
         decode_delta(blob, v1, base_version=1, target_version=3)
     with pytest.raises(ShardIntegrityError):
         decode_delta(b"not a delta at all", v1, base_version=1, target_version=2)
+
+
+# --------------------------------------------------------------------- #
+# Relay + client over HTTP.
+# --------------------------------------------------------------------- #
+
+
+async def _start_relay(retain_last=5):
+    relay = RelayServer(retain_last=retain_last)
+    server = TestServer(relay.app())
+    await server.start_server()
+    return relay, server, str(server.make_url("")).rstrip("/")
+
+
+async def _publish(url, version, sd, num_shards=2):
+    shards = shard_state_dict(sd, num_shards)
+    await RelayClient([url]).publish(version, shards, build_manifest(version, shards))
+
+
+def test_worker_fetches_newer_versions_as_exact_deltas():
+    async def scenario():
+        relay, server, url = await _start_relay()
+        try:
+            trainer = _Trainer()
+            client = RelayClient([url])
+            published = {1: trainer.published()}
+            await _publish(url, 1, published[1])
+            version, sd = await client.fetch_latest()
+            assert version == 1 and client.last_fetch["kind"] == "full"
+            _assert_bit_identical(sd, published[1])
+            sd.clear()  # what the worker does after loading; the base must survive
+
+            for version in (2, 3, 4):
+                trainer.step()
+                published[version] = trainer.published()
+                await _publish(url, version, published[version])
+                got_version, sd = await client.fetch_latest(min_version=version - 1)
+                assert got_version == version
+                assert client.last_fetch["kind"] == "delta"
+                full = sum(relay.get_manifest(version).shard_sizes)
+                assert client.last_fetch["bytes"] < 0.25 * full
+                _assert_bit_identical(sd, published[version])
+                sd.clear()
+            assert relay.num_delta_builds == 3  # one per version, on request
+
+            # A second worker at the same base reuses the cached delta.
+            twin = RelayClient([url])
+            twin._base = (3, relay_mod.manifest_tag(relay.get_manifest(3)), published[3])
+            _, sd = await twin.fetch_latest(min_version=3)
+            assert twin.last_fetch["kind"] == "delta" and relay.num_delta_builds == 3
+            _assert_bit_identical(sd, published[4])
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_skipping_versions_still_deltas_against_what_the_worker_holds():
+    """A worker that fell behind (generation outlasting several publishes) asks
+    for latest-vs-what-it-holds, not a chain."""
+    async def scenario():
+        relay, server, url = await _start_relay()
+        try:
+            trainer = _Trainer()
+            client = RelayClient([url])
+            await _publish(url, 1, trainer.published())
+            await client.fetch_latest()
+            for version in (2, 3, 4, 5):
+                trainer.step()
+                await _publish(url, version, trainer.published())
+            version, sd = await client.fetch_latest(min_version=1)
+            assert version == 5 and client.last_fetch["kind"] == "delta"
+            _assert_bit_identical(sd, trainer.published())
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_falls_back_to_whole_download_when_base_was_evicted(monkeypatch):
+    monkeypatch.setattr(relay_mod, "_IN_USE_S", 0.0)  # count-based eviction only
+
+    async def scenario():
+        relay, server, url = await _start_relay(retain_last=2)
+        try:
+            trainer = _Trainer()
+            client = RelayClient([url])
+            await _publish(url, 1, trainer.published())
+            await client.fetch_latest()
+            for version in (2, 3):
+                trainer.step()
+                await _publish(url, version, trainer.published())
+            assert relay.get_manifest(1) is None  # the worker's base is gone
+            version, sd = await client.fetch_latest(min_version=1)
+            assert version == 3 and client.last_fetch["kind"] == "full"
+            _assert_bit_identical(sd, trainer.published())
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_falls_back_when_relay_has_different_content_under_the_base_version():
+    """A relay that outlived a run: same version number, different weights.
+    The base tag must catch it (409) before any delta is applied."""
+    async def scenario():
+        relay, server, url = await _start_relay()
+        try:
+            trainer = _Trainer(seed=1)
+            client = RelayClient([url])
+            await _publish(url, 1, trainer.published())
+            await client.fetch_latest()
+            other_run = _Trainer(seed=2).published()
+            client._base = (1, "0" * 16, other_run)  # held v1 is another run's
+            trainer.step()
+            await _publish(url, 2, trainer.published())
+            version, sd = await client.fetch_latest(min_version=1)
+            assert version == 2 and client.last_fetch["kind"] == "full"
+            assert relay.num_delta_builds == 0
+            _assert_bit_identical(sd, trainer.published())
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_falls_back_when_the_served_delta_is_corrupt():
+    async def scenario():
+        relay, server, url = await _start_relay()
+        try:
+            trainer = _Trainer()
+            client = RelayClient([url])
+            await _publish(url, 1, trainer.published())
+            await client.fetch_latest()
+            trainer.step()
+            await _publish(url, 2, trainer.published())
+            path = await relay.ensure_delta(1, 2)
+            data = bytearray(path.read_bytes())
+            data[len(relay_mod._DELTA_MAGIC) + 20] ^= 0x40
+            path.write_bytes(bytes(data))
+
+            version, sd = await client.fetch_latest(min_version=1)
+            assert version == 2 and client.last_fetch["kind"] == "full"
+            _assert_bit_identical(sd, trainer.published())
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_falls_back_when_applying_the_delta_raises(monkeypatch):
+    """Not only a failed check: anything applying a delta raises (a base on the
+    wrong device, say) costs only the optimization, never the fetch."""
+    def broken(*args, **kwargs):
+        raise RuntimeError("Expected all tensors to be on the same device")
+
+    async def scenario():
+        relay, server, url = await _start_relay()
+        try:
+            trainer = _Trainer()
+            client = RelayClient([url])
+            await _publish(url, 1, trainer.published())
+            await client.fetch_latest()
+            trainer.step()
+            await _publish(url, 2, trainer.published())
+            monkeypatch.setattr(relay_mod, "decode_delta", broken)
+            version, sd = await client.fetch_latest(min_version=1)
+            assert version == 2 and client.last_fetch["kind"] == "full"
+            _assert_bit_identical(sd, trainer.published())
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_republished_versions_start_over_as_the_new_content():
+    """A new run on a standing relay republishes v1 and v2 as other weights. The
+    relay must drop the old content's shards, chunk digests and deltas -- served
+    any of them, a fetcher of the new run would fail verification on every
+    delta and silently download whole."""
+    async def scenario():
+        relay, server, url = await _start_relay()
+        try:
+            old = _Trainer(seed=1)
+            old_client = RelayClient([url])
+            await _publish(url, 1, old.published())
+            await old_client.fetch_latest()
+            old.step()
+            await _publish(url, 2, old.published())
+            await old_client.fetch_latest(min_version=1)
+            assert old_client.last_fetch["kind"] == "delta"  # old v1->v2 cached
+
+            new = _Trainer(seed=2)
+            new_v1 = new.published()
+            await _publish(url, 1, new_v1)
+            client = RelayClient([url])
+            client._base = (1, relay_mod.manifest_tag(relay.get_manifest(1)), new_v1)
+            new.step()
+            await _publish(url, 2, new.published())
+            version, sd = await client.fetch_latest(min_version=1)
+            assert version == 2 and client.last_fetch["kind"] == "delta"
+            _assert_bit_identical(sd, new.published())
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_use_deltas_false_keeps_the_old_behaviour():
+    async def scenario():
+        relay, server, url = await _start_relay()
+        try:
+            trainer = _Trainer()
+            client = RelayClient([url], use_deltas=False)
+            await _publish(url, 1, trainer.published())
+            await client.fetch_latest()
+            assert client._base is None  # no extra checkpoint held in RAM
+            trainer.step()
+            await _publish(url, 2, trainer.published())
+            _, sd = await client.fetch_latest(min_version=1)
+            assert client.last_fetch["kind"] == "full" and relay.num_delta_builds == 0
+            _assert_bit_identical(sd, trainer.published())
+        finally:
+            await server.close()
+
+    asyncio.run(scenario())

@@ -308,7 +308,8 @@ def test_site_cache_keeps_only_the_two_newest_versions(tmp_path, monkeypatch):
     async def scenario():
         relay, server, base_url = await _start_relay()
         try:
-            client = RelayClient([base_url], site_cache_dir=str(tmp_path))
+            # Whole downloads: a delta never touches the site cache.
+            client = RelayClient([base_url], site_cache_dir=str(tmp_path), use_deltas=False)
             for version in (1, 2, 3):
                 await _publish(base_url, version, _site_sd())
                 # min_version = the version held, as the worker passes it
@@ -340,7 +341,8 @@ def test_site_fetchers_join_the_version_their_site_already_started(tmp_path, mon
             relay_dir = next(tmp_path.iterdir())
             (relay_dir / "v2-0123456789ab").mkdir()        # v2 by number, wrong content
             counts = _count_shard_gets(relay, monkeypatch)
-            late = RelayClient([base_url], site_cache_dir=str(tmp_path))
+            # Whole downloads: the v2 step below asserts on shard GETs.
+            late = RelayClient([base_url], site_cache_dir=str(tmp_path), use_deltas=False)
             version, restored = await late.fetch_latest()
             assert version == 1 and counts == {}            # joined v1 from the cache
             assert all(torch.equal(restored[k], sd[k]) for k in sd)

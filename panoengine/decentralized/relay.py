@@ -22,6 +22,13 @@
 #     relay from permanently starving the others.
 #   - BackgroundPublisher: the trainer-side upload, run on a thread so
 #     training pauses only for the device->host copy.
+#   - Deltas: a fetcher that already holds version A asks for B as a lossless
+#     delta (``GET /delta/{A}/{B}``): each tensor's bit pattern XOR A's,
+#     zstd-compressed. RL updates are tiny next to bf16's resolution, so most
+#     weights keep their exact bits between versions (Qwen3-0.6B's 1.5 GB
+#     checkpoint ships as ~11 MB). Verified per chunk (SHA-256), so a worker
+#     holds exactly the weights it would have downloaded whole; any doubt
+#     falls back to the full download.
 #
 # Needs torch (state-dict tensors) but never the torchtitan training stack or
 # vLLM, so the standalone relay-server process stays CPU-only, like heloco's
@@ -458,6 +465,35 @@ def _sweep_dead_spools(base: Path) -> None:
             pass  # alive under another user, or not a spool of ours
 
 
+class _DeltaWriter:
+    """One delta file written shard by shard: frames stream to a temp file as
+    each target shard is cut, the footer goes last, then it's renamed into
+    place -- so a delta is visible only once complete."""
+
+    def __init__(self, out: Path, base: int, target: int):
+        fd, tmp = tempfile.mkstemp(dir=out.parent, prefix=f".{out.name}.", suffix=".part")
+        self._file = os.fdopen(fd, "wb")
+        self._file.write(_DELTA_MAGIC)
+        self._tmp, self._out = Path(tmp), out
+        self._base, self._target = base, target
+        self._entries: list[dict] = []
+
+    def add(self, entries: list[dict], frames: list[bytes]) -> None:
+        for frame in frames:
+            self._file.write(frame)
+        self._entries.extend(entries)
+
+    def finish(self) -> Path:
+        self._file.write(_delta_footer(self._entries, self._base, self._target))
+        self._file.close()
+        os.replace(self._tmp, self._out)
+        return self._out
+
+    def abort(self) -> None:
+        self._file.close()
+        self._tmp.unlink(missing_ok=True)
+
+
 class RelayServer:
     """Shard/manifest store for one relay node: shards in files, manifests in
     memory.
@@ -494,6 +530,9 @@ class RelayServer:
         self._landed: dict[int, set[int]] = {}
         self._manifests: dict[int, CheckpointManifest] = {}
         self._touched: dict[int, float] = {}  # version -> last fetcher access
+        self._delta_builds: dict[Path, asyncio.Future] = {}  # delta file -> its build
+        self._digests: dict[int, dict[str, list[str]]] = {}  # version -> chunk digests
+        self.num_delta_builds = 0  # on demand
 
     def _private_root(self, base: Path) -> Path:
         if base not in self._roots:
@@ -540,15 +579,25 @@ class RelayServer:
         keep |= {v for v, t in self._touched.items() if now - t < _IN_USE_S}
         for version in list(self._manifests):
             if version not in keep:
-                del self._manifests[version]
-                self._landed.pop(version, None)
-                self._touched.pop(version, None)
-                # A download already streaming one of these files keeps its
-                # open fd, so unlinking never cuts a transfer short.
-                if (vdir := self._dirs.pop(version, None)) is not None:
-                    shutil.rmtree(vdir, ignore_errors=True)
+                self._drop_version(version)
+
+    def _drop_version(self, version: int) -> None:
+        del self._manifests[version]
+        self._landed.pop(version, None)
+        self._touched.pop(version, None)
+        self._digests.pop(version, None)
+        # A download already streaming one of these files keeps its
+        # open fd, so unlinking never cuts a transfer short.
+        if (vdir := self._dirs.pop(version, None)) is not None:
+            shutil.rmtree(vdir, ignore_errors=True)
 
     def publish_manifest(self, version: int, manifest: CheckpointManifest) -> None:
+        old = self._manifests.get(version)
+        if old is not None and manifest_tag(old) != manifest_tag(manifest):
+            # Other content under a version number this relay still holds (a
+            # new run on a standing relay): start the version over, or its
+            # landed shards, chunk digests and deltas would be the old content's.
+            self._drop_version(version)
         self._manifests[version] = manifest
         self._landed.setdefault(version, set())
         # Evict first: the versions it frees count toward this one's room.
@@ -595,6 +644,93 @@ class RelayServer:
         path = self.shard_path(version, idx)
         return path.read_bytes() if path is not None else None
 
+    def _load_shard(self, version: int, idx: int) -> dict[str, torch.Tensor]:
+        # Not via shard_path: that is the serving accessor (what fetchers GET),
+        # and the delta builds' own reads are not downloads.
+        if idx not in self._landed.get(version, ()) or version not in self._dirs:
+            raise KeyError(f"no shard {idx} for version {version}")
+        return torch.load(self._dirs[version] / str(idx), weights_only=True)
+
+    def delta_path(self, base: int, target: int) -> Path:
+        # Inside the target's spool dir, so evicting the target removes it; named
+        # by the base's content too, so a base republished as other content
+        # never gets a delta cut against the old one.
+        tag = manifest_tag(self._manifests[base])
+        return self._version_dir(target) / f"delta-from-{base}-{tag}"
+
+    def _cut_shard(
+        self, target: int, idx: int, writers: dict[int, "_DeltaWriter"]
+    ) -> list[int]:
+        """Encode target shard ``idx`` against every base in ``writers`` and
+        append the frames to each base's delta, loading the target shard once
+        and hashing it once (cached per version). Blocking. Returns the bases
+        that failed (evicted mid-build); their writers are left to the caller.
+
+        Shard ``idx`` of one model's versions holds the same names (the
+        partition is deterministic), so the base's same-index shard is all a
+        cut needs; one whose names it lacks (the model changed) is cut against
+        the whole base instead."""
+        target_sd = self._load_shard(target, idx)
+        digests = self._digests.setdefault(target, {})
+        failed = []
+        for base, writer in writers.items():
+            try:
+                base_m = self.complete_manifest(base)
+                if base_m is None:
+                    raise KeyError(f"base v{base} is gone")
+                base_sd = self._load_shard(base, idx) if idx < base_m.num_shards else {}
+                if not target_sd.keys() <= base_sd.keys():
+                    base_sd = {}
+                    for i in range(base_m.num_shards):
+                        base_sd.update(self._load_shard(base, i))
+                known = {n: digests[n] for n in target_sd if n in digests}
+                entries, frames, computed = _encode_entries(base_sd, target_sd, known)
+                digests.update(computed)
+                writer.add(entries, frames)
+            except (KeyError, OSError) as exc:
+                logger.warning("delta v%d->v%d: shard %d failed: %s", base, target, idx, exc)
+                failed.append(base)
+        return failed
+
+    def build_delta(self, base: int, target: int) -> Path:
+        """Write ``target`` as a delta against ``base`` (both complete) into the
+        target's spool dir. Blocking, so callers run it on a thread; a shard at
+        a time, so the peak is two shards, not two checkpoints."""
+        target_m = self.complete_manifest(target)
+        if target_m is None or self.complete_manifest(base) is None:
+            raise KeyError(f"v{base} and v{target} must both be complete")
+        t0 = time.perf_counter()
+        writer = _DeltaWriter(self.delta_path(base, target), base, target)
+        try:
+            for idx in range(target_m.num_shards):
+                if self._cut_shard(target, idx, {base: writer}):
+                    raise KeyError(f"v{base} or v{target} was evicted mid-build")
+            out = writer.finish()
+        except BaseException:
+            writer.abort()
+            raise
+        self.num_delta_builds += 1
+        size, full = out.stat().st_size, sum(target_m.shard_sizes)
+        logger.info("built delta v%d->v%d on demand: %.1f MB (%.0fx smaller than "
+                    "%.2f GB) in %.1fs", base, target, size / 1e6,
+                    full / max(size, 1), full / 1e9, time.perf_counter() - t0)
+        return out
+
+    async def ensure_delta(self, base: int, target: int) -> Path:
+        """The delta file: already built, or built now -- once, however many
+        fetchers ask for the same pair."""
+        path = self.delta_path(base, target)
+        if path.exists():
+            return path
+        build = self._delta_builds.get(path)
+        if build is None:
+            build = asyncio.ensure_future(asyncio.to_thread(self.build_delta, base, target))
+            self._delta_builds[path] = build
+            build.add_done_callback(
+                lambda done: self._delta_builds.pop(path, None)
+                if self._delta_builds.get(path) is done else None)
+        return await asyncio.shield(build)
+
     def app(self) -> web.Application:
         # client_max_size=0 disables aiohttp's default 1MB body cap: a
         # checkpoint shard is state_dict_bytes / num_shards, routinely
@@ -611,6 +747,7 @@ class RelayServer:
                 web.get("/manifest/latest", _handle_manifest_latest),
                 web.get("/manifest/{version}", _handle_manifest_version),
                 web.get("/shard/{version}/{idx}", _handle_get_shard),
+                web.get("/delta/{base}/{target}", _handle_get_delta),
             ]
         )
         return app
@@ -689,6 +826,29 @@ async def _handle_get_shard(request: web.Request) -> web.Response:
     return web.FileResponse(path)
 
 
+async def _handle_get_delta(request: web.Request) -> web.Response:
+    """``target`` as a delta against ``base`` (see decode_delta). 404 when either
+    version is gone or incomplete, 409 when ``?base_tag=`` says the fetcher's
+    base is different content under the same version number (a relay that
+    outlived a run) -- both mean: download the whole checkpoint instead."""
+    relay: RelayServer = request.app[_RELAY_KEY]
+    base = int(request.match_info["base"])
+    target = int(request.match_info["target"])
+    base_m, target_m = relay.complete_manifest(base), relay.complete_manifest(target)
+    if base_m is None or target_m is None or base >= target:
+        return web.Response(status=404, text=f"no delta v{base}->v{target}")
+    if request.query.get("base_tag", manifest_tag(base_m)) != manifest_tag(base_m):
+        return web.Response(status=409, text=f"v{base} here is different content")
+    relay.touch(base)
+    relay.touch(target)
+    try:
+        path = await relay.ensure_delta(base, target)
+    except (KeyError, OSError) as exc:  # evicted mid-build, or the spool failed
+        logger.warning("delta v%d->v%d failed: %s", base, target, exc)
+        return web.Response(status=404, text=f"no delta v{base}->v{target}: {exc}")
+    return web.FileResponse(path, headers={"X-Delta-Target-Tag": manifest_tag(target_m)})
+
+
 async def run_relay_server(
     host: str = "0.0.0.0", port: int = 8765, retain_last: int = 5,
     spool_dir: str | None = None,
@@ -729,8 +889,14 @@ class RelayClient:
         timeout_s: float = 30.0,
         stall_timeout_s: float = 120.0,
         site_cache_dir: str | None = None,
+        use_deltas: bool = True,
     ):
-        """``site_cache_dir``: a directory shared with the other fetchers on this
+        """``use_deltas``: ask for each checkpoint newer than the last one
+        returned as a delta against it (``GET /delta``), falling back to the
+        whole download whenever the relay can't serve one or it fails
+        verification.
+
+        ``site_cache_dir``: a directory shared with the other fetchers on this
         site (a cluster's shared filesystem). Fetchers then split each version's
         shards between them -- every shard crosses the link to the relay ONCE per
         site -- and read the rest from there (_fetch_shards_via_site). Four
@@ -763,6 +929,14 @@ class RelayClient:
         self._bandwidth = {
             url: 1.0 for url in self.relay_urls
         }  # arbitrary units, EMA of bytes/sec
+        self._use_deltas = use_deltas
+        # (version, manifest_tag, state dict) of the last checkpoint returned:
+        # the base the next delta is cut against. The client's own dict, so a
+        # caller emptying the returned one (the worker does) leaves it intact.
+        self._base: tuple[int, str, dict[str, torch.Tensor]] | None = None
+        #: How the last fetch_latest arrived: {"kind": "delta"|"full", "bytes",
+        #: "seconds"} -- for logs, metrics and tests.
+        self.last_fetch: dict | None = None
 
     def stats(self, url: str) -> tuple[float, float]:
         return self._success_rate[url], self._bandwidth[url]
@@ -1048,6 +1222,67 @@ class RelayClient:
             pass
         return [shards[i] for i in range(manifest.num_shards)]
 
+    async def _fetch_delta(
+        self, session: aiohttp.ClientSession, url: str, manifest: CheckpointManifest
+    ) -> dict[str, torch.Tensor] | None:
+        """``manifest``'s checkpoint as a delta against the held base, or None
+        (no base, relay can't serve it, transfer failed, or it failed
+        verification) -- the caller then downloads it whole."""
+        if not self._use_deltas or self._base is None:
+            return None
+        base_version, base_tag, base_sd = self._base
+        if base_version >= manifest.version:
+            return None
+        t0 = time.monotonic()
+        try:
+            async with session.get(
+                f"{url}/delta/{base_version}/{manifest.version}",
+                params={"base_tag": base_tag},
+            ) as resp:
+                if resp.status != 200:
+                    logger.info("no delta v%d->v%d from %s (status %d); fetching whole",
+                                base_version, manifest.version, url, resp.status)
+                    return None
+                if resp.headers.get("X-Delta-Target-Tag") != manifest_tag(manifest):
+                    logger.warning("delta v%d->v%d from %s is for other content; "
+                                   "fetching whole", base_version, manifest.version, url)
+                    return None
+                blob = await resp.read()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.info("delta v%d->v%d from %s failed (%s); fetching whole",
+                        base_version, manifest.version, url, exc)
+            return None
+        t_net = time.monotonic() - t0
+        try:
+            state_dict = await asyncio.to_thread(
+                decode_delta, blob, base_sd,
+                base_version=base_version, target_version=manifest.version)
+        except ShardIntegrityError as exc:
+            logger.warning("delta v%d->v%d from %s failed verification (%s); "
+                           "fetching whole", base_version, manifest.version, url, exc)
+            return None
+        except Exception as exc:  # e.g. a base on the wrong device; never fail the fetch
+            logger.warning("could not apply delta v%d->v%d from %s (%r); fetching whole",
+                           base_version, manifest.version, url, exc)
+            return None
+        dt = time.monotonic() - t0
+        full = sum(manifest.shard_sizes)
+        # Not fed to the bandwidth EMA: a ~10 MB transfer measures latency, and
+        # would make a fast relay look slow for the next whole download.
+        self._success_rate[url] = _EMA_ALPHA + (1 - _EMA_ALPHA) * self._success_rate[url]
+        self.last_fetch = {"kind": "delta", "bytes": len(blob), "seconds": dt}
+        logger.info(
+            "fetched checkpoint v%d from %s as a delta from v%d: %.1f MB instead of "
+            "%.2f GB (%.0fx) in %.1fs (%.1fs transfer)",
+            manifest.version, url, base_version, len(blob) / 1e6, full / 1e9,
+            full / max(len(blob), 1), dt, t_net,
+        )
+        return state_dict
+
+    def _remember(self, manifest: CheckpointManifest, state_dict: dict) -> None:
+        if self._use_deltas:
+            self._base = (manifest.version, manifest_tag(manifest), dict(state_dict))
+
     async def latest_version(self) -> int:
         """The newest complete version any relay serves (0 when none, or none
         reachable) -- read from the manifests alone, nothing downloaded."""
@@ -1081,6 +1316,11 @@ class RelayClient:
                     manifest = await self._fetch_manifest(session, url, min_version)
                 if manifest is None:
                     continue
+                state_dict = await self._fetch_delta(session, url, manifest)
+                if state_dict is not None:
+                    self._remember(manifest, state_dict)
+                    return manifest.version, state_dict
+                t0 = time.monotonic()
                 fetch = (self._fetch_shards_via_site if self._site_cache is not None
                          else self._fetch_shards)
                 shard_bytes = await fetch(session, url, manifest)
@@ -1098,6 +1338,9 @@ class RelayClient:
                     )
                     self._record_failure(url)
                     continue
+                self.last_fetch = {"kind": "full", "bytes": sum(manifest.shard_sizes),
+                                   "seconds": time.monotonic() - t0}
+                self._remember(manifest, state_dict)
                 return manifest.version, state_dict
         return None
 

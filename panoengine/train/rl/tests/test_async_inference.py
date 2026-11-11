@@ -1029,3 +1029,39 @@ def test_relay_publish_survives_a_transfer_slower_than_the_old_total():
             await server.close()
 
     asyncio.run(scenario())
+
+
+def test_collect_and_build_drops_rollouts_from_the_future():
+    """Regression: a run whose relay restarted fresh while the rollout queue
+    lived on trained window 0 on 48 rollouts the previous run's worker had
+    queued under v~33 (logged staleness=-32): the staleness gate only bounds
+    how OLD a rollout is. The sole publisher knows nothing newer than its own
+    weights can exist, so it must drop those."""
+
+    async def scenario():
+        r = make_replica(max_staleness=50, policy_version=0)  # its weights: v1
+        r.trainer = SimpleNamespace(sync_log_step=_ep(lambda step: _noop()))
+        r.trainer_dp_degree = 1
+        _passthrough_pipeline(r, min_policy_versions=[1])
+        r._remote_consumer_task = asyncio.create_task(asyncio.sleep(30))
+        await r._buffer.put((_group(num_tokens=5), 33))  # another run's: dropped
+        await r._buffer.put((_group(num_tokens=5), 2))   # also never published
+        await r._buffer.put((_group(num_tokens=5), 1))   # this run's: kept
+        _, rollout_groups = await asyncio.wait_for(r._collect_and_build(1), 1)
+        assert r._num_dropped == 2 and len(rollout_groups) == 1
+        assert r._window_yield_snapshot()["dropped_future"] == 2
+        r._remote_consumer_task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_shared_version_strategies_have_no_future_ceiling():
+    """HeLoCo trainers share the parameter server's revision, and a worker may
+    hold one this trainer has not synced to yet -- a ceiling there would drop
+    good rollouts, so only the sole-publisher strategy sets one."""
+    from panoengine.train.rl.controller import PureLearnerReplica
+    from panoengine.train.rl.replicas import HeLoCoAsyncInferenceReplica
+
+    assert (HeLoCoAsyncInferenceReplica._newest_possible_version
+            is PureLearnerReplica._newest_possible_version)
+    assert make_replica(policy_version=9)._newest_possible_version() == 10

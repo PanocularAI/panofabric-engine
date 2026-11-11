@@ -746,6 +746,13 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
         checkpoint version, or the shared parameter-server revision)."""
         raise NotImplementedError
 
+    def _newest_possible_version(self) -> int | None:
+        """The newest version a rollout can legitimately be stamped with, for a
+        subclass that publishes every version itself (so it knows); None when
+        it can't know -- several trainers advance a shared version, and a
+        worker may already hold one this trainer has not seen yet."""
+        return None
+
     # ------------------------------------------------------------------ #
     # Consumer side.
     # ------------------------------------------------------------------ #
@@ -827,10 +834,27 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
         # step. Diagnosing that once cost an hour of a paid 4B cluster's time, so
         # the loop now reports itself. Counted per call; a batch that legitimately
         # needs several groups is normal and stays quiet.
-        seen = stale = untrainable = 0
+        seen = stale = future = untrainable = 0
         while packed is None:
             group, version = await self._buffer_get_checked()
             seen += 1
+            ceiling = self._newest_possible_version()
+            if ceiling is not None and version > ceiling:
+                # Stamped with a version this trainer never published: left in
+                # the queue by another run (the queue outlived it, the relay
+                # did not). The staleness gate passes these -- reference minus
+                # version is negative -- and one such window trained on 48
+                # rollouts from another run's policy, logged as staleness=-32.
+                self._num_dropped += 1
+                future += 1
+                if future & (future - 1) == 0:  # 1, 2, 4, ...: escalate, don't flood
+                    logger.warning(
+                        "[replica %d] step %d: dropped %d rollout group(s) stamped "
+                        "newer than anything this trainer published (latest v%d, got "
+                        "v%d) -- left in the rollout queue by another run; restart "
+                        "the queue between runs", self.config.replica_id, step,
+                        future, ceiling, version)
+                continue
             if self._staleness_reference() - version > self.config.max_staleness:
                 self._num_dropped += 1
                 stale += 1
@@ -855,10 +879,12 @@ class PureLearnerReplica(RLControllerMixin, RLTrainer):
         y = getattr(self, "_win_yield", None)
         if y is None:
             y = self._win_yield = {
-                "groups_consumed": 0, "dropped_stale": 0, "dropped_zero_std": 0,
+                "groups_consumed": 0, "dropped_stale": 0, "dropped_future": 0,
+                "dropped_zero_std": 0,
             }
         y["groups_consumed"] += seen
         y["dropped_stale"] += stale
+        y["dropped_future"] += future
         y["dropped_zero_std"] += untrainable
         return packed, rollout_groups
 

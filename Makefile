@@ -165,8 +165,11 @@ install-torchtt-ft: forks
 #
 # Pins are the image's, verbatim (panofabric infra/engine-image/Dockerfile) — they must
 # move together:
-#   - torchmonarch ships compiled bindings that load libtorch, so its build date must
-#     track the torch nightly's.
+#   - torchmonarch is the STABLE release, not a nightly: monarch nightlies are pruned
+#     from PyPI after a few weeks (0.7.0.dev20260930 vanished, breaking fresh installs),
+#     and post-branch-cut ones are built on 2.16. 0.7.0 is built against torch 2.14.1,
+#     but only monarch.gradient (version-checked; nothing here imports it) needs a
+#     matched libtorch -- actor/spmd/rdma were smoke-tested on 2.15 (2026-10-30).
 #   - torchstore's PyPI release pins torch==2.9.0 and would drag the stack backwards, so
 #     it is installed --no-deps from a pinned source tarball with its real deps by hand.
 #   - flash-attn-3 comes from the pytorch TEST index, not nightly. The RL trainer imports
@@ -184,7 +187,7 @@ install-torchtt-ft: forks
 # Resolved together 2026-09-30 from the pytorch cu130 nightly index, the way
 # torchtitan's own RL CI installs them.
 TORCH_VERSION ?= 2.15.0.dev20260928
-RL_TORCHMONARCH_VERSION ?= 0.7.0.dev20260930
+RL_TORCHMONARCH_VERSION ?= 0.7.0
 RL_TORCHSTORE_SHA ?= a80f8cae60ed9336b547fded9108f4df8222f0e8
 RL_RENDERERS_VERSION ?= 0.1.11
 RL_FLASH_ATTN_3_VERSION ?= 3.0.0

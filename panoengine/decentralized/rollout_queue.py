@@ -17,7 +17,9 @@
 # did so needed the full GPU RL stack on a CPU-only box (every push 500'd on a
 # CPU-only venv). Full -> push rejected (503); the worker waits and retries,
 # which holds its generation to the trainer's pace. Empty -> pop returns 204
-# (the trainer polls). Runs next to the relay
+# (the trainer polls). ``GET /stats`` reports the depth and the push/pop
+# counters, which the control plane polls to size the generator pool. Runs
+# next to the relay
 # process (relay.py) but separately from it, so multi-GB
 # checkpoint traffic and rollout traffic never queue behind each other.
 #
@@ -74,6 +76,7 @@ class RolloutQueueServer:
         return [
             web.post("/rollouts", self._handle_push),
             web.post("/rollouts/pop", self._handle_pop),
+            web.get("/stats", self._handle_stats),
         ]
 
     def app(self) -> web.Application:
@@ -97,6 +100,22 @@ class RolloutQueueServer:
             return web.Response(status=503, text="rollout queue full; consumer stalled")
         self.num_received += 1
         return web.Response(status=204)
+
+    def stats(self) -> dict:
+        """Depth and lifetime counters. ``rejected`` rising while ``qsize`` sits
+        at ``maxsize`` means the generators are ahead of the trainers; an empty
+        queue with a waiting trainer means they are behind."""
+        return {
+            "qsize": self.queue.qsize(),
+            "maxsize": self.queue.maxsize,
+            "received": self.num_received,
+            "rejected": self.num_rejected,
+            "popped": self.num_popped,
+        }
+
+    async def _handle_stats(self, request: web.Request) -> web.Response:
+        del request
+        return web.json_response(self.stats())
 
     async def _handle_pop(self, request: web.Request) -> web.Response:
         del request

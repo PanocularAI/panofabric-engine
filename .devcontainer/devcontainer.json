@@ -1,0 +1,69 @@
+{
+  "name": "panofabric-engine",
+  "build": { "dockerfile": "Dockerfile" },
+
+  "features": {
+    // Multi-user (daemon) install, so the root-owned store survives the
+    // devcontainer remapping the `vscode` user's UID to match the host.
+    "ghcr.io/devcontainers/features/nix:1": {
+      "version": "2.34.8",
+      "multiUser": true,
+      "extraNixConfig": "experimental-features = nix-command flakes"
+    }
+  },
+
+  // Mount the PARENT directory, not just this repo: scripts/nix_dev_setup.sh
+  // installs the torchtitan/torchft forks editable from sibling checkouts
+  // (FORKS_DIR, default ..), same layout as on the host.
+  "workspaceMount": "source=${localWorkspaceFolder}/..,target=/workspaces,type=bind",
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+
+  "runArgs": [
+    // GPU passthrough via CDI. NOT `hostRequirements.gpu`: that makes the CLI
+    // add `--gpus all` only when docker has an `nvidia` runtime, which the
+    // NixOS hosts (hardware.nvidia-container-toolkit) don't register -- and
+    // `--gpus all` itself fails there ("AMD CDI spec not found"). On other
+    // distros generate the spec once with `sudo nvidia-ctk cdi generate
+    // --output=/etc/cdi/nvidia.yaml`; on a host with no GPU at all, drop this
+    // line.
+    "--device=nvidia.com/gpu=all",
+    // vLLM workers and torch dataloaders exchange tensors through /dev/shm;
+    // docker's 64MB default fails the first non-trivial transfer.
+    "--shm-size=16g"
+  ],
+
+  // A named volume so a rebuild doesn't redo the venv/wheel downloads. See
+  // the Dockerfile for what lives in it. ONE volume for both the venvs and
+  // uv's cache (UV_CACHE_DIR below): uv hardlinks wheels from its cache into
+  // the venv, which can't cross mounts, so with two volumes it silently falls
+  // back to copying and every install takes double the disk.
+  //
+  // Deliberately NO volume at /nix (unlike PanoRT): on a NixOS host the CDI
+  // spec bind-mounts the driver in as its own /nix/store/...-nvidia-x11 path
+  // (/run/opengl-driver/lib/libcuda.so.1 is a symlink into it), and docker
+  // applies a /nix volume AFTER the CDI mounts, shadowing them -- libcuda
+  // becomes a dangling symlink and the container has no GPU. So the toolchain
+  // store lives in the container layer: kept across restarts, re-fetched on
+  // a rebuild.
+  "mounts": [
+    "source=panofabric-engine-local,target=/home/vscode/.local,type=volume"
+  ],
+  "containerEnv": {
+    "UV_CACHE_DIR": "/home/vscode/.local/cache/uv"
+  },
+
+  "remoteUser": "vscode",
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "postStartCommand": "link-nvidia-driver",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "mkhl.direnv",
+        "jnoortheen.nix-ide",
+        "ms-python.python",
+        "rust-lang.rust-analyzer"
+      ]
+    }
+  }
+}

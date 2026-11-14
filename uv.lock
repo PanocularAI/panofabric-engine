@@ -3,16 +3,16 @@ revision = 3
 requires-python = ">=3.11, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'win32'",
     "python_full_version >= '3.13' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'win32'",
     "python_full_version >= '3.13' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
     "python_full_version >= '3.13' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
     "python_full_version >= '3.13' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version >= '3.13' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.12' and platform_machine == 's390x' and sys_platform == 'win32'",
     "python_full_version < '3.12' and platform_machine != 's390x' and sys_platform == 'win32'",
@@ -603,8 +603,8 @@ version = "12.9.4"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version >= '3.13' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.12' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.12' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
@@ -629,12 +629,12 @@ version = "13.3.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'win32'",
     "python_full_version >= '3.13' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'win32'",
     "python_full_version >= '3.13' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
     "python_full_version >= '3.13' and platform_machine != 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
     "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
     "python_full_version < '3.12' and platform_machine == 's390x' and sys_platform == 'win32'",
     "python_full_version < '3.12' and platform_machine != 's390x' and sys_platform == 'win32'",
@@ -2508,7 +2508,7 @@ requires-dist = [
     { name = "panofabric-engine", extras = ["decentralized"], marker = "extra == 'train'" },
     { name = "safetensors", marker = "extra == 'serve'" },
     { name = "torchft", marker = "extra == 'decentralized'", git = "https://github.com/PanocularAI/torchft.git?rev=716bff9584a9e0613dd07f1837a63a9f2e3583b4" },
-    { name = "torchtitan", marker = "extra == 'train'", git = "https://github.com/PanocularAI/torchtitan.git?rev=3058f9779f43e887422da6dfe7fb8ca4b1afbccb" },
+    { name = "torchtitan", marker = "extra == 'train'", git = "https://github.com/PanocularAI/torchtitan.git?rev=0483d9ff3a939a206c6e66c79e0ceae56efadfa7" },
     { name = "transformers", marker = "extra == 'serve'" },
     { name = "transformers", marker = "extra == 'train'" },
     { name = "vllm", marker = "extra == 'serve-vllm'" },
@@ -3586,16 +3586,16 @@ version = "80.10.2"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'win32'",
     "python_full_version >= '3.13' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'win32'",
     "python_full_version >= '3.13' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
     "python_full_version >= '3.13' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
     "python_full_version >= '3.13' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version >= '3.13' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/76/95/faf61eb8363f26aa7e1d762267a8d602a1b26d4f3a1e758e92cb3cb8b054/setuptools-80.10.2.tar.gz", hash = "sha256:8b0e9d10c784bf7d262c4e5ec5d4ec94127ce206e8738f29a437945fbc219b70", size = 1200343, upload-time = "2026-01-25T22:38:17.252Z" }
@@ -3944,7 +3944,7 @@ dependencies = [
 [[package]]
 name = "torchtitan"
 version = "0.2.2"
-source = { git = "https://github.com/PanocularAI/torchtitan.git?rev=3058f9779f43e887422da6dfe7fb8ca4b1afbccb#3058f9779f43e887422da6dfe7fb8ca4b1afbccb" }
+source = { git = "https://github.com/PanocularAI/torchtitan.git?rev=0483d9ff3a939a206c6e66c79e0ceae56efadfa7#0483d9ff3a939a206c6e66c79e0ceae56efadfa7" }
 dependencies = [
     { name = "attn-gym", extra = ["linear"] },
     { name = "datasets" },

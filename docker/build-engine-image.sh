@@ -23,7 +23,7 @@
 # Override the locations with TORCHTITAN_DIR / TORCHFT_DIR.
 #
 # Usage:
-#   ./docker/build-engine-image.sh                 # both tags; <cuda>-<date>-<shas>[-train]
+#   ./docker/build-engine-image.sh                 # both tags; <cuda>-<shas>[-dirty]-<image id>[-train]
 #   TARGETS=train ./docker/build-engine-image.sh   # just the training-only tag
 #   PUSH=1 ./docker/build-engine-image.sh          # also push (run `docker login` first)
 #   CUDA_TAG=rocm7.0 CUDA_VERSION=13.0.3 ./docker/build-engine-image.sh
@@ -97,22 +97,19 @@ for d in "." "$TORCHTITAN_DIR" "$TORCHFT_DIR"; do
 done
 
 # ---- tags -----------------------------------------------------------------
-DATE_TAG="$(date -u +%Y%m%d)"
-
-# Records what is ACTUALLY inside: this repo's SHA plus both forks'. It used to be
-# torchft's SHA alone, which meant an engine-only or torchtitan-only change produced a
-# byte-identical tag to the previous build — and torchft is the tree that moves least,
-# so that was the common case, not the corner case. Two images claiming one tag, with
-# the second push silently overwriting the first.
-VERSION_TAG="${CUDA_TAG}-${DATE_TAG}-${ENGINE_SHA:0:7}-tt${TT_SHA:0:7}-ft${FT_SHA:0:7}"
-
-# "Immutable" only holds when all three trees are COMMITTED; otherwise the SHAs above
-# describe something other than what was copied in. Mark those builds so they can never
-# clobber a real immutable tag — same rule as infra/engine-image/build.sh in panofabric.
+# <cuda>-<engine sha>-tt<sha>-ft<sha>[-dirty]-<image id>[-train]. The SHAs say where the
+# sources came from; the image ID (completed after each build below) says what is inside.
+# A fully cached rebuild keeps its image ID, so an unchanged image keeps its tag: the
+# registry already has it (the push is skipped) and the daemon's --engine-image does not
+# change. Any change to the contents, committed or not, gives a new ID and so a new tag
+# that cannot overwrite an older one. (The tag used to carry the build date and, for a
+# dirty tree, a timestamp, so every build got a new tag even when nothing had changed.)
+SOURCE_TAG="${CUDA_TAG}-${ENGINE_SHA:0:7}-tt${TT_SHA:0:7}-ft${FT_SHA:0:7}"
 if (( ${#DIRTY_TREES[@]} )); then
-  VERSION_TAG="${VERSION_TAG}-dirty-$(date +%s)"
-  echo "NOTE: uncommitted changes in ${DIRTY_TREES[*]} -> tagging :$VERSION_TAG"
+  SOURCE_TAG="${SOURCE_TAG}-dirty"
 fi
+IID_FILE="$(mktemp)"
+trap 'rm -f "$IID_FILE"' EXIT
 
 # ---- RL / serving pins: read from the Makefile, which is the single source of truth --
 # `make install-rl` (the imageless path) and this image MUST agree, and they used to be
@@ -138,12 +135,13 @@ RL_ARGS=(
 )
 
 # ---- build -----------------------------------------------------------------
-# `full` derives FROM `train`, so building both is one pass plus a cache-hit re-tag.
-# `full` gets the bare tags; `train` gets the same with a -train suffix. Every tag is
-# collected for the push, because pushing "${IMAGE}:${CUDA_TAG}" once per target would
-# have the train build clobber full's moving tag.
+# `train` and `full` share the `runtime` stage, so building both pays for it once.
+# `full` gets the bare tags; `train` gets the same with a -train suffix, so the train
+# build cannot clobber full's moving tag.
 IMAGE="${REGISTRY}/${IMAGE_NAME}"
-PUSH_REFS=()
+VERSION_REFS=()
+MOVING_REFS=()
+NODE_REF=""   # what TAG_OUT hands to the deploy: `full` when built, else `train`
 
 for target in $TARGETS; do
   case "$target" in
@@ -151,10 +149,9 @@ for target in $TARGETS; do
     train) sfx="-train" ;;
     *) echo "ERROR: unknown target '$target' (want: train, full)" >&2; exit 1 ;;
   esac
-  version_ref="${IMAGE}:${VERSION_TAG}${sfx}"
   moving_ref="${IMAGE}:${CUDA_TAG}${sfx}"
 
-  echo ">>> building ${version_ref}  (--target $target)"
+  echo ">>> building ${IMAGE}:${SOURCE_TAG}-<image id>${sfx}  (--target $target)"
   docker build \
     -f docker/engine.Dockerfile \
     --target "$target" \
@@ -170,36 +167,47 @@ for target in $TARGETS; do
     "${RL_ARGS[@]}" \
     --build-context torchtitan="$TORCHTITAN_DIR" \
     --build-context torchft="$TORCHFT_DIR" \
-    -t "$version_ref" \
+    --iidfile "$IID_FILE" \
     -t "$moving_ref" \
     "${EXTRA_BUILD_ARGS[@]}" \
     .
-  PUSH_REFS+=("$version_ref" "$moving_ref")
+  image_id="$(<"$IID_FILE")"
+  image_id="${image_id#sha256:}"
+  version_ref="${IMAGE}:${SOURCE_TAG}-${image_id:0:12}${sfx}"
+  docker tag "$moving_ref" "$version_ref"
+  VERSION_REFS+=("$version_ref")
+  MOVING_REFS+=("$moving_ref")
+  if [[ "$target" == "full" || -z "$NODE_REF" ]]; then NODE_REF="$version_ref"; fi
 done
 
 echo ">>> built:"
-for ref in "${PUSH_REFS[@]}"; do echo "      $ref"; done
+for ref in "${VERSION_REFS[@]}" "${MOVING_REFS[@]}"; do echo "      $ref"; done
 
 if [[ "$PUSH" == "1" ]]; then
-  echo ">>> pushing..."
-  for ref in "${PUSH_REFS[@]}"; do docker push "$ref"; done
-  echo ">>> pushed."
+  for i in "${!VERSION_REFS[@]}"; do
+    # The version tag names the contents, so if the registry has it, it has this image.
+    # A failed or hung lookup (the timeout covers a credential helper waiting on a login)
+    # reads as "not there": the push then runs, which is safe, just slower.
+    if timeout 60 docker manifest inspect "${VERSION_REFS[$i]}" >/dev/null 2>&1; then
+      echo ">>> ${VERSION_REFS[$i]} is already in the registry — not pushing it again."
+      continue
+    fi
+    echo ">>> pushing ${VERSION_REFS[$i]}"
+    docker push "${VERSION_REFS[$i]}"
+    docker push "${MOVING_REFS[$i]}"
+  done
+  echo ">>> registry up to date."
 else
   echo ">>> PUSH=0 — not pushing. To push: docker login ${REGISTRY%%/*} && PUSH=1 $0"
 fi
 
 # Machine-readable handoff: panofabric's 04-deploy-controld.sh reads the tag it just
-# built from here instead of scraping the human output above. `full` is the node image,
-# so it wins when both were built.
+# built from here instead of scraping the human output above.
 if [[ -n "${TAG_OUT:-}" ]]; then
-  if [[ " $TARGETS " == *" full "* ]]; then
-    printf '%s\n' "${IMAGE}:${VERSION_TAG}" > "$TAG_OUT"
-  else
-    printf '%s\n' "${IMAGE}:${VERSION_TAG}-train" > "$TAG_OUT"
-  fi
+  printf '%s\n' "$NODE_REF" > "$TAG_OUT"
 fi
 
 cat <<EOF
 >>> point --engine-image / ENGINE_IMAGE at the FULL tag:
-      ${IMAGE}:${VERSION_TAG}
+      ${NODE_REF}
 EOF

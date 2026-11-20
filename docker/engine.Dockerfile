@@ -15,6 +15,11 @@ ARG CUDA_VERSION=13.0.3
 ARG UBUNTU_VERSION=24.04
 ARG PYTHON_VERSION=3.12
 
+# uv, pinned. A floating tag is looked up again on every cache miss or fresh machine, and a
+# new uv release then rebuilds every layer above it (the multi-GB vllm/RL layers) with none
+# of our code changed.
+FROM ghcr.io/astral-sh/uv:0.13.9 AS uv
+
 # ---------------------------------------------------------------------------
 # builder — toolchain (rust + protoc + python headers) to compile torchft; dropped
 # from the runtime stage.
@@ -51,27 +56,23 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 # stage (same ubuntu base => identical /usr/bin/pythonX.Y at the symlink target).
 RUN uv venv --python /usr/bin/python${PYTHON_VERSION} ${VIRTUAL_ENV}
 
-# This repo is the build context; .dockerignore drops .venv/.git/outputs/ so only source
-# travels. The forks come in as named contexts (see the header).
-WORKDIR /build
-COPY . /build
-
 # install-torchtt-ft (Makefile): torchtitan deps, then torchtitan + torchft from the
 # sibling clones, bind-mounted from their named build contexts. `rw` because setuptools
 # and maturin write build metadata into the source dir (it lands in a scratch overlay,
-# never in the checkout). `uv pip install --no-deps .` then adds panofabric-engine for the
-# recipe registry (--no-deps: the forks are already installed from source here, not from
-# the pyproject git pins). This is where torchft compiles from source — paid once.
+# never in the checkout). This is where torchft compiles from source — paid once.
 # `transformers` is torchtitan's undeclared transformers_modeling_backend dep, which
 # panoengine.train.pretrain.hf_transformers imports (see the Makefile for the long version).
 # Qwen3.5's GatedDeltaNet kernels come from attn-gym[linear], a declared torchtitan dep.
+#
+# THIS repo's code is deliberately NOT in this venv: the venv becomes one ~6.6 GB layer,
+# and anything in it that changes forces a rebuild and re-upload of all of it. panoengine
+# is installed on top in each final stage instead (a <1 MB layer).
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,from=torchtitan,target=/src/torchtitan,rw \
     --mount=type=bind,from=torchft,target=/src/torchft,rw \
     uv pip install -r /src/torchtitan/requirements.txt \
     && uv pip install /src/torchtitan \
     && uv pip install /src/torchft \
-    && uv pip install --no-deps . \
     && uv pip install transformers
 
 # install-torch LAST + --force-reinstall so the backend-matched torch NIGHTLY wins over
@@ -84,13 +85,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --pre "torch${TORCH_VERSION:+==${TORCH_VERSION}+${CUDA_TAG}}" \
     --index-url "${PYTORCH_BASE_URL}/${CUDA_TAG}" --force-reinstall
 
-# Park run_train.sh beside the venv so the whole engine travels as one /opt/panoengine tree.
-RUN cp /build/run_train.sh /opt/panoengine/run_train.sh && chmod +x /opt/panoengine/run_train.sh
-
 # ---------------------------------------------------------------------------
-# runtime — slim: CUDA runtime libs + the baked engine, no toolchain.
+# runtime — slim: CUDA runtime libs + the baked dependencies, no toolchain. Shared base of
+# `train` and `full`; it holds nothing from this repo, so engine edits leave it cached.
 # ---------------------------------------------------------------------------
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu${UBUNTU_VERSION} AS train
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu${UBUNTU_VERSION} AS runtime
 
 ARG PYTHON_VERSION
 ENV DEBIAN_FRONTEND=noninteractive
@@ -126,7 +125,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libibverbs1 ibverbs-providers librdmacm1t64 \
     && rm -rf /var/lib/apt/lists/*
 
-# The whole engine: venv (torch + torchtitan + torchft + panoengine) + run_train.sh.
+# The dependency venv (torch + torchtitan + torchft); panoengine goes on top per stage.
 COPY --from=builder /opt/panoengine /opt/panoengine
 WORKDIR /opt/panoengine
 
@@ -140,8 +139,20 @@ RUN ldconfig -p | grep -q 'libibverbs.so.1' \
     && ls /usr/lib/*/libibverbs/libmlx5-rdmav*.so >/dev/null \
     && echo 'InfiniBand verbs + mlx5 provider present'
 
+# ---------------------------------------------------------------------------
+# train — runtime + this repo's code, the only thing that changes on an engine-only edit.
+# uv is bind-mounted, not installed: the training image ships no installer.
+# ---------------------------------------------------------------------------
+FROM runtime AS train
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,from=uv,source=/uv,target=/usr/local/bin/uv \
+    --mount=type=bind,source=.,target=/src,rw \
+    uv pip install --python ${VIRTUAL_ENV}/bin/python --no-deps /src
+COPY --chmod=755 run_train.sh /opt/panoengine/run_train.sh
+
 # OCI labels: source -> THIS repo (so GHCR shows the engine's README, not the control
-# plane's); the build script passes the resolved source SHAs.
+# plane's); the build script passes the resolved source SHAs. Keep these ARGs LAST in each
+# final stage: a RUN after them would rebuild on every commit, since the SHA value changes.
 ARG ENGINE_SHA=unknown
 ARG TORCHTITAN_SHA=unknown
 ARG TORCHFT_SHA=unknown
@@ -161,13 +172,13 @@ LABEL org.opencontainers.image.title="panofabric-engine (train)" \
 # Stop at `--target train` for the training-only image (no vLLM, ~6 GB smaller);
 # a serving or RL island cannot run on that one.
 # =============================================================================
-FROM train AS full
+FROM runtime AS full
 
 ARG CUDA_TAG=cu130
 ARG PYTORCH_BASE_URL=https://download.pytorch.org/whl/nightly
 
-# The train stage ships no installer (uv lived only in the builder).
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# The runtime stage ships no installer (uv lived only in the builder).
+COPY --from=uv /uv /usr/local/bin/uv
 
 # vLLM FIRST (the slow, rarely-changing, ~3 GB layer). All three EXACT-pinned to one
 # nightly date so the vllm wheel matches the torch it was compiled against (torchtitan
@@ -240,12 +251,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       "flash-attn-3==${FLASH_ATTN_3_VERSION}" \
       --extra-index-url "${PYTORCH_BASE_URL%/nightly}/test/${CUDA_TAG}"
 
-# The serving plane's declared deps (aiohttp/safetensors/hf-hub/numpy/transformers).
-# They come free with vllm where versions matter, but the extra makes that explicit
-# rather than accidental. torch/vllm stay undeclared by [serve] on purpose.
+# panoengine itself, plus the serving plane's declared deps (aiohttp/safetensors/hf-hub/
+# numpy/transformers). They come free with vllm where versions matter, but the extra makes
+# that explicit rather than accidental. torch/vllm stay undeclared by [serve] on purpose.
+# Last of the installs, so an engine-only edit rebuilds only this small layer.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=.,target=/src,rw \
     uv pip install --python ${VIRTUAL_ENV}/bin/python "/src[serve]"
+COPY --chmod=755 run_train.sh /opt/panoengine/run_train.sh
 
 # Fail the build if anything can't import (no GPU needed): catches a vllm/torch mismatch
 # and a torchft break from the torch bump before the image ships. The RL line is separate

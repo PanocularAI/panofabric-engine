@@ -43,9 +43,11 @@ label cannot describe them.
 
 Each build produces two tags:
 
-- `…:cu130-20260630-abc1234-tt89ef012-ft3456789` — immutable; CUDA build, date, and the
-  short SHA of all three sources (this repo, torchtitan, torchft). A build from any dirty
-  tree gets a `-dirty-<epoch>` suffix so it can never claim an immutable tag.
+- `…:cu130-abc1234-tt89ef012-ft3456789-0123456789ab` — immutable; CUDA build, the short
+  SHA of all three sources (this repo, torchtitan, torchft), and the first 12 characters
+  of the image ID. A build from any dirty tree gets `-dirty` before the image ID. Because
+  the image ID comes from the contents, an unchanged rebuild (a full cache hit) keeps the
+  same tag, and with `PUSH=1` a tag the registry already has is not pushed again.
 - `…:cu130` — moving "latest for this CUDA" pointer.
 - `…-train` on either of the above — the training-only variant (`--target train`): no
   vllm, no RL runtime, no serving plane, ~6 GB smaller. Pretrain islands only.
